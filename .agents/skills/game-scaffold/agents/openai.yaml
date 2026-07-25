@@ -1,0 +1,6 @@
+interface:
+  display_name: "AlSniper Game Scaffold"
+  short_description: "Build games on the repository scaffold and contracts"
+  default_prompt: "Use $game-scaffold to build or modify an AlSniper OS browser game."
+policy:
+  allow_implicit_invocation: true

@@ -42,9 +42,9 @@ Original prompt: 参考 macOS 最新操作系统，创建一个现代、有精�
 
 ## 2026-07-26 Agent 游戏治理
 
-- 新增根 `AGENTS.md`，将游戏脚手架、共享平台分层、禁止旁路、显式注册、确定性/浏览器/性能门禁和例外审批固化为全仓强制规则。
-- 新游戏的第一项写操作必须执行 `npm run game:create`；既有游戏必须遵循同一平台契约，禁止删除重生成或复制 SpaceGame 基础设施。
-- 非 R3F 游戏允许替换渲染层，但必须保留 domain/runtime/web/testkit、单时钟、生命周期与自动化契约；任何旁路必须在实施前获得用户明确批准。
-- 新增 `tools/game-scaffold/agents-policy.test.mjs`，由 `npm test` 自动防止关键治理条款被删除或弱化。
-- 验证：Node 测试 8/8（治理 1 + 生成器 7）、Vitest 17 文件 / 120 项、typecheck 与生产 build 全部通过。
+- 根 `AGENTS.md` 已收敛为短小、fail-closed 的 `$game-scaffold` 强制路由，避免所有非游戏任务常驻完整游戏策略上下文。
+- 完整治理迁移到仓库标准路径 `.agents/skills/game-scaffold`；Skill 通过 frontmatter 精确触发，并按核心契约、新游戏、既有游戏/平台、验证四类 reference 渐进加载。
+- 新游戏首写必须执行 `npm run game:create`；既有游戏禁止删除重生成；非 R3F 可替换渲染层但必须保留 domain/runtime/web/testkit；任何旁路必须事前获得用户明确批准。
+- `tools/game-scaffold/agents-policy.test.mjs` 同时防止根路由丢失、详细策略回流 `AGENTS.md`、Skill 触发描述退化、reference 孤儿化或关键契约被删除。
+- 验证：Codex 官方 Skill 校验通过；Node 测试 10/10（治理 3 + 生成器 7）、Vitest 17 文件 / 120 项、typecheck 与生产 build 全部通过。
 - 当前无治理 TODO。

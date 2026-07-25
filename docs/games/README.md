@@ -2,6 +2,8 @@
 
 The repository provides one production-oriented browser-game foundation under `src/game-platform` and a zero-dependency generator under `tools/game-scaffold`. New games reuse the platform instead of copying infrastructure out of an existing game.
 
+Repository-aware Agents must load the progressive `$game-scaffold` Skill from `.agents/skills/game-scaffold/SKILL.md` before game implementation. Root `AGENTS.md` intentionally contains only the compact mandatory route so non-game tasks do not pay the full game-policy context cost.
+
 ## Create a game
 
 Run from the repository root:
