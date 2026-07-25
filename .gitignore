@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.local
+*.log
+.cache/
+.omx/
+.cursor/
+.playwright-cli/
+coverage/
+output/
