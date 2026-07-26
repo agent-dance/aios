@@ -2,6 +2,7 @@ import {
   Calculator,
   Folder,
   Gamepad2,
+  Spade,
   Settings,
   ShoppingBag,
   SquareTerminal,
@@ -32,6 +33,10 @@ export const APP_REGISTRY: Record<AppId, AppDefinition> = {
   'space-game': {
     id: 'space-game', name: 'Cosmic Vanguard', eyebrow: 'Arcade', icon: Gamepad2, accent: '#62ffbf',
     defaultSize: { width: 1040, height: 670 }, defaultPosition: { x: 150, y: 62 },
+  },
+  doudizhu: {
+    id: 'doudizhu', name: '斗地主', eyebrow: 'AI Table', icon: Spade, accent: '#f2c66d',
+    defaultSize: { width: 1120, height: 720 }, defaultPosition: { x: 130, y: 56 },
   },
 };
 

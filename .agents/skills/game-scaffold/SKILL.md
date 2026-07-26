@@ -1,6 +1,6 @@
 ---
 name: game-scaffold
-description: "Use for every AlSniper OS browser-game task: creating or modifying games, gameplay simulation, input, rendering loops, lifecycle, fullscreen, automation, determinism, performance, the game scaffold, or src/game-platform. Requires the repository scaffold and shared runtime/web/r3f/testkit. Do not use for ordinary non-game system apps."
+description: "Use for every AlSniper OS browser-game or Agent co-play task: creating or modifying games, AGAP/ParticipantPort, human-Agent action parity, gameplay simulation, input, rendering loops, lifecycle, fullscreen, automation, determinism, performance, the game scaffold, or src/game-platform. Requires the repository scaffold and shared runtime/web/testkit, plus r3f when applicable. Do not use for ordinary non-game system apps."
 ---
 
 # AlSniper OS Game Scaffold

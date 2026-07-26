@@ -9,6 +9,7 @@ import {
   Search,
   Settings,
   ShoppingBag,
+  Spade,
   Sparkles,
   SquareTerminal,
 } from 'lucide-react';
@@ -207,6 +208,27 @@ const LISTINGS: StoreListing[] = [
     updateDate: '2026-07-22',
     appId: 'space-game',
   },
+  {
+    id: 'doudizhu',
+    name: '斗地主',
+    category: 'games',
+    publisher: 'AlSniper Arcade',
+    tagline: 'A native AI card table where human and Agent players share one rules contract.',
+    description:
+      'Plays classic three-seat Dou Dizhu through the AGAP v1 participation protocol. Every human and Agent seat receives the same authorized view, legal actions, timing, and rule validation.',
+    featuredNote: 'The first Agent-native AlSniper OS game, built for fair human–AI mixed play.',
+    rating: 'New',
+    installs: 'Bundled',
+    verified: true,
+    capabilities: ['Human–Agent mixed play', 'Seat-scoped observations', 'Deterministic replay'],
+    permissions: [
+      { name: 'Read game controls', scope: 'Focused game window', reason: 'Submit the same structured actions available to Agent seats.' },
+      { name: 'Run local game Agents', scope: 'Current match only', reason: 'Control assigned seats without access to OS tools or other seats.' },
+    ],
+    execution: 'Local practice authority with AGAP v1 seat-scoped projections',
+    updateDate: '2026-07-26',
+    appId: 'doudizhu',
+  },
 ];
 
 const FALLBACK_LISTING = LISTINGS[0]!;
@@ -218,6 +240,7 @@ const LISTING_ICONS: Record<string, ReactNode> = {
   finder: <Folder size={18} />,
   'pulse-canvas': <BadgeCheck size={18} />,
   'cosmic-vanguard': <Gamepad2 size={18} />,
+  doudizhu: <Spade size={18} />,
 };
 
 function getInitialInstalledIds() {

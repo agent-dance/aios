@@ -12,6 +12,8 @@ npm run game:create -- --id <lowercase-kebab-id> --name "<Display Name>"
 - Do not copy `src/apps/space-game` or another game as a template. Existing games may inform gameplay or visuals, never infrastructure.
 - The CLI supports only `--id` and `--name`. Do not bypass reserved-name, path, conflict, no-overwrite, or atomic-creation safeguards.
 - Gameplay, scene, UI, input mapping, and renderer content may change after generation, but the shared platform boundaries and runtime contract must remain.
+- Keep the generated `<Game>AgentAdapter.ts` wired to the application: the local human must use a bound `ParticipantPort`, and every new formal action must be added to the shared domain reducer, legal-action enumeration, seat projection, descriptor metadata, and parity tests.
+- Never remove AGAP for a single-player or perfect-information game; retain one explicit seat and its port.
 
 ## Explicit product registration
 

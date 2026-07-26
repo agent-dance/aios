@@ -627,6 +627,7 @@ export function SpaceGameApp({ isActive = true }: SpaceGameAppProps) {
   });
 
   useGameAutomationBridge({
+    enabled: isActive,
     renderGameToText: () => renderGameToText(runtime.getState()),
     advanceTime: runFixedSteps,
     onManualClockRequested: requestManualClock,

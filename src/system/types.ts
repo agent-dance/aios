@@ -1,6 +1,6 @@
 import type { ComponentType } from 'react';
 
-export type AppId = 'finder' | 'calculator' | 'settings' | 'terminal' | 'store' | 'space-game';
+export type AppId = 'finder' | 'calculator' | 'settings' | 'terminal' | 'store' | 'space-game' | 'doudizhu';
 export type Theme = 'aurora' | 'midnight';
 
 export interface AppDefinition {

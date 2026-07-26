@@ -140,6 +140,7 @@ test('game-scaffold Skill references preserve the mandatory game workflow', asyn
     'game-platform/web',
     'game-platform/r3f',
     'game-platform/testkit',
+    'game-platform/agent',
     'develop-web-game',
     'window.advanceTime',
     'window.render_game_to_text',
@@ -154,4 +155,11 @@ test('game-scaffold Skill references preserve the mandatory game workflow', asyn
   assert.match(verification, /Before bypassing the platform[\s\S]{0,600}receive explicit user approval/);
   assert.match(verification, /npm run typecheck\r?\nnpm test\r?\nnpm run build/);
   assert.match(verification, /The task is incomplete while any required evidence/);
+  assert.match(core, /AGAP v1 descriptor/);
+  assert.match(core, /single-player games/);
+  assert.match(core, /action parity:[\s\S]{0,240}same serializable action union[\s\S]{0,240}reducer\/validator/);
+  assert.match(core, /Agent[\s\S]{0,180}unauthenticated `window` automation bridge/);
+  assert.match(newGame, /generated `<Game>AgentAdapter\.ts` wired to the application/);
+  assert.match(existing, /every human-visible decision and control[\s\S]{0,220}AGAP action/);
+  assert.match(verification, /human\/Agent parity through bound `ParticipantPort` instances/);
 });

@@ -10,6 +10,9 @@ import { useSystemStore } from './system/useSystemStore';
 const SpaceGameApp = lazy(() =>
   import('./apps/space-game').then((module) => ({ default: module.SpaceGameApp })),
 );
+const DoudizhuApp = lazy(() =>
+  import('./apps/doudizhu').then((module) => ({ default: module.DoudizhuApp })),
+);
 
 function AppLoading({ label }: { label: string }) {
   return (
@@ -32,6 +35,11 @@ export default function App() {
     'space-game': ({ isActive }) => (
       <Suspense fallback={<AppLoading label="Cosmic Vanguard" />}>
         <SpaceGameApp isActive={isActive} />
+      </Suspense>
+    ),
+    doudizhu: ({ isActive }) => (
+      <Suspense fallback={<AppLoading label="斗地主" />}>
+        <DoudizhuApp isActive={isActive} />
       </Suspense>
     ),
   };

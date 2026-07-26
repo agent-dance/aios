@@ -20,6 +20,8 @@ The command creates:
 src/apps/asteroid-run/
 ├── AsteroidRunEngine.ts
 ├── AsteroidRunEngine.test.ts
+├── AsteroidRunAgentAdapter.ts
+├── AsteroidRunAgentAdapter.test.ts
 ├── AsteroidRunApp.tsx
 ├── index.ts
 └── README.md
@@ -45,7 +47,7 @@ The foundation is split into one-way layers:
 ```text
 game engine (pure domain)
         ↓
-game-platform/runtime
+game-platform/runtime        game-platform/agent (AGAP)
         ↓
 game-platform/web    game-platform/r3f
         ↓                   ↓
@@ -55,29 +57,53 @@ game-platform/testkit → domain/runtime verification only
 ```
 
 - The engine owns gameplay state and deterministic simulation, with no React, DOM, Three.js, or shell imports.
-- `runtime` owns exact fixed-step time, state/input replacement, reset semantics, and publication.
+- `runtime` owns exact fixed-step time, reset semantics, and presentation/simulation state only inside the match authority boundary. In the generated command template it stores presentation time and no gameplay fields.
 - `web` owns automation, blur/visibility/inactive input reset, suspension, and fullscreen.
 - `r3f` owns the single render-loop driver, adaptive DPR, resource ownership, and capacity helpers.
 - `testkit` owns stable snapshots, timeline replay, and time-partition assertions.
+- `agent` owns the transport-neutral AGAP host, seat-bound participant capabilities, revision/nonce checks, idempotent receipts, and private event channels.
+- Each concrete game adapter imports its pure engine and `game-platform/agent`; the engine never imports the protocol host, React, or transport code.
 - The OS store owns windows and focus only. It must not receive per-frame game state.
+
+## Agent-native participation is mandatory
+
+Every built-in game declares an [AGAP v1](./agent-coplay-contract.md) `GameDescriptor`, including stable game/rules versions, turn and information models, seats, and machine-readable metadata. Every seat exposes only a seat-projected `SeatObservation`, its complete current `LegalActionSet`, receipts, and visible events through a seat-bound `ParticipantPort`. Hidden domain state and another seat's private information never cross that boundary.
+
+The human UI and Agent controller must map intent into the same formal action union and use the same domain reducer/validator. `ParticipantKind` is audit metadata only: it must never change observations, legal actions, authorization, timing, scoring, or outcomes. Add contract tests that run the same match id, request ids, and action timeline through human- and Agent-bound ports and compare receipts, projected outcomes, legal actions, and visible events after every transition.
+
+Start, in-match restart/reset, pause/resume, resign/leave, and every other rule-bearing operation supported by a live match are formal actions. An in-match restart must enter through the participant port, reset authoritative gameplay in the Host reducer, and publish the new revision/projection. UI code may then reset presentation clock/input, but it must never recreate gameplay state locally.
+
+A terminal **New Match/New Round** control is a different orchestration lifecycle: the terminal Host remains immutable and rejects further game actions, while a match factory creates a new authority with a new match id and fresh seed, then rebinds every participant. It is not an action against the old terminal `ParticipantPort`. Tests must prove that the new authority is independent and that no hidden seed/state is reused or copied from the completed match.
+
+This applies to perfect-information and single-player games too. They declare one explicit seat and a single-seat port rather than omitting AGAP. The generated template demonstrates this end-to-end: its local human controls call the bound port rather than mutating engine state directly.
+
+Each match has exactly one gameplay authority. In the generated command-driven template that authority is the AGAP Host: React snapshots, R3F rendering, HUD, and automation text consume `humanPort.observe().observation`, while the fixed-step runtime advances presentation time only. They must not copy `mode`, positions, score, cards, health, inventory, or other rule-bearing state and synchronize it later with `runtime.replaceState`.
+
+Real-time games follow the same single-authority rule. Their deterministic simulation runs behind the authoritative match/AGAP composition and publishes seat projections from that same state. Do not create one mutable simulation in runtime and a second mutable rules state in the AGAP Host; either integrate simulation state into the authority or expose it through an authority-owned adapter, with ParticipantPorts and renderers remaining projections.
+
+`window.render_game_to_text()` and `window.advanceTime(ms)` remain unauthenticated developer/test automation hooks. They are not AGAP, must be enabled only for the active game, and must never be handed to an Agent as a participant capability. Local and remote Agent orchestration bind an authenticated/authorized seat and expose only its `ParticipantPort`.
 
 ECS, a physics engine, networking, asset pipelines, and post-processing remain game-level choices. They should be added only when a game needs them, not to the shared baseline preemptively.
 
 ## Required quality gate
 
-Every game must preserve these invariants:
+Every game must preserve the applicable invariants below. Renderer-specific gates apply only when that renderer is used:
 
-- one simulation clock and one R3F frame loop;
+- one simulation clock; R3F games also have exactly one R3F frame loop;
 - fixed-step simulation with deterministic time partitioning;
-- `frameloop="demand"` whenever the game is ready, paused, inactive, or complete;
+- R3F games use `frameloop="demand"` whenever the game is ready, paused, inactive, or complete;
 - no per-frame React state or global Zustand writes for transforms;
-- input reset on blur, hidden document, inactive window, unmount, restart, and suspension;
+- input reset on blur, hidden document, inactive window, unmount, in-match restart/new-match replacement, and suspension;
+- when in-match restart is supported, it is a formal ParticipantPort action with authoritative Host reset plus separate presentation clock/input cleanup;
+- terminal New Match/New Round creates a fresh Host/match id/seed and participant bindings instead of acting on or mutating the old terminal Host;
 - `window.advanceTime(ms)` and concise `window.render_game_to_text()` automation bridges;
+- an AGAP descriptor, seat projection, complete formal-action parity, and conformance tests for human/Agent ports;
+- exactly one gameplay authority; React, renderers, automation, and presentation clocks are projections rather than synchronized gameplay replicas;
 - synchronous virtual-clock ownership on the first React render when the official client's `__vt_pending` marker is present, plus a ref guard that closes the bridge-effect/state-commit race;
-- one visible Canvas with the background rendered inside it;
+- R3F/Canvas games render one visible Canvas with the background inside it; DOM games must not add a placeholder Canvas;
 - `F` fullscreen toggle and Escape handled through the browser fullscreen contract;
 - deterministic unit tests plus official-client gameplay, screenshot, state, and console validation;
-- bounded draw calls and explicit resource ownership for dynamic Three.js objects.
+- R3F/Three.js games have bounded draw calls and explicit resource ownership for dynamic objects.
 
 The generated deterministic test advances two seconds (120 ticks at the default 60 Hz) in one call with both the runtime's default 240-step budget and an explicit 120-step budget, then compares it with two one-second partitions. Keep that path within the configured budget to preserve the repository's `advanceTime(2000)` contract without partial or nondeterministic progress.
 

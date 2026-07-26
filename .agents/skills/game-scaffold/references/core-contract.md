@@ -6,7 +6,7 @@ Every game must reuse `src/game-platform` with this one-way dependency structure
 
 ```text
 pure game domain engine
-    → game-platform/runtime
+    → game-platform/runtime and game-platform/agent (AGAP)
     → game-platform/web and optional game-platform/r3f
     → React game application
 
@@ -18,6 +18,10 @@ game-platform/testkit → domain/runtime verification
 - Automation, blur/visibility/inactive lifecycle, input cleanup, suspension, and Fullscreen must use `game-platform/web`.
 - R3F games must use `game-platform/r3f` for the single frame driver, adaptive DPR, capacity growth, and explicit resource ownership.
 - Stable serialization, timeline replay, and time-partition equivalence must use `game-platform/testkit`.
+- Every game must use `game-platform/agent` to publish an AGAP descriptor, seat-projected observations, complete legal actions, and seat-bound `ParticipantPort` capabilities.
+- The concrete game Agent adapter depends on both the pure engine and `game-platform/agent`; the pure engine itself must not import the protocol host.
+- Every match has exactly one gameplay authority. The generated command template uses the AGAP Host; React, R3F, HUD, automation text, and fixed-step presentation state consume seat projections and never mirror authoritative gameplay fields.
+- Real-time simulation must live behind that same authority boundary or be exposed by an authority-owned adapter. Never maintain independently mutable runtime and AGAP copies of mode, entities, score, health, cards, inventory, or other rule state.
 - `src/game-platform` must never import `src/apps` or a concrete game.
 - The OS store owns windows and focus only; it must never receive per-frame game state.
 
@@ -31,6 +35,10 @@ Without a user-approved exception, do not:
 - add an independent `requestAnimationFrame`, second simulation clock, or parallel simulation loop;
 - install incompatible `window.advanceTime` or `window.render_game_to_text` globals;
 - duplicate blur, visibility, inactive, Fullscreen, adaptive-DPR, resource-disposal, or capacity-growth infrastructure;
+- let a human UI mutate authoritative game state outside the same formal reducer/validator used by AGAP actions;
+- synchronize duplicated gameplay state from a ParticipantPort into runtime with `runtime.replaceState`; generated runtime state is presentation-only;
+- implement an in-match restart/reset, start, pause/resume, resign, or another rule-bearing live-match operation as a UI-only reset; supported operations must be formal ParticipantPort actions;
+- give an Agent raw domain state, another seat's projection, React/OS stores, or the unauthenticated `window` automation bridge;
 - write React state or global Zustand state on a per-frame path;
 - retain input after blur, hidden, inactive, suspend, restart, or unmount;
 - read wall-clock time, DOM, React state, or the Three.js scene from simulation;
@@ -54,3 +62,9 @@ Every game must preserve:
 - input cleanup on blur, hidden, inactive, suspend, restart, and unmount;
 - `F` toggles Fullscreen for the game target, while Escape follows the browser Fullscreen contract;
 - explicit, idempotent disposal ownership for dynamic Three.js resources.
+- an AGAP v1 descriptor with stable game/rules version, declared seats, turn/information model, and machine-readable metadata;
+- one seat-bound port per participant, including an explicit single seat for perfect-information or single-player games;
+- action parity: human intent and Agent calls use the same serializable action union, legal-action source, reducer/validator, and outcome semantics;
+- full protocol parity: participant kind is audit metadata only; identical match/request ids and action timelines must produce identical receipts, projected outcomes, legal actions, and visible events for the same seat;
+- in-match restart parity, when supported: the Host reducer resets authoritative gameplay and publishes a new projection; UI/Agent use the same action, while presentation clock/state and input are cleared separately;
+- terminal New Match/New Round parity, when supported: a match factory creates an independent Host with a fresh match id/seed and rebinds participants; the completed Host remains terminal and is never mutated or reused as the new authority;

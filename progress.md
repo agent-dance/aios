@@ -48,3 +48,22 @@ Original prompt: 参考 macOS 最新操作系统，创建一个现代、有精�
 - `tools/game-scaffold/agents-policy.test.mjs` 同时防止根路由丢失、详细策略回流 `AGENTS.md`、Skill 触发描述退化、reference 孤儿化或关键契约被删除。
 - 验证：Codex 官方 Skill 校验通过；Node 测试 10/10（治理 3 + 生成器 7）、Vitest 17 文件 / 120 项、typecheck 与生产 build 全部通过。
 - 当前无治理 TODO。
+
+## 2026-07-26 AI 原生共玩与斗地主
+
+- 新增传输无关的 AGAP v1：权威状态 → 座位投影 → seat-bound `ParticipantPort` → Human/Agent adapter；两类参与者共享同一观察、合法动作、回执与事件语义，参与者类型只用于审计和展示。
+- 安全边界明确：浏览器本地模式保证正确投影与防止意外旁路，不宣称能对抗同设备恶意所有者；正式隐藏信息竞技应把 Match Authority 移到独立进程或远端服务。
+- 第一款 Agent 原生游戏“斗地主”已完成：`classic-3p-score-bid@1` 完整规则、14 类牌型、确定性发牌、独立农民加倍/地主再加倍、炸弹/王炸、春天/反春天与零和结算。
+- 默认一名 Human 与两名确定性内置 Agent 可完整混玩；UI、键盘、内置 Agent 全部通过同一个 AGAP 提交通道，React、ARIA 和自动化文本只消费 seat-0 投影。
+- 斗地主已注册为独立 lazy app，并通过 App Store 的安装/打开闭环进入 OS；不常驻 Dock。
+- 仓库脚手架现默认生成 AGAP adapter、单席投影与 Human/Agent action-parity contract test；`$game-scaffold` Skill 的触发描述已覆盖 AGAP/ParticipantPort 共玩任务。
+- 公共脚手架使用唯一 `agap-contract-probe` 两次真实生成验证，首次发现并修复模板类型推断缺陷，复验 6/6 与全仓 typecheck 通过后精确清理。
+- 真实 Chromium 完成从叫分到结算的整局、App Store 安装启动、360×720 响应式、隐藏信息 ARIA 检查和截图人工审阅；官方游戏客户端两次确定性状态/画面哈希严格一致。
+- DOM 牌桌最终性能样本 P95/P99 约 6/6 ms、最大 6.6 ms、0 Long Task、0 Canvas/WebGL；生产斗地主 JS chunk 51,324 bytes，SHA-256 `5D433F9142EABF452282CEB7F7F58096089B9F9DEC95C660F8CC7A7CEF0E146C`。
+- 最终门禁：Node 10/10、Vitest 26 文件 / 199 项、typecheck 与生产 build 全部通过；AGAP 平台、架构、安全、规则/脚手架与斗地主适配独立终审均 PASS。
+- 审计闭环：公开 `matchId` 与秘密 seed 解耦并由 Web Crypto 生成；重入错误保持 `AGAP_REENTRANT_OPERATION`；实时倍率公开计入炸弹/王炸；App Store 明确本地练习信任边界。
+- 脚手架闭环：AGAP Host 是命令模板唯一玩法权威，fixed-step runtime 只推进 presentation time，所有 UI/Scene/HUD/自动化文本从 seat-bound 投影读取；唯一生成 probe 已完整验证并精确清理。
+- 最终契约 probe `final-contract-probe-20260726` 通过生成测试 6/6 与 typecheck，随后按精确路径清理；仓库无 probe/temp 游戏目录。
+- 真实浏览器最终验收：Fullscreen/Escape、inactive freeze/recovery、同步 manual-clock takeover、按钮 Enter/Space 原生语义、7 次全新 Host/ID 新局（中位数 39.9 ms/最大 46.5 ms）、0 console error；官方客户端两次状态与截图哈希一致。
+- 新局/时钟防回退：编排单测证明 fresh Host/matchId/seed/port 且旧 terminal Host 不变；进行中 New Round 在 UI 与 handler 双层禁用，防止人类获得 Agent Port 不具备的弃局换牌能力；sticky clock 单测证明旧 interval closure 也会同步服从 manual ownership。
+- 最终全量门禁更新：Node 10/10、Vitest 26 文件 / 199 项、typecheck 与 build 通过；斗地主 chunk 51,324 bytes，SHA-256 `5D433F9142EABF452282CEB7F7F58096089B9F9DEC95C660F8CC7A7CEF0E146C`。
