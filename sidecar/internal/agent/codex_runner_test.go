@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,6 +14,56 @@ import (
 	"github.com/agent-dance/agent-adaptor/codex"
 	"github.com/buthim/alsniper-os/sidecar/internal/config"
 )
+
+func TestCodexProcessOutcomeRejectsBufferedOutputAfterAbnormalTermination(t *testing.T) {
+	structured := &agentadaptor.StructuredOutput{Valid: true, RawJSON: []byte(`{"ok":true}`)}
+	tests := []struct {
+		name   string
+		result agentadaptor.RunResult
+		want   error
+	}{
+		{name: "success", result: agentadaptor.RunResult{StructuredOutput: structured}},
+		{name: "timeout", result: agentadaptor.RunResult{TimedOut: true, StructuredOutput: structured}, want: context.DeadlineExceeded},
+		{name: "nonzero exit", result: agentadaptor.RunResult{ExitCode: 9, StructuredOutput: structured}, want: errors.New("failure")},
+		{name: "signal", result: agentadaptor.RunResult{Signal: "SIGKILL", StructuredOutput: structured}, want: errors.New("failure")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateCodexProcessOutcome(test.result)
+			if test.want == nil && err != nil {
+				t.Fatalf("successful process was rejected: %v", err)
+			}
+			if test.want != nil && err == nil {
+				t.Fatal("abnormal process result with valid buffered JSON was accepted")
+			}
+			if errors.Is(test.want, context.DeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("timeout error = %v", err)
+			}
+		})
+	}
+}
+
+func TestCodexRunCompletionRejectsBufferedOutputAfterContextRevocation(t *testing.T) {
+	structured := &agentadaptor.StructuredOutput{Valid: true, RawJSON: []byte(`{"ok":true}`)}
+	result := agentadaptor.RunResult{StructuredOutput: structured}
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := validateCodexRunCompletion(cancelled, result, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled run returned %v", err)
+	}
+
+	deadline, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer stop()
+	if err := validateCodexRunCompletion(deadline, result, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired run returned %v", err)
+	}
+
+	sdkErr := errors.New("sdk failure")
+	if err := validateCodexRunCompletion(context.Background(), result, sdkErr); !errors.Is(err, sdkErr) {
+		t.Fatalf("SDK error was not preserved: %v", err)
+	}
+}
 
 func testRunnerConfig(profile, workspace, command string) config.Config {
 	return config.Config{

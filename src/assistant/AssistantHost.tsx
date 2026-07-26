@@ -1,14 +1,17 @@
-import { Mic, Sparkles, X } from 'lucide-react';
+import { Bug, Mic, Sparkles, X } from 'lucide-react';
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   useCallback,
   useEffect,
   useMemo,
+  useReducer,
   useRef,
   useState,
 } from 'react';
 import { AssistantComposer } from './AssistantComposer';
+import { AssistantDebugTimeline } from './AssistantDebugTimeline';
 import { AssistantSurfaceView } from './AssistantSurfaceView';
+import { reduceAssistantDebugTimeline } from './debug';
 import {
   appendBounded,
   ASSISTANT_MESSAGE_HISTORY_LIMIT,
@@ -22,6 +25,7 @@ import { VoiceDisclosurePanel } from './VoiceDisclosurePanel';
 import type {
   AssistantActionReceipt,
   AssistantClient,
+  AssistantDebugEvent,
   AssistantInputSource,
   AssistantMessage,
   AssistantMood,
@@ -125,6 +129,9 @@ export function AssistantHost<TSurface = AssistantSurface>({
   const [listening, setListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [liveStatus, setLiveStatus] = useState('助手已就绪');
+  const [debugEnabled, setDebugEnabled] = useState(false);
+  const [debugEvents, dispatchDebugEvent] = useReducer(reduceAssistantDebugTimeline, []);
+  const debugEnabledRef = useRef(false);
   const [voiceConsent, setVoiceConsent] = useState<VoiceDisclosureConsent>(() =>
     readVoiceDisclosureConsent(getBrowserStorage()),
   );
@@ -142,6 +149,10 @@ export function AssistantHost<TSurface = AssistantSurface>({
     [],
   );
   const effectiveSpeechPort = speechPort ?? defaultSpeechPort;
+
+  const handleDebugEvent = useCallback((event: AssistantDebugEvent) => {
+    dispatchDebugEvent({ type: 'append', event, enabled: debugEnabledRef.current });
+  }, []);
 
   const setPanelOpen = useCallback(
     (nextOpen: boolean) => {
@@ -201,6 +212,7 @@ export function AssistantHost<TSurface = AssistantSurface>({
           source,
           context: { activeAppId, activeGame },
           signal: abortController.signal,
+          ...(debugEnabled ? { onDebugEvent: handleDebugEvent } : {}),
         });
         if (abortController.signal.aborted) return;
         const responseText = response.message.trim() || '操作已处理。';
@@ -235,7 +247,7 @@ export function AssistantHost<TSurface = AssistantSurface>({
         }
       }
     },
-    [activeAppId, activeGame, client, messages, pending, setPanelOpen, threadId],
+    [activeAppId, activeGame, client, debugEnabled, handleDebugEvent, messages, pending, setPanelOpen, threadId],
   );
 
   submitRef.current = (text, source) => {
@@ -409,9 +421,25 @@ export function AssistantHost<TSurface = AssistantSurface>({
               <span className="assistant-panel__eyebrow"><Sparkles size={13} /> OS Agent</span>
               <h2 id="assistant-panel-title">AlSniper 助手</h2>
             </div>
-            <button type="button" className="assistant-icon-button" onClick={() => setPanelOpen(false)} aria-label="关闭助手">
-              <X size={17} />
-            </button>
+            <div className="assistant-panel__header-actions">
+              <button
+                type="button"
+                className={`assistant-debug-toggle${debugEnabled ? ' assistant-debug-toggle--active' : ''}`}
+                aria-pressed={debugEnabled}
+                aria-controls={debugEnabled ? 'assistant-debug-title' : undefined}
+                onClick={() => {
+                  const enabled = !debugEnabled;
+                  debugEnabledRef.current = enabled;
+                  setDebugEnabled(enabled);
+                }}
+              >
+                <Bug size={14} aria-hidden="true" />
+                Debug
+              </button>
+              <button type="button" className="assistant-icon-button" onClick={() => setPanelOpen(false)} aria-label="关闭助手">
+                <X size={17} />
+              </button>
+            </div>
           </header>
 
           {voiceDisclosureOpen ? (
@@ -439,6 +467,13 @@ export function AssistantHost<TSurface = AssistantSurface>({
                   </div>
                 ) : null}
               </div>
+
+              {debugEnabled ? (
+                <AssistantDebugTimeline
+                  events={debugEvents}
+                  onClear={() => dispatchDebugEvent({ type: 'clear' })}
+                />
+              ) : null}
 
               {surface ? (
                 renderSurface ? (

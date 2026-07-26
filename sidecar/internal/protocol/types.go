@@ -15,6 +15,8 @@ import (
 
 const Version = "1.0.0"
 
+const AgentDebugProfile = "agent-debug.v1"
+
 var (
 	idPattern       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 	manifestPattern = regexp.MustCompile(`^[a-z0-9]+(?:[.-][a-z0-9]+)*$`)
@@ -71,6 +73,43 @@ type ChatRequest struct {
 	Message   string             `json:"message"`
 	History   []ChatHistoryEntry `json:"history,omitempty"`
 	Context   ChatContext        `json:"context"`
+}
+
+type AgentDebugTraceRequest struct {
+	Profile string      `json:"profile"`
+	Request ChatRequest `json:"request"`
+}
+
+type AgentDebugTracePayload struct {
+	Kind       string `json:"kind"`
+	TraceID    string `json:"traceId"`
+	TimeUnixMS int64  `json:"timeUnixMs"`
+	Source     string `json:"source"`
+	Stage      string `json:"stage"`
+	Status     string `json:"status"`
+	Title      string `json:"title"`
+	Detail     string `json:"detail,omitempty"`
+	ElapsedMS  int64  `json:"elapsedMs"`
+}
+
+type AgentDebugCompletedPayload struct {
+	Kind       string       `json:"kind"`
+	TraceID    string       `json:"traceId"`
+	TimeUnixMS int64        `json:"timeUnixMs"`
+	Response   ChatResponse `json:"response"`
+}
+
+type AgentDebugFailedPayload struct {
+	Kind       string                `json:"kind"`
+	TraceID    string                `json:"traceId"`
+	TimeUnixMS int64                 `json:"timeUnixMs"`
+	Error      AgentDebugFailureBody `json:"error"`
+}
+
+type AgentDebugFailureBody struct {
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	Retryable bool   `json:"retryable"`
 }
 
 type ChatHistoryEntry struct {
@@ -463,6 +502,71 @@ func (o AgentOutput) Validate() error {
 		return o.Surface.Validate(intentIDs)
 	}
 	return nil
+}
+
+func (r AgentDebugTraceRequest) Validate() error {
+	if r.Profile != AgentDebugProfile {
+		return errors.New("unsupported Agent debug profile")
+	}
+	return r.Request.Validate()
+}
+
+func (p AgentDebugTracePayload) Validate() error {
+	if p.Kind != "trace" || !idPattern.MatchString(p.TraceID) || p.TimeUnixMS < 0 || p.TimeUnixMS > 9007199254740991 || p.Source != "sidecar" {
+		return errors.New("invalid Agent debug trace identity")
+	}
+	switch p.Stage {
+	case "request", "analysis", "decision", "authorization", "completion":
+	default:
+		return errors.New("invalid Agent debug trace stage")
+	}
+	switch p.Status {
+	case "started", "completed", "info", "failed":
+	default:
+		return errors.New("invalid Agent debug trace status")
+	}
+	if err := bounded("Agent debug trace title", p.Title, 1, 80); err != nil {
+		return err
+	}
+	if utf16CodeUnits(p.Detail) > 240 || p.ElapsedMS < 0 || p.ElapsedMS > 600000 {
+		return errors.New("Agent debug trace detail is invalid")
+	}
+	return nil
+}
+
+func (p AgentDebugCompletedPayload) Validate() error {
+	if p.Kind != "completed" || !idPattern.MatchString(p.TraceID) || p.TimeUnixMS < 0 || p.TimeUnixMS > 9007199254740991 {
+		return errors.New("invalid Agent debug completion identity")
+	}
+	if err := validateID("requestId", p.Response.RequestID); err != nil {
+		return err
+	}
+	if err := validateID("runId", p.Response.RunID); err != nil {
+		return err
+	}
+	if p.Response.Usage != nil {
+		const maxSafeInteger = int64(9007199254740991)
+		usage := p.Response.Usage
+		if usage.InputTokens < 0 || usage.OutputTokens < 0 || usage.CachedInputTokens < 0 ||
+			int64(usage.InputTokens) > maxSafeInteger || int64(usage.OutputTokens) > maxSafeInteger || int64(usage.CachedInputTokens) > maxSafeInteger ||
+			usage.EstimatedCostMilli < -maxSafeInteger || usage.EstimatedCostMilli > maxSafeInteger {
+			return errors.New("invalid Agent debug completion usage")
+		}
+	}
+	return AgentOutput{
+		Message: p.Response.Message, Mood: p.Response.Mood, ActiveAgentID: p.Response.ActiveAgentID,
+		Intents: p.Response.Intents, Surface: p.Response.Surface,
+	}.Validate()
+}
+
+func (p AgentDebugFailedPayload) Validate() error {
+	if p.Kind != "failed" || !idPattern.MatchString(p.TraceID) || p.TimeUnixMS < 0 || p.TimeUnixMS > 9007199254740991 {
+		return errors.New("invalid Agent debug failure identity")
+	}
+	if err := bounded("Agent debug failure code", p.Error.Code, 1, 64); err != nil {
+		return err
+	}
+	return bounded("Agent debug failure message", p.Error.Message, 1, 160)
 }
 
 func (i Intent) Validate() error {

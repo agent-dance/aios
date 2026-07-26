@@ -43,6 +43,37 @@ type Runner interface {
 	Readiness(context.Context) Readiness
 }
 
+// ChatTraceStage is a closed host-owned lifecycle marker. It deliberately
+// contains no provider text, prompt content, transcript, tool data, or model
+// reasoning.
+type ChatTraceStage string
+
+const (
+	ChatTraceRequestAccepted   ChatTraceStage = "request.accepted"
+	ChatTraceContextValidated  ChatTraceStage = "context.validated"
+	ChatTraceExecutionStarted  ChatTraceStage = "model.execution.started"
+	ChatTraceExecutionComplete ChatTraceStage = "model.execution.completed"
+	ChatTraceOutputValidated   ChatTraceStage = "output.validated"
+	ChatTraceResponseReady     ChatTraceStage = "response.ready"
+)
+
+// ChatDecisionSummary is a categorical summary derived only after the closed
+// assistant output has passed validation. It is not model rationale.
+type ChatDecisionSummary struct {
+	Mood                string
+	IntentType          string
+	Target              string
+	HasSurface          bool
+	ActiveAgentSelected bool
+}
+
+// ChatTraceSink accepts only closed lifecycle stages and a categorical
+// decision summary. The Runner's raw events can never enter this interface.
+type ChatTraceSink interface {
+	Stage(context.Context, ChatTraceStage) error
+	Decision(context.Context, ChatDecisionSummary) error
+}
+
 type Service struct {
 	runner Runner
 	sem    chan struct{}
@@ -63,7 +94,24 @@ func NewService(runner Runner, maxConcurrent int) (*Service, error) {
 func (s *Service) Readiness(ctx context.Context) Readiness { return s.runner.Readiness(ctx) }
 
 func (s *Service) Chat(ctx context.Context, req protocol.ChatRequest) (protocol.ChatResponse, error) {
+	return s.chat(ctx, req, nil)
+}
+
+func (s *Service) ChatWithTrace(ctx context.Context, req protocol.ChatRequest, trace ChatTraceSink) (protocol.ChatResponse, error) {
+	if trace == nil {
+		return protocol.ChatResponse{}, errors.New("chat trace sink is required")
+	}
+	return s.chat(ctx, req, trace)
+}
+
+func (s *Service) chat(ctx context.Context, req protocol.ChatRequest, trace ChatTraceSink) (protocol.ChatResponse, error) {
 	if err := req.Validate(); err != nil {
+		return protocol.ChatResponse{}, err
+	}
+	if err := emitChatTraceStage(ctx, trace, ChatTraceRequestAccepted); err != nil {
+		return protocol.ChatResponse{}, err
+	}
+	if err := emitChatTraceStage(ctx, trace, ChatTraceContextValidated); err != nil {
 		return protocol.ChatResponse{}, err
 	}
 	key := canonicalInvocationKey("chat", req.ThreadID)
@@ -76,9 +124,15 @@ func (s *Service) Chat(ctx context.Context, req protocol.ChatRequest) (protocol.
 	if err != nil {
 		return protocol.ChatResponse{}, fmt.Errorf("build chat prompt: %w", err)
 	}
+	if err := emitChatTraceStage(ctx, trace, ChatTraceExecutionStarted); err != nil {
+		return protocol.ChatResponse{}, err
+	}
 	result, err := s.runner.Run(ctx, RunRequest{Prompt: prompt, Schema: chatSchema, SchemaName: "alsniper_assistant_turn"})
 	if err != nil {
 		return protocol.ChatResponse{}, fmt.Errorf("%w: %w", ErrAgent, err)
+	}
+	if err := emitChatTraceStage(ctx, trace, ChatTraceExecutionComplete); err != nil {
+		return protocol.ChatResponse{}, err
 	}
 	var output protocol.AgentOutput
 	if err := protocol.DecodeStrict(result.JSON, &output); err != nil {
@@ -108,7 +162,92 @@ func (s *Service) Chat(ctx context.Context, req protocol.ChatRequest) (protocol.
 	if err := output.Validate(); err != nil {
 		return protocol.ChatResponse{}, fmt.Errorf("%w: %v", ErrInvalidAI, err)
 	}
-	return protocol.ChatResponse{RequestID: req.RequestID, RunID: result.RunID, Message: output.Message, Mood: output.Mood, ActiveAgentID: output.ActiveAgentID, Intents: output.Intents, Surface: output.Surface, Usage: result.Usage}, nil
+	if err := emitChatTraceStage(ctx, trace, ChatTraceOutputValidated); err != nil {
+		return protocol.ChatResponse{}, err
+	}
+	intentType := "none"
+	if len(output.Intents) == 1 {
+		intentType = output.Intents[0].Type
+	}
+	if trace != nil {
+		if err := trace.Decision(ctx, ChatDecisionSummary{
+			Mood: output.Mood, IntentType: intentType, Target: chatDecisionTarget(output), HasSurface: output.Surface != nil, ActiveAgentSelected: output.ActiveAgentID != "",
+		}); err != nil {
+			return protocol.ChatResponse{}, err
+		}
+	}
+	response := protocol.ChatResponse{RequestID: req.RequestID, RunID: result.RunID, Message: output.Message, Mood: output.Mood, ActiveAgentID: output.ActiveAgentID, Intents: output.Intents, Surface: output.Surface, Usage: result.Usage}
+	if err := emitChatTraceStage(ctx, trace, ChatTraceResponseReady); err != nil {
+		return protocol.ChatResponse{}, err
+	}
+	return response, nil
+}
+
+func chatDecisionTarget(output protocol.AgentOutput) string {
+	if len(output.Intents) != 1 {
+		return ""
+	}
+	intent := output.Intents[0]
+	switch intent.Type {
+	case "open_app", "close_app", "focus_app", "minimize_app":
+		return intent.AppID
+	case "install_app":
+		return intent.ListingID
+	case "install_agent":
+		if intent.Manifest != nil {
+			return intent.Manifest.ID
+		}
+	case "set_preferences":
+		if intent.Preferences == nil {
+			return ""
+		}
+		fields := make([]string, 0, 5)
+		if intent.Preferences.Theme != nil {
+			fields = append(fields, "theme")
+		}
+		if intent.Preferences.ReduceMotion != nil {
+			fields = append(fields, "reduceMotion")
+		}
+		if intent.Preferences.SoundEffects != nil {
+			fields = append(fields, "soundEffects")
+		}
+		if intent.Preferences.DockMagnification != nil {
+			fields = append(fields, "dockMagnification")
+		}
+		if intent.Preferences.Accent != nil {
+			fields = append(fields, "accent")
+		}
+		return strings.Join(fields, ",")
+	case "set_system_status":
+		if intent.StatusPatch == nil {
+			return ""
+		}
+		fields := make([]string, 0, 5)
+		if intent.StatusPatch.WifiEnabled != nil {
+			fields = append(fields, "wifiEnabled")
+		}
+		if intent.StatusPatch.BluetoothEnabled != nil {
+			fields = append(fields, "bluetoothEnabled")
+		}
+		if intent.StatusPatch.EnergyMode != nil {
+			fields = append(fields, "energyMode")
+		}
+		if intent.StatusPatch.Brightness != nil {
+			fields = append(fields, "brightness")
+		}
+		if intent.StatusPatch.Volume != nil {
+			fields = append(fields, "volume")
+		}
+		return strings.Join(fields, ",")
+	}
+	return ""
+}
+
+func emitChatTraceStage(ctx context.Context, trace ChatTraceSink, stage ChatTraceStage) error {
+	if trace == nil {
+		return nil
+	}
+	return trace.Stage(ctx, stage)
 }
 
 func (s *Service) Decide(ctx context.Context, req protocol.GameDecisionRequest) (protocol.GameDecisionResponse, error) {

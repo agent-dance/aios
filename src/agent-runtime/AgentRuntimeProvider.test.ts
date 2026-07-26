@@ -1,12 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   AgentRegistry,
+  AgentDebugEvent,
   ChatRequest,
   ChatResponse,
   HealthResponse,
   InstalledAgent,
+  RequestOptions,
   SidecarClient,
 } from '../agent-platform';
+import type { AssistantDebugEvent } from '../assistant';
 import { validateAgentManifest } from '../agent-platform';
 import { DEFAULT_SYSTEM_STATUS } from '../system/useSystemStore';
 import { useSystemStore } from '../system/useSystemStore';
@@ -111,6 +114,204 @@ describe('Agent runtime composition', () => {
     expect(useSystemStore.getState().windows.calculator).toBeUndefined();
     expect((await runtime.onSurfaceAction('open-calc')).status).toBe('accepted');
     expect(useSystemStore.getState().windows.calculator?.isOpen).toBe(true);
+  });
+
+  it('keeps the normal chat path trace-free when Debug is disabled', async () => {
+    let observedRequest: ChatRequest | undefined;
+    let observedOptions: RequestOptions | undefined;
+    const client: SidecarClient = {
+      ...clientFor((request) => ({
+        requestId: request.requestId,
+        runId: 'run-no-debug',
+        message: '完成。',
+        mood: 'neutral',
+        intents: [],
+      })),
+      chat: async (request, options) => {
+        observedRequest = request;
+        observedOptions = options;
+        return {
+          requestId: request.requestId,
+          runId: 'run-no-debug',
+          message: '完成。',
+          mood: 'neutral',
+          intents: [],
+        };
+      },
+    };
+
+    const runtime = assembleRuntime(client, emptyRegistry, () => undefined, host());
+    await runtime.assistantClient.run({
+      threadId: 'thread-no-debug',
+      message: '普通请求',
+      source: 'text',
+      context: { activeAppId: null, activeGame: false },
+      signal: new AbortController().signal,
+    });
+
+    expect(observedRequest?.debug).toBeUndefined();
+    expect(observedOptions?.onDebugEvent).toBeUndefined();
+  });
+
+  it('forwards sidecar traces and emits redacted browser authorization and receipt events', async () => {
+    let observedRequest: ChatRequest | undefined;
+    let observedOptions: RequestOptions | undefined;
+    const sidecarEvent: AgentDebugEvent = {
+      kind: 'trace',
+      traceId: 'trace-sidecar',
+      sequence: 0,
+      timeUnixMs: 1,
+      source: 'sidecar',
+      stage: 'analysis',
+      status: 'info',
+      title: 'Planning complete',
+      detail: 'Summary only',
+      elapsedMs: 4,
+    };
+    const client: SidecarClient = {
+      ...clientFor((request) => ({
+        requestId: request.requestId,
+        runId: 'run-debug',
+        message: '打开。',
+        mood: 'focused',
+        intents: [{ id: 'debug-open', type: 'open_app', appId: 'calculator' }],
+      })),
+      chat: async (request, options) => {
+        observedRequest = request;
+        observedOptions = options;
+        await options?.onDebugEvent?.(sidecarEvent);
+        return {
+          requestId: request.requestId,
+          runId: 'run-debug',
+          message: '打开。',
+          mood: 'focused',
+          intents: [{ id: 'debug-open', type: 'open_app', appId: 'calculator' }],
+        };
+      },
+    };
+    const events: AssistantDebugEvent[] = [];
+    const runtime = assembleRuntime(client, emptyRegistry, () => undefined, host());
+
+    const response = await runtime.assistantClient.run({
+      threadId: 'thread-debug',
+      message: '打开计算器',
+      source: 'text',
+      context: { activeAppId: null, activeGame: false },
+      signal: new AbortController().signal,
+      onDebugEvent: (event) => { events.push(event); },
+    });
+
+    expect(observedRequest?.debug).toEqual({ profile: 'agent-debug.v1' });
+    expect(observedOptions?.onDebugEvent).toBeTypeOf('function');
+    expect(events[0]).toMatchObject(sidecarEvent);
+    expect(events.map((event) => event.source)).toEqual([
+      'sidecar',
+      'broker',
+      'broker',
+      'runtime',
+    ]);
+    expect(events.map((event) => event.stage)).toContain('authorization');
+    expect(events.at(-1)).toMatchObject({
+      source: 'runtime',
+      stage: 'completion',
+      status: 'completed',
+      title: 'Capability receipt issued',
+    });
+    expect(events.filter((event) => event.source !== 'sidecar').map((event) => event.detail).join(' '))
+      .not.toContain('calculator');
+    expect(response.receipts?.[0]?.status).toBe('accepted');
+  });
+
+  it('delivers a live sidecar event before the traced chat request resolves', async () => {
+    let resolveChat!: (response: ChatResponse) => void;
+    const events: AssistantDebugEvent[] = [];
+    const client: SidecarClient = {
+      ...clientFor((request) => ({
+        requestId: request.requestId,
+        runId: 'unused',
+        message: 'unused',
+        mood: 'neutral',
+        intents: [],
+      })),
+      chat: async (request, options) => {
+        await options?.onDebugEvent?.({
+          kind: 'trace',
+          traceId: 'trace-live',
+          sequence: 0,
+          timeUnixMs: 1,
+          source: 'sidecar',
+          stage: 'request',
+          status: 'started',
+          title: 'Request accepted',
+          elapsedMs: 1,
+        });
+        return new Promise<ChatResponse>((resolve) => { resolveChat = resolve; });
+      },
+    };
+    const runtime = assembleRuntime(client, emptyRegistry, () => undefined, host());
+    const runPromise = runtime.assistantClient.run({
+      threadId: 'thread-live-debug',
+      message: '等待响应',
+      source: 'text',
+      context: { activeAppId: null, activeGame: false },
+      signal: new AbortController().signal,
+      onDebugEvent: (event) => { events.push(event); },
+    });
+
+    await vi.waitFor(() => {
+      expect(events).toHaveLength(1);
+      expect(resolveChat).toBeTypeOf('function');
+    });
+    resolveChat({
+      requestId: 'chat-request-1',
+      runId: 'run-live',
+      message: '完成。',
+      mood: 'neutral',
+      intents: [],
+    });
+    await expect(runPromise).resolves.toMatchObject({ message: '完成。' });
+  });
+
+  it('does not let a never-resolving Debug observer delay normal chat completion', async () => {
+    const client: SidecarClient = {
+      ...clientFor((request) => ({
+        requestId: request.requestId,
+        runId: 'run-isolated-debug',
+        message: '正常完成。',
+        mood: 'neutral',
+        intents: [],
+      })),
+      chat: async (request, options) => {
+        await options?.onDebugEvent?.({
+          kind: 'trace',
+          traceId: 'trace-isolated',
+          sequence: 0,
+          timeUnixMs: 1,
+          source: 'sidecar',
+          stage: 'analysis',
+          status: 'info',
+          title: 'Non-blocking event',
+          elapsedMs: 2,
+        });
+        return {
+          requestId: request.requestId,
+          runId: 'run-isolated-debug',
+          message: '正常完成。',
+          mood: 'neutral',
+          intents: [],
+        };
+      },
+    };
+    const runtime = assembleRuntime(client, emptyRegistry, () => undefined, host());
+
+    await expect(runtime.assistantClient.run({
+      threadId: 'thread-isolated-debug',
+      message: '普通请求',
+      source: 'text',
+      context: { activeAppId: null, activeGame: false },
+      signal: new AbortController().signal,
+      onDebugEvent: () => new Promise<void>(() => undefined),
+    })).resolves.toMatchObject({ message: '正常完成。' });
   });
 
   it('requires trusted Host approval for an app installation intent', async () => {

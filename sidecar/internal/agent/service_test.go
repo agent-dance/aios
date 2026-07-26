@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,21 @@ type fakeRunner struct {
 	entered chan RunRequest
 	release chan struct{}
 	err     error
+}
+
+type recordingChatTrace struct {
+	stages    []ChatTraceStage
+	decisions []ChatDecisionSummary
+}
+
+func (r *recordingChatTrace) Stage(_ context.Context, stage ChatTraceStage) error {
+	r.stages = append(r.stages, stage)
+	return nil
+}
+
+func (r *recordingChatTrace) Decision(_ context.Context, decision ChatDecisionSummary) error {
+	r.decisions = append(r.decisions, decision)
+	return nil
 }
 
 func (f *fakeRunner) Run(ctx context.Context, req RunRequest) (RunResult, error) {
@@ -63,6 +79,33 @@ func TestServiceAttachesRevisionAndFinalizesManifest(t *testing.T) {
 	}
 	if intent.Manifest.ContentDigest == "" || intent.Manifest.GeneratedBy == nil || intent.Manifest.GeneratedBy.RunID != "run-1" {
 		t.Fatalf("manifest was not finalized: %+v", intent.Manifest)
+	}
+}
+
+func TestChatWithTraceEmitsOnlyClosedHostMilestones(t *testing.T) {
+	runner := &fakeRunner{output: []byte(`{"message":"Ready","mood":"focused","intents":[]}`)}
+	service, _ := NewService(runner, 1)
+	trace := &recordingChatTrace{}
+	response, err := service.ChatWithTrace(context.Background(), chatRequest("thread-trace"), trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStages := []ChatTraceStage{
+		ChatTraceRequestAccepted,
+		ChatTraceContextValidated,
+		ChatTraceExecutionStarted,
+		ChatTraceExecutionComplete,
+		ChatTraceOutputValidated,
+		ChatTraceResponseReady,
+	}
+	if fmt.Sprint(trace.stages) != fmt.Sprint(wantStages) {
+		t.Fatalf("trace stages = %v, want %v", trace.stages, wantStages)
+	}
+	if len(trace.decisions) != 1 || trace.decisions[0] != (ChatDecisionSummary{Mood: "focused", IntentType: "none"}) {
+		t.Fatalf("trace decision = %+v", trace.decisions)
+	}
+	if response.Message != "Ready" || response.Mood != "focused" {
+		t.Fatalf("response changed by trace mode: %+v", response)
 	}
 }
 

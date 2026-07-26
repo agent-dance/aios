@@ -14,6 +14,16 @@ export interface AssistantConversationEntry {
   readonly content: string;
 }
 
+export interface AssistantDebugEvent {
+  readonly kind: 'trace';
+  readonly source: 'sidecar' | 'runtime' | 'broker';
+  readonly stage: 'request' | 'analysis' | 'decision' | 'authorization' | 'completion';
+  readonly status: 'started' | 'completed' | 'info' | 'failed';
+  readonly title: string;
+  readonly detail?: string;
+  readonly elapsedMs: number;
+}
+
 export interface AssistantRequest {
   readonly threadId: string;
   readonly message: string;
@@ -21,6 +31,7 @@ export interface AssistantRequest {
   readonly source: AssistantInputSource;
   readonly context: AssistantContext;
   readonly signal: AbortSignal;
+  readonly onDebugEvent?: (event: AssistantDebugEvent) => void | Promise<void>;
 }
 
 export interface AssistantSurfaceText {

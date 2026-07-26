@@ -13,6 +13,7 @@ export type {
   AssistantClient,
   AssistantConversationEntry,
   AssistantContext,
+  AssistantDebugEvent,
   AssistantInputSource,
   AssistantMessage,
   AssistantMood,

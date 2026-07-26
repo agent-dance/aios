@@ -45,11 +45,14 @@ The default browser origin is `http://localhost:5173` and the default endpoint i
 
 - `GET /v1/health` returns sanitized readiness, limits, and profile/auth-link status.
 - `POST /v1/chat` accepts a user message plus a revisioned OS context and returns a typed assistant turn, zero or one closed intent, and an optional restricted A2UI surface.
+- `POST /v1/chat/trace` is the explicit `agent-debug.v1` mode. It streams only allowlisted lifecycle and categorical decision-summary frames, each authenticated by a forward HMAC chain, and terminates with the same typed assistant response. It never forwards raw model reasoning, prompts, provider output, tool data, paths, credentials, or hidden game state.
 - `POST /v1/game/decide` accepts one seat projection and its complete legal actions and returns one member `actionId`.
 
 All endpoints require `X-AIOS-Protocol-Version`, `X-AIOS-Timestamp`, `X-AIOS-Nonce`, `X-AIOS-Content-SHA256`, and `X-AIOS-Signature`. Request signatures bind method, normalized sidecar authority, path, exact origin, protocol, timestamp, nonce, and exact body hash; redirects are rejected. The acceptance window is 30 seconds and each nonce is consumed once through a bounded, fail-closed replay cache. A separate 16-slot fail-closed gate bounds pre-authentication body buffering and hashing.
 
 Every application response, including errors, is signed over the request nonce, generated `X-Request-Id`, HTTP status, exact response-body hash, and protocol version. The browser verifies the response bytes and HMAC before parsing JSON or accepting readiness, intents, A2UI, or game actions. Errors use `{ "error": { "code", "message", "requestId", "retryable" } }` and never include provider stderr. The architecture document contains the normative canonical formats and CORS contract.
+
+The Debug stream is the sole exception to whole-body response signing: it authenticates every bounded NDJSON frame before delivery and chains each frame MAC to its predecessor. The client accepts a result only after one authenticated terminal frame and EOF. Debug capture is disabled by default, memory-only in the browser, and does not enable the pinned SDK's provider reasoning stream or change Codex's batch, strict-output, read-only, ephemeral execution path.
 
 ## Verification
 

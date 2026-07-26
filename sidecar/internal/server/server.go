@@ -94,6 +94,7 @@ func New(cfg config.Config, service *agent.Service) (*Server, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", server.health)
 	mux.HandleFunc("/v1/chat", server.chat)
+	mux.HandleFunc(agentDebugTracePath, server.chatTrace)
 	mux.HandleFunc("/v1/game/decide", server.decide)
 	mux.HandleFunc("/", server.notFound)
 	server.handler = server.security(mux)
@@ -194,7 +195,7 @@ func (s *Server) security(next http.Handler) http.Handler {
 		origin := r.Header.Get("Origin")
 		if origin == s.cfg.AllowedOrigin {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Access-Control-Expose-Headers", strings.Join([]string{headerProtocol, headerRequestID, headerRequestNonce, headerContentSHA256, headerSignature}, ", "))
+			w.Header().Set("Access-Control-Expose-Headers", strings.Join([]string{headerProtocol, headerRequestID, headerRequestNonce, headerContentSHA256, headerSignature, headerAgentDebugProfile}, ", "))
 			w.Header().Set("Vary", "Origin")
 		}
 		if r.Method == http.MethodOptions {

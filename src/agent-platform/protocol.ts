@@ -4,6 +4,7 @@ import type { OsIntent, SystemStatusSnapshot } from './intents';
 import type { JsonValue } from './validation';
 
 export const AIOS_AGENT_PROTOCOL_VERSION = '1.0.0' as const;
+export const AIOS_AGENT_DEBUG_PROFILE = 'agent-debug.v1' as const;
 
 export interface HealthResponse {
   readonly protocolVersion: typeof AIOS_AGENT_PROTOCOL_VERSION;
@@ -57,7 +58,54 @@ export interface ChatRequest {
     readonly content: string;
   }[];
   readonly context: OsContextSnapshot;
+  /** Browser-only opt-in. The client wraps this request for the trace endpoint. */
+  readonly debug?: {
+    readonly profile: typeof AIOS_AGENT_DEBUG_PROFILE;
+  };
 }
+
+export type AgentDebugSource = 'sidecar' | 'runtime' | 'broker';
+export type AgentDebugStage = 'request' | 'analysis' | 'decision' | 'authorization' | 'completion';
+export type AgentDebugStatus = 'started' | 'completed' | 'info' | 'failed';
+
+/**
+ * A deliberately summary-only observability projection. It is neither a raw
+ * chain-of-thought channel nor an authority/receipt record.
+ */
+export interface AgentDebugEvent {
+  readonly kind: 'trace';
+  readonly traceId: string;
+  readonly sequence: number;
+  readonly timeUnixMs: number;
+  readonly source: AgentDebugSource;
+  readonly stage: AgentDebugStage;
+  readonly status: AgentDebugStatus;
+  readonly title: string;
+  readonly detail?: string;
+  readonly elapsedMs: number;
+}
+
+export type AgentDebugTracePayload = Omit<AgentDebugEvent, 'sequence'>;
+
+export interface AgentDebugCompleted {
+  readonly kind: 'completed';
+  readonly traceId: string;
+  readonly timeUnixMs: number;
+  readonly response: ChatResponse;
+}
+
+export interface AgentDebugFailed {
+  readonly kind: 'failed';
+  readonly traceId: string;
+  readonly timeUnixMs: number;
+  readonly error: {
+    readonly code: string;
+    readonly message: string;
+    readonly retryable: boolean;
+  };
+}
+
+export type AgentDebugFramePayload = AgentDebugTracePayload | AgentDebugCompleted | AgentDebugFailed;
 
 export interface UsageSummary {
   readonly inputTokens: number;

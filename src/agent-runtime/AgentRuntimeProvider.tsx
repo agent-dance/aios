@@ -1,5 +1,11 @@
 import { createContext, lazy, Suspense, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
-import type { AssistantActionReceipt, AssistantClient, AssistantConversationEntry, AssistantSurfaceRenderer } from '../assistant';
+import type {
+  AssistantActionReceipt,
+  AssistantClient,
+  AssistantConversationEntry,
+  AssistantDebugEvent,
+  AssistantSurfaceRenderer,
+} from '../assistant';
 import type { AiPrivacyStatus } from '../apps/settings';
 import type { AgentLibraryEntry, AgentLibraryPort } from '../apps/store';
 import type {
@@ -33,7 +39,11 @@ import {
 } from '../agent-platform/capabilityBroker';
 import { createSidecarAgentController } from '../agent-platform/game';
 import type { BrokerIntent, OsIntent } from '../agent-platform/intents';
-import type { OsContextSnapshot } from '../agent-platform/protocol';
+import {
+  AIOS_AGENT_DEBUG_PROFILE,
+  type AgentDebugEvent,
+  type OsContextSnapshot,
+} from '../agent-platform/protocol';
 import { createSidecarClient, type SidecarClient } from '../agent-platform/sidecarClient';
 import { isAppId } from '../system/appRegistry';
 import type { SystemPreferences } from '../system/types';
@@ -302,7 +312,48 @@ export const assembleRuntime = (
   refreshAgents: () => void,
   host: AgentRuntimeHostPort = browserHost,
 ): RuntimeAssembly => {
-  const pendingIntents = new Map<string, { intent: OsIntent; revision: number; activeAgentId?: string }>();
+  type DebugObserver = (event: AssistantDebugEvent) => void | Promise<void>;
+  type DebugEmitter = (
+    source: AgentDebugEvent['source'],
+    stage: AgentDebugEvent['stage'],
+    status: AgentDebugEvent['status'],
+    title: string,
+    detail?: string,
+  ) => void;
+  const createDebugEmitter = (
+    observer: DebugObserver | undefined,
+    traceId: string,
+  ): DebugEmitter | undefined => {
+    if (!observer) return undefined;
+    const startedAt = Date.now();
+    let sequence = 0;
+    return (source, stage, status, title, detail) => {
+      const timeUnixMs = Date.now();
+      const event: AgentDebugEvent = {
+        kind: 'trace',
+        traceId,
+        sequence: sequence++,
+        timeUnixMs,
+        source,
+        stage,
+        status,
+        title,
+        ...(detail === undefined ? {} : { detail }),
+        elapsedMs: Math.max(0, timeUnixMs - startedAt),
+      };
+      try {
+        void Promise.resolve(observer(event)).catch(() => undefined);
+      } catch {
+        // Debug observation is intentionally isolated from authority and chat semantics.
+      }
+    };
+  };
+  const pendingIntents = new Map<string, {
+    intent: OsIntent;
+    revision: number;
+    activeAgentId?: string;
+    emitDebug?: DebugEmitter;
+  }>();
   const ports: OsCapabilityPorts = {
       apps: {
         open: (appId) => {
@@ -479,6 +530,7 @@ export const assembleRuntime = (
     intent: OsIntent,
     revision: number,
     activeAgentId?: string,
+    emitDebug?: DebugEmitter,
   ): Promise<AssistantActionReceipt> => {
     const installation = activeAgentId === undefined ? undefined : registry.get(activeAgentId);
     const agentIdentity = installation === undefined ? undefined : {
@@ -486,12 +538,48 @@ export const assembleRuntime = (
       version: installation.manifest.version,
       digest: installation.digest,
     };
+    emitDebug?.(
+      'broker',
+      'authorization',
+      'started',
+      'Checking OS capability authorization',
+      `Intent type: ${intent.type}`,
+    );
     try {
       const authority = activeAgentId === undefined ? broker : brokerForAgent(activeAgentId);
       const receipt = await authority.execute(intent, { expectedRevision: revision });
+      emitDebug?.(
+        'broker',
+        'authorization',
+        'completed',
+        'OS capability authorized and executed',
+        `Intent type: ${intent.type}`,
+      );
+      emitDebug?.(
+        'runtime',
+        'completion',
+        'completed',
+        'Capability receipt issued',
+        `Receipt status: accepted; OS revision: ${receipt.revision}`,
+      );
       return receiptView(receipt, agentIdentity);
     } catch (error) {
-      return failedReceipt(intent.id, error, agentIdentity);
+      const receipt = failedReceipt(intent.id, error, agentIdentity);
+      emitDebug?.(
+        'broker',
+        'authorization',
+        'failed',
+        'OS capability was not executed',
+        `Intent type: ${intent.type}`,
+      );
+      emitDebug?.(
+        'runtime',
+        'completion',
+        receipt.status === 'rejected' ? 'info' : 'failed',
+        'Capability receipt issued',
+        `Receipt status: ${receipt.status}`,
+      );
+      return receipt;
     }
   };
 
@@ -513,8 +601,10 @@ export const assembleRuntime = (
         : Object.freeze([]);
       const runningGameIds = (['space-game', 'doudizhu'] as const)
         .filter((gameId) => system.windows[gameId]?.isOpen === true);
+      const requestId = `chat-${host.requestId()}`;
+      const emitDebug = createDebugEmitter(request.onDebugEvent, requestId);
       const response = await client.chat({
-        requestId: `chat-${host.requestId()}`,
+        requestId,
         threadId,
         message: boundDomainAgent?.message ?? message,
         ...(principalHistory === undefined ? {} : { history: principalHistory }),
@@ -531,7 +621,19 @@ export const assembleRuntime = (
           runningGameIds,
           enabledAgents,
         },
-      }, { signal });
+        ...(request.onDebugEvent ? { debug: { profile: AIOS_AGENT_DEBUG_PROFILE } } : {}),
+      }, {
+        signal,
+        ...(request.onDebugEvent ? {
+          onDebugEvent: (event) => {
+            try {
+              void Promise.resolve(request.onDebugEvent?.(event)).catch(() => undefined);
+            } catch {
+              // Debug observation is intentionally isolated from chat completion.
+            }
+          },
+        } : {}),
+      });
       if (response.activeAgentId !== undefined && response.activeAgentId !== boundDomainAgent?.id) {
         throw new Error('The sidecar response does not match the Host-bound domain Agent principal.');
       }
@@ -546,9 +648,10 @@ export const assembleRuntime = (
             intent,
             revision,
             ...(authorityAgentId === undefined ? {} : { activeAgentId: authorityAgentId }),
+            ...(emitDebug === undefined ? {} : { emitDebug }),
           });
         } else {
-          receipts.push(await executeIntent(intent, revision, authorityAgentId));
+          receipts.push(await executeIntent(intent, revision, authorityAgentId, emitDebug));
         }
       }
       return {
@@ -563,7 +666,12 @@ export const assembleRuntime = (
   const onSurfaceAction = async (intentId: string): Promise<AssistantActionReceipt> => {
     const pending = pendingIntents.get(intentId);
     if (!pending) return { id: intentId, label: 'OS capability', status: 'failed', detail: 'This action is no longer available.' };
-    const receipt = await executeIntent(pending.intent, pending.revision, pending.activeAgentId);
+    const receipt = await executeIntent(
+      pending.intent,
+      pending.revision,
+      pending.activeAgentId,
+      pending.emitDebug,
+    );
     if (receipt.status === 'accepted' || receipt.status === 'rejected') pendingIntents.delete(intentId);
     return receipt;
   };

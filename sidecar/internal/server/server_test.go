@@ -24,12 +24,16 @@ type runner struct {
 	output []byte
 	ready  bool
 	wait   bool
+	err    error
 }
 
 func (f runner) Run(ctx context.Context, _ agent.RunRequest) (agent.RunResult, error) {
 	if f.wait {
 		<-ctx.Done()
 		return agent.RunResult{}, ctx.Err()
+	}
+	if f.err != nil {
+		return agent.RunResult{}, f.err
 	}
 	return agent.RunResult{RunID: "run-1", JSON: f.output}, nil
 }
@@ -111,7 +115,7 @@ func TestHealthAndCORSPreflight(t *testing.T) {
 	}
 	verifySignedResponse(t, rec, cfg, "00112233445566778899aabbccddeeff")
 	exposed := strings.ToLower(rec.Header().Get("Access-Control-Expose-Headers"))
-	for _, required := range []string{"x-aios-protocol-version", "x-request-id", "x-aios-request-nonce", "x-aios-content-sha256", "x-aios-signature"} {
+	for _, required := range []string{"x-aios-protocol-version", "x-request-id", "x-aios-request-nonce", "x-aios-content-sha256", "x-aios-signature", "x-aios-stream-profile"} {
 		if !strings.Contains(exposed, required) {
 			t.Fatalf("browser cannot read %s response header: %q", required, exposed)
 		}

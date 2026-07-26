@@ -1,5 +1,6 @@
 export const ASSISTANT_MESSAGE_HISTORY_LIMIT = 40;
 export const ASSISTANT_RECEIPT_HISTORY_LIMIT = 12;
+export const ASSISTANT_DEBUG_EVENT_LIMIT = 200;
 
 export const appendBounded = <T>(
   current: readonly T[],

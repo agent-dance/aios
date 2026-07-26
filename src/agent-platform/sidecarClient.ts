@@ -2,7 +2,12 @@ import { validateA2uiSurface } from './a2ui';
 import { AGENT_CONTRIBUTIONS, OS_CAPABILITIES } from './agentManifest';
 import { validateOsIntent, validateSystemStatusSnapshot } from './intents';
 import {
+  AIOS_AGENT_DEBUG_PROFILE,
   AIOS_AGENT_PROTOCOL_VERSION,
+  type AgentDebugCompleted,
+  type AgentDebugEvent,
+  type AgentDebugFailed,
+  type AgentDebugFramePayload,
   type ChatRequest,
   type ChatResponse,
   type GameDecisionRequest,
@@ -35,6 +40,7 @@ export type SidecarClientErrorCode =
   | 'SIDECAR_HTTP_ERROR'
   | 'SIDECAR_PROTOCOL_MISMATCH'
   | 'SIDECAR_RESPONSE_AUTH_FAILED'
+  | 'SIDECAR_DEBUG_OBSERVER_FAILED'
   | 'SIDECAR_INVALID_RESPONSE';
 
 export class SidecarClientError extends Error {
@@ -70,6 +76,7 @@ export interface SidecarClient {
 export interface RequestOptions {
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
+  readonly onDebugEvent?: (event: AgentDebugEvent) => void | Promise<void>;
 }
 
 interface SidecarClientConfig {
@@ -90,6 +97,15 @@ const HEX_SHA256 = /^[0-9a-f]{64}$/;
 const REQUEST_SIGNATURE_CONTEXT = 'AIOS1-REQUEST';
 const RESPONSE_SIGNATURE_CONTEXT = 'AIOS1-RESPONSE';
 const RESPONSE_BODY_LIMIT = 4 * 1024 * 1024;
+const DEBUG_STREAM_PATH = '/v1/chat/trace';
+const DEBUG_STREAM_CONTENT_TYPE = 'application/x-ndjson';
+const DEBUG_STREAM_FRAME_CONTEXT = 'AIOS1-STREAM-FRAME';
+const DEBUG_STREAM_MAX_TRACE_PAYLOAD_BYTES = 32 * 1024;
+const DEBUG_STREAM_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
+const DEBUG_STREAM_MAX_FRAME_BYTES = 6 * 1024 * 1024;
+const DEBUG_STREAM_MAX_BYTES = 6 * 1024 * 1024;
+const DEBUG_STREAM_MAX_FRAMES = 16;
+const DEBUG_STREAM_INITIAL_MAC = '0'.repeat(64);
 const AUTHENTICATION_WINDOW_MS = 30_000;
 const NONCE_CACHE_CAPACITY = 4096;
 const encoder = new TextEncoder();
@@ -141,7 +157,7 @@ const validateEnabledAgents = (value: unknown, path: string): OsContextSnapshot[
 
 export const validateChatRequest = (value: unknown): ChatRequest => {
   const record = assertRecord(value, 'request');
-  assertExactKeys(record, ['requestId', 'threadId', 'message', 'context'], ['history'], 'request');
+  assertExactKeys(record, ['requestId', 'threadId', 'message', 'context'], ['history', 'debug'], 'request');
   const context = assertRecord(record.context, 'request.context');
   assertExactKeys(context, ['osRevision'], [
     'locale',
@@ -154,6 +170,14 @@ export const validateChatRequest = (value: unknown): ChatRequest => {
     'enabledAgents',
     'runningGames',
   ], 'request.context');
+  const debug = record.debug === undefined ? undefined : (() => {
+    const candidate = assertRecord(record.debug, 'request.debug');
+    assertExactKeys(candidate, ['profile'], [], 'request.debug');
+    if (candidate.profile !== AIOS_AGENT_DEBUG_PROFILE) {
+      throw new ValidationError('request.debug.profile', 'unsupported Agent debug profile');
+    }
+    return Object.freeze({ profile: AIOS_AGENT_DEBUG_PROFILE });
+  })();
   return Object.freeze({
     requestId: assertString(record.requestId, 'request.requestId', { min: 1, max: 128, pattern: REQUEST_ID }),
     threadId: assertString(record.threadId, 'request.threadId', { min: 1, max: 128, pattern: REQUEST_ID }),
@@ -205,6 +229,7 @@ export const validateChatRequest = (value: unknown): ChatRequest => {
         })),
       }),
     }),
+    ...(debug === undefined ? {} : { debug }),
   });
 };
 
@@ -362,6 +387,47 @@ export const validateGameDecisionResponse = (value: unknown): GameDecisionRespon
   });
 };
 
+const validateDebugFramePayload = (value: unknown): AgentDebugFramePayload => {
+  const record = assertRecord(value, 'debugFrame.payload');
+  const kind = assertEnum(record.kind, ['trace', 'completed', 'failed'], 'debugFrame.payload.kind');
+  if (kind === 'trace') {
+    assertExactKeys(record, ['kind', 'traceId', 'timeUnixMs', 'source', 'stage', 'status', 'title', 'elapsedMs'], ['detail'], 'debugFrame.payload');
+    return Object.freeze({
+      kind,
+      traceId: assertString(record.traceId, 'debugFrame.payload.traceId', { min: 1, max: 128, pattern: REQUEST_ID }),
+      timeUnixMs: assertSafeInteger(record.timeUnixMs, 'debugFrame.payload.timeUnixMs', { min: 0 }),
+      source: assertEnum(record.source, ['sidecar'], 'debugFrame.payload.source'),
+      stage: assertEnum(record.stage, ['request', 'analysis', 'decision', 'authorization', 'completion'], 'debugFrame.payload.stage'),
+      status: assertEnum(record.status, ['started', 'completed', 'info', 'failed'], 'debugFrame.payload.status'),
+      title: assertString(record.title, 'debugFrame.payload.title', { min: 1, max: 80 }),
+      ...(record.detail === undefined ? {} : { detail: assertString(record.detail, 'debugFrame.payload.detail', { min: 1, max: 240 }) }),
+      elapsedMs: assertSafeInteger(record.elapsedMs, 'debugFrame.payload.elapsedMs', { min: 0, max: 600_000 }),
+    });
+  }
+  if (kind === 'completed') {
+    assertExactKeys(record, ['kind', 'traceId', 'timeUnixMs', 'response'], [], 'debugFrame.payload');
+    return Object.freeze({
+      kind,
+      traceId: assertString(record.traceId, 'debugFrame.payload.traceId', { min: 1, max: 128, pattern: REQUEST_ID }),
+      timeUnixMs: assertSafeInteger(record.timeUnixMs, 'debugFrame.payload.timeUnixMs', { min: 0 }),
+      response: validateChatResponse(record.response),
+    }) satisfies AgentDebugCompleted;
+  }
+  assertExactKeys(record, ['kind', 'traceId', 'timeUnixMs', 'error'], [], 'debugFrame.payload');
+  const error = assertRecord(record.error, 'debugFrame.payload.error');
+  assertExactKeys(error, ['code', 'message', 'retryable'], [], 'debugFrame.payload.error');
+  return Object.freeze({
+    kind,
+    traceId: assertString(record.traceId, 'debugFrame.payload.traceId', { min: 1, max: 128, pattern: REQUEST_ID }),
+    timeUnixMs: assertSafeInteger(record.timeUnixMs, 'debugFrame.payload.timeUnixMs', { min: 0 }),
+    error: Object.freeze({
+      code: assertString(error.code, 'debugFrame.payload.error.code', { min: 1, max: 64, pattern: REQUEST_ID }),
+      message: assertString(error.message, 'debugFrame.payload.error.message', { min: 1, max: 500 }),
+      retryable: assertBoolean(error.retryable, 'debugFrame.payload.error.retryable'),
+    }),
+  }) satisfies AgentDebugFailed;
+};
+
 const validateErrorEnvelope = (value: unknown): SidecarErrorEnvelope | undefined => {
   try {
     const root = assertRecord(value, 'response');
@@ -445,6 +511,50 @@ export const canonicalSidecarResponse = (
   bodyHash: string,
   protocolVersion: string,
 ): string => [RESPONSE_SIGNATURE_CONTEXT, nonce, requestId, String(status), bodyHash, protocolVersion].join('\n');
+
+export const canonicalAgentDebugFrame = (
+  nonce: string,
+  requestId: string,
+  authority: string,
+  method: string,
+  path: string,
+  status: number,
+  profile: string,
+  sequence: number,
+  previousMac: string,
+  payloadHash: string,
+  protocolVersion: string,
+): string => [
+  DEBUG_STREAM_FRAME_CONTEXT,
+  nonce,
+  requestId,
+  authority,
+  method,
+  path,
+  String(status),
+  profile,
+  String(sequence),
+  previousMac,
+  payloadHash,
+  protocolVersion,
+].join('\n');
+
+const decodeBase64Url = (value: string): Uint8Array => {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error('invalid base64url payload');
+  const paddingLength = (4 - (value.length % 4)) % 4;
+  if (paddingLength === 3) throw new Error('invalid base64url length');
+  const normalized = value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat(paddingLength);
+  const decoded = atob(normalized);
+  const bytes = new Uint8Array(decoded.length);
+  for (let index = 0; index < decoded.length; index += 1) bytes[index] = decoded.charCodeAt(index);
+  return bytes;
+};
+
+const encodeBase64Url = (value: Uint8Array): string => {
+  let binary = '';
+  for (const byte of value) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+};
 
 const readBoundedResponse = async (response: Response): Promise<Uint8Array> => {
   const declaredLength = response.headers.get('content-length');
@@ -645,6 +755,239 @@ export const createSidecarClient = (config: SidecarClientConfig): SidecarClient 
     return request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: json }, validate, options);
   };
 
+  const chatWithDebug = async (chatRequest: ChatRequest, options: RequestOptions = {}): Promise<ChatResponse> => {
+    if (getOrigin() !== origin) throw new SidecarClientError('SIDECAR_ORIGIN_MISMATCH', 'Browser origin does not match the sidecar capability binding.');
+    const timeoutMs = options.timeoutMs ?? defaultTimeout;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 300_000) {
+      throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Request timeout must be between 100 and 300000ms.');
+    }
+    const linked = linkedSignal(options.signal, timeoutMs);
+    const { debug: _debug, ...wireRequest } = chatRequest;
+    const requestBody = JSON.stringify(assertJsonValue({ profile: AIOS_AGENT_DEBUG_PROFILE, request: wireRequest }, 'request'));
+    const bodyBytes = encoder.encode(requestBody);
+    const bodyHash = await sha256Hex(cryptoProvider, bodyBytes);
+    const timestamp = String(Math.trunc(now()));
+    if (!/^\d{1,16}$/.test(timestamp)) {
+      linked.dispose();
+      throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'System time cannot be represented for sidecar authentication.');
+    }
+    const nonce = newNonce();
+    const key = await hmacKey;
+    const requestSignature = await hmacHex(
+      cryptoProvider,
+      key,
+      canonicalSidecarRequest('POST', sidecarAuthority, DEBUG_STREAM_PATH, origin, AIOS_AGENT_PROTOCOL_VERSION, timestamp, nonce, bodyHash),
+    );
+    let response: Response;
+    try {
+      response = await fetcher(`${baseUrl}${DEBUG_STREAM_PATH}`, {
+        method: 'POST',
+        mode: 'cors',
+        cache: 'no-store',
+        redirect: 'error',
+        credentials: 'omit',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: DEBUG_STREAM_CONTENT_TYPE,
+          'X-AIOS-Protocol-Version': AIOS_AGENT_PROTOCOL_VERSION,
+          'X-AIOS-Timestamp': timestamp,
+          'X-AIOS-Nonce': nonce,
+          'X-AIOS-Content-SHA256': bodyHash,
+          'X-AIOS-Signature': requestSignature,
+        },
+        body: requestBody,
+        signal: linked.signal,
+      });
+    } catch (error) {
+      linked.dispose();
+      if (linked.timedOut()) throw new SidecarClientError('SIDECAR_TIMEOUT', 'Sidecar request timed out.', { retryable: true, cause: error });
+      if (options.signal?.aborted) throw new SidecarClientError('SIDECAR_ABORTED', 'Sidecar request was cancelled.', { cause: error });
+      throw new SidecarClientError('SIDECAR_NETWORK_ERROR', 'Sidecar could not be reached.', { retryable: true, cause: error });
+    }
+
+    const responseVersion = response.headers.get('x-aios-protocol-version') ?? '';
+    const responseNonce = response.headers.get('x-aios-request-nonce') ?? '';
+    const responseRequestId = response.headers.get('x-request-id') ?? '';
+    try {
+      if (response.status !== 200) {
+        const responseBody = await readBoundedResponse(response);
+        const declaredHash = response.headers.get('x-aios-content-sha256') ?? '';
+        const declaredSignature = response.headers.get('x-aios-signature') ?? '';
+        if (
+          responseVersion.length > 32 || responseNonce !== nonce || !REQUEST_ID.test(responseRequestId) ||
+          !HEX_SHA256.test(declaredHash) || !HEX_SHA256.test(declaredSignature)
+        ) {
+          throw new SidecarClientError('SIDECAR_RESPONSE_AUTH_FAILED', 'Sidecar response authentication metadata is invalid.', { status: response.status });
+        }
+        const actualHash = await sha256Hex(cryptoProvider, responseBody);
+        const authenticated = actualHash === declaredHash && await verifyHmac(
+          cryptoProvider,
+          key,
+          canonicalSidecarResponse(nonce, responseRequestId, response.status, declaredHash, responseVersion),
+          declaredSignature,
+        );
+        if (!authenticated) {
+          throw new SidecarClientError('SIDECAR_RESPONSE_AUTH_FAILED', 'Sidecar response authentication failed.', { status: response.status });
+        }
+        if (responseVersion !== AIOS_AGENT_PROTOCOL_VERSION) {
+          throw new SidecarClientError('SIDECAR_PROTOCOL_MISMATCH', 'Sidecar protocol version does not match.', { status: response.status });
+        }
+        const envelope = validateErrorEnvelope(parseJson(response, responseBody));
+        throw new SidecarClientError('SIDECAR_HTTP_ERROR', envelope?.error.message ?? 'Sidecar rejected the debug stream.', {
+          status: response.status,
+          remoteCode: envelope?.error.code,
+          retryable: envelope?.error.retryable,
+          requestId: envelope?.error.requestId,
+        });
+      }
+
+      const contentType = (response.headers.get('content-type') ?? '').split(';', 1)[0]?.trim().toLowerCase();
+      if (
+        responseVersion !== AIOS_AGENT_PROTOCOL_VERSION || responseNonce !== nonce || !REQUEST_ID.test(responseRequestId) ||
+        response.headers.get('x-aios-stream-profile') !== AIOS_AGENT_DEBUG_PROFILE || contentType !== DEBUG_STREAM_CONTENT_TYPE || !response.body
+      ) {
+        await response.body?.cancel('Agent debug stream metadata rejected').catch(() => undefined);
+        throw new SidecarClientError('SIDECAR_RESPONSE_AUTH_FAILED', 'Agent debug stream metadata is invalid.', { status: response.status });
+      }
+
+      const reader = response.body.getReader();
+      let buffered = new Uint8Array();
+      let totalBytes = 0;
+      let frameCount = 0;
+      let expectedSequence = 1;
+      let previousMac = DEBUG_STREAM_INITIAL_MAC;
+      let traceId: string | undefined;
+      let completed: ChatResponse | undefined;
+      let failed: AgentDebugFailed['error'] | undefined;
+      let terminalSeen = false;
+
+      const consumeLine = async (lineBytes: Uint8Array): Promise<void> => {
+        if (terminalSeen) throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream contains data after its terminal frame.');
+        if (lineBytes.byteLength === 0 || lineBytes.byteLength > DEBUG_STREAM_MAX_FRAME_BYTES || lineBytes.includes(13)) {
+          throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream contains an invalid frame size or delimiter.');
+        }
+        frameCount += 1;
+        if (frameCount > DEBUG_STREAM_MAX_FRAMES) {
+          throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream exceeds the accepted frame count.');
+        }
+        let line: string;
+        try { line = decoder.decode(lineBytes); } catch (error) {
+          throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream frame is not valid UTF-8.', { cause: error });
+        }
+        const match = /^([1-9][0-9]{0,5})\.([A-Za-z0-9_-]+)\.([0-9a-f]{64})$/.exec(line);
+        if (!match) throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream frame encoding is invalid.');
+        const sequence = Number(match[1]);
+        if (sequence !== expectedSequence) {
+          throw new SidecarClientError('SIDECAR_RESPONSE_AUTH_FAILED', 'Agent debug stream sequence is not contiguous.');
+        }
+        let payloadBytes: Uint8Array;
+        try { payloadBytes = decodeBase64Url(match[2]!); } catch (error) {
+          throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream payload encoding is invalid.', { cause: error });
+        }
+        if (encodeBase64Url(payloadBytes) !== match[2]) {
+          throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream payload encoding is not canonical.');
+        }
+        if (payloadBytes.byteLength === 0 || payloadBytes.byteLength > DEBUG_STREAM_MAX_PAYLOAD_BYTES) {
+          throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream payload exceeds the accepted size.');
+        }
+        const payloadHash = await sha256Hex(cryptoProvider, payloadBytes);
+        const mac = match[3]!;
+        const authenticated = await verifyHmac(
+          cryptoProvider,
+          key,
+          canonicalAgentDebugFrame(
+            nonce,
+            responseRequestId,
+            sidecarAuthority,
+            'POST',
+            DEBUG_STREAM_PATH,
+            response.status,
+            AIOS_AGENT_DEBUG_PROFILE,
+            sequence,
+            previousMac,
+            payloadHash,
+            responseVersion,
+          ),
+          mac,
+        );
+        if (!authenticated) throw new SidecarClientError('SIDECAR_RESPONSE_AUTH_FAILED', 'Agent debug stream frame signature is invalid.');
+        let decoded: unknown;
+        try { decoded = JSON.parse(decoder.decode(payloadBytes)) as unknown; } catch (error) {
+          throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream payload is malformed JSON.', { cause: error });
+        }
+        let payload: AgentDebugFramePayload;
+        try { payload = validateDebugFramePayload(decoded); } catch (error) {
+          throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream payload is outside the negotiated schema.', { cause: error });
+        }
+        if (traceId === undefined) traceId = payload.traceId;
+        else if (traceId !== payload.traceId) throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream changed trace identity.');
+        if (payload.kind === 'trace') {
+          if (payloadBytes.byteLength > DEBUG_STREAM_MAX_TRACE_PAYLOAD_BYTES) {
+            throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug trace event exceeds the accepted size.');
+          }
+          try { await options.onDebugEvent?.(Object.freeze({ ...payload, sequence })); } catch (error) {
+            throw new SidecarClientError('SIDECAR_DEBUG_OBSERVER_FAILED', 'Agent debug observer rejected an event.', { cause: error });
+          }
+        } else {
+          terminalSeen = true;
+          if (payload.kind === 'completed') completed = payload.response;
+          else failed = payload.error;
+        }
+        previousMac = mac;
+        expectedSequence += 1;
+      };
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          totalBytes += value.byteLength;
+          if (totalBytes > DEBUG_STREAM_MAX_BYTES) {
+            throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream exceeds the accepted size.');
+          }
+          const merged = new Uint8Array(buffered.byteLength + value.byteLength);
+          merged.set(buffered);
+          merged.set(value, buffered.byteLength);
+          buffered = merged;
+          let newline = buffered.indexOf(10);
+          while (newline >= 0) {
+            const line = buffered.slice(0, newline);
+            buffered = buffered.slice(newline + 1);
+            await consumeLine(line);
+            newline = buffered.indexOf(10);
+          }
+          if (buffered.byteLength > DEBUG_STREAM_MAX_FRAME_BYTES) {
+            throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream frame exceeds the accepted size.');
+          }
+        }
+      } catch (error) {
+        await reader.cancel('Agent debug stream rejected').catch(() => undefined);
+        if (error instanceof SidecarClientError) throw error;
+        if (linked.timedOut()) throw new SidecarClientError('SIDECAR_TIMEOUT', 'Agent debug stream timed out.', { retryable: true, cause: error });
+        if (options.signal?.aborted) throw new SidecarClientError('SIDECAR_ABORTED', 'Agent debug stream was cancelled.', { cause: error });
+        throw new SidecarClientError('SIDECAR_NETWORK_ERROR', 'Agent debug stream could not be read.', { retryable: true, cause: error });
+      } finally {
+        reader.releaseLock();
+      }
+      if (linked.timedOut()) throw new SidecarClientError('SIDECAR_TIMEOUT', 'Agent debug stream timed out.', { retryable: true });
+      if (options.signal?.aborted) throw new SidecarClientError('SIDECAR_ABORTED', 'Agent debug stream was cancelled.');
+      if (buffered.byteLength !== 0 || !terminalSeen || (completed === undefined) === (failed === undefined)) {
+        throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Agent debug stream ended without one complete terminal frame.');
+      }
+      if (failed) {
+        throw new SidecarClientError('SIDECAR_HTTP_ERROR', failed.message, {
+          status: response.status,
+          remoteCode: failed.code,
+          retryable: failed.retryable,
+          requestId: chatRequest.requestId,
+        });
+      }
+      return completed!;
+    } finally {
+      linked.dispose();
+    }
+  };
+
   return Object.freeze({
     health: (options?: RequestOptions) => request('/v1/health', { method: 'GET' }, validateHealthResponse, options),
     chat: async (candidate: ChatRequest, options?: RequestOptions) => {
@@ -652,7 +995,9 @@ export const createSidecarClient = (config: SidecarClientConfig): SidecarClient 
       try { chatRequest = validateChatRequest(candidate); } catch (error) {
         throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Chat request is outside the protocol schema.', { cause: error });
       }
-      const response = await post('/v1/chat', chatRequest as unknown as JsonValue, validateChatResponse, options);
+      const response = chatRequest.debug === undefined
+        ? await post('/v1/chat', chatRequest as unknown as JsonValue, validateChatResponse, options)
+        : await chatWithDebug(chatRequest, options);
       if (response.requestId !== chatRequest.requestId) throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Sidecar response request ID does not match.');
       if (
         response.activeAgentId !== undefined &&

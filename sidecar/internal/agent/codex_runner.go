@@ -398,7 +398,11 @@ func (r *CodexRunner) Run(ctx context.Context, req RunRequest) (RunResult, error
 		agentadaptor.WithJSONSchemaOutput(req.Schema, agentadaptor.NativeStrictOutput(), agentadaptor.StructuredOutputName(req.SchemaName)),
 		agentadaptor.WithMetadata("surface", "alsniper-os-sidecar"),
 	)
-	if err != nil {
+	// The adapter can return a parsed structured value together with process
+	// termination metadata. Cancellation is an authority boundary: once the
+	// caller has revoked the turn, no previously buffered model output may be
+	// promoted into an OS response or game action.
+	if err := validateCodexRunCompletion(ctx, result, err); err != nil {
 		return RunResult{}, err
 	}
 	if result.Failure != nil {
@@ -412,6 +416,29 @@ func (r *CodexRunner) Run(ctx context.Context, req RunRequest) (RunResult, error
 		usage = &protocol.Usage{InputTokens: result.Usage.InputTokens, OutputTokens: result.Usage.OutputTokens, CachedInputTokens: result.Usage.CachedInputTokens, EstimatedCostMilli: result.Usage.EstimatedCostMilli}
 	}
 	return RunResult{RunID: result.RunID, Model: result.Model, JSON: append([]byte(nil), result.StructuredOutput.RawJSON...), Usage: usage}, nil
+}
+
+func validateCodexRunCompletion(ctx context.Context, result agentadaptor.RunResult, runErr error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if runErr != nil {
+		return runErr
+	}
+	return validateCodexProcessOutcome(result)
+}
+
+func validateCodexProcessOutcome(result agentadaptor.RunResult) error {
+	if result.TimedOut {
+		return context.DeadlineExceeded
+	}
+	if result.ExitCode != 0 {
+		return errors.New("Codex process exited unsuccessfully")
+	}
+	if strings.TrimSpace(result.Signal) != "" {
+		return errors.New("Codex process was terminated by a signal")
+	}
+	return nil
 }
 
 func denyPolicy() agentadaptor.RunPolicy {

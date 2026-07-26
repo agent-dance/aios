@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
-import { AIOS_AGENT_PROTOCOL_VERSION, type ChatRequest, type GameDecisionRequest } from './protocol';
 import {
+  AIOS_AGENT_DEBUG_PROFILE,
+  AIOS_AGENT_PROTOCOL_VERSION,
+  type AgentDebugFramePayload,
+  type ChatRequest,
+  type GameDecisionRequest,
+} from './protocol';
+import {
+  canonicalAgentDebugFrame,
   canonicalSidecarRequest,
   canonicalSidecarResponse,
   createSidecarClient,
@@ -52,6 +59,58 @@ const config = (fetcher: typeof fetch) => ({
   fetch: fetcher,
 });
 
+const base64Url = (value: Uint8Array): string => {
+  let binary = '';
+  for (const byte of value) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+};
+
+const debugStreamResponse = async (
+  init: RequestInit | undefined,
+  payloads: readonly AgentDebugFramePayload[],
+  options: { tamperFrame?: number; omitTerminalNewline?: boolean; sequenceOffset?: number } = {},
+): Promise<Response> => {
+  const requestHeaders = new Headers(init?.headers);
+  const nonce = requestHeaders.get('x-aios-nonce') ?? '';
+  const requestId = 'transport-debug-1';
+  let previousMac = '0'.repeat(64);
+  const lines: string[] = [];
+  for (let index = 0; index < payloads.length; index += 1) {
+    const sequence = index + 1 + (options.sequenceOffset ?? 0);
+    const bytes = encoder.encode(JSON.stringify(payloads[index]));
+    const payloadHash = await digest(decoderForTest(bytes));
+    let mac = await signature(canonicalAgentDebugFrame(
+      nonce,
+      requestId,
+      'http://127.0.0.1:43127',
+      'POST',
+      '/v1/chat/trace',
+      200,
+      AIOS_AGENT_DEBUG_PROFILE,
+      sequence,
+      previousMac,
+      payloadHash,
+      AIOS_AGENT_PROTOCOL_VERSION,
+    ));
+    if (options.tamperFrame === index) mac = `${mac.slice(0, -1)}${mac.endsWith('0') ? '1' : '0'}`;
+    lines.push(`${sequence}.${base64Url(bytes)}.${mac}`);
+    previousMac = mac;
+  }
+  const body = `${lines.join('\n')}${options.omitTerminalNewline ? '' : '\n'}`;
+  return new Response(body, {
+    status: 200,
+    headers: {
+      'Content-Type': 'application/x-ndjson',
+      'X-AIOS-Protocol-Version': AIOS_AGENT_PROTOCOL_VERSION,
+      'X-Request-Id': requestId,
+      'X-AIOS-Request-Nonce': nonce,
+      'X-AIOS-Stream-Profile': AIOS_AGENT_DEBUG_PROFILE,
+    },
+  });
+};
+
+const decoderForTest = (value: Uint8Array): string => new TextDecoder().decode(value);
+
 const request: ChatRequest = {
   requestId: 'request-1',
   threadId: 'thread-1',
@@ -94,6 +153,19 @@ describe('sidecar client', () => {
     expect(await sign(canonicalSidecarResponse(
       '00112233445566778899aabbccddeeff', 'request-vector-1', 200, responseHash, '1.0.0',
     ))).toBe('f985b14e6fb5979010fd90770e22ec984160048f7f27a9abe70c2028925b6817');
+    expect(await sign(canonicalAgentDebugFrame(
+      '00112233445566778899aabbccddeeff',
+      'request-vector-1',
+      'http://127.0.0.1:4317',
+      'POST',
+      '/v1/chat/trace',
+      200,
+      'agent-debug.v1',
+      1,
+      '0'.repeat(64),
+      '15b3f7b8244fc365b0fc382807379d9fc1c1ece1b73336dce4c69af89c7d14cb',
+      '1.0.0',
+    ))).toBe('229288c01c8047188ec52c03d5fd91ba947cbeb92f43e846944c67ee57b9d73f');
   });
 
   it('sends per-request HMAC metadata without disclosing the shared secret and accepts an authenticated chat response', async () => {
@@ -124,6 +196,91 @@ describe('sidecar client', () => {
     const result = await createSidecarClient(config(fetcher)).chat(request);
     expect(result.intents[0]?.type).toBe('open_app');
     expect(fetcher).toHaveBeenCalledOnce();
+  });
+
+  it('authenticates every debug frame before delivering live summary events', async () => {
+    const traceId = 'trace-1';
+    const completedResponse = {
+      requestId: request.requestId,
+      runId: 'run-debug-1',
+      message: 'Opening Finder.',
+      mood: 'helpful' as const,
+      intents: [{ id: 'intent-debug-1', type: 'open_app' as const, appId: 'finder' }],
+    };
+    const payloads: readonly AgentDebugFramePayload[] = [
+      {
+        kind: 'trace', traceId, timeUnixMs: 1_785_038_400_000, source: 'sidecar', stage: 'analysis',
+        status: 'started', title: '正在分析请求', detail: '正在生成受约束的结构化响应。', elapsedMs: 4,
+      },
+      { kind: 'completed', traceId, timeUnixMs: 1_785_038_400_100, response: completedResponse },
+    ];
+    const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+      expect(String(input)).toBe('http://127.0.0.1:43127/v1/chat/trace');
+      const sent = JSON.parse(String(init?.body)) as { profile: string; request: Record<string, unknown> };
+      expect(sent.profile).toBe(AIOS_AGENT_DEBUG_PROFILE);
+      expect(sent.request.debug).toBeUndefined();
+      expect(new Headers(init?.headers).get('accept')).toBe('application/x-ndjson');
+      return debugStreamResponse(init, payloads);
+    });
+    const observer = vi.fn();
+    const client = createSidecarClient(config(fetcher));
+    const response = await client.chat(
+      { ...request, debug: { profile: AIOS_AGENT_DEBUG_PROFILE } },
+      { onDebugEvent: observer },
+    );
+    expect(response).toEqual(completedResponse);
+    expect(observer).toHaveBeenCalledOnce();
+    expect(observer).toHaveBeenCalledWith(expect.objectContaining({ sequence: 1, traceId, stage: 'analysis' }));
+  });
+
+  it('fails closed on debug-frame tampering, sequence gaps, and truncated terminal frames', async () => {
+    const payloads: readonly AgentDebugFramePayload[] = [
+      {
+        kind: 'trace', traceId: 'trace-secure', timeUnixMs: 1, source: 'sidecar', stage: 'request',
+        status: 'started', title: 'Request accepted', elapsedMs: 0,
+      },
+      {
+        kind: 'completed', traceId: 'trace-secure', timeUnixMs: 2,
+        response: { requestId: request.requestId, runId: 'run-secure', message: 'ok', mood: 'neutral', intents: [] },
+      },
+    ];
+    const debugRequest: ChatRequest = { ...request, debug: { profile: AIOS_AGENT_DEBUG_PROFILE } };
+    const tampered = createSidecarClient(config(async (_input, init) => debugStreamResponse(init, payloads, { tamperFrame: 0 })));
+    await expect(tampered.chat(debugRequest)).rejects.toMatchObject({ code: 'SIDECAR_RESPONSE_AUTH_FAILED' });
+
+    const skipped = createSidecarClient(config(async (_input, init) => debugStreamResponse(init, payloads, { sequenceOffset: 1 })));
+    await expect(skipped.chat(debugRequest)).rejects.toMatchObject({ code: 'SIDECAR_RESPONSE_AUTH_FAILED' });
+
+    const truncated = createSidecarClient(config(async (_input, init) => debugStreamResponse(init, payloads, { omitTerminalNewline: true })));
+    await expect(truncated.chat(debugRequest)).rejects.toMatchObject({ code: 'SIDECAR_INVALID_RESPONSE' });
+  });
+
+  it('surfaces only authenticated terminal failures and isolates a rejecting observer', async () => {
+    const debugRequest: ChatRequest = { ...request, debug: { profile: AIOS_AGENT_DEBUG_PROFILE } };
+    const failurePayloads: readonly AgentDebugFramePayload[] = [{
+      kind: 'failed',
+      traceId: 'trace-failed',
+      timeUnixMs: 1,
+      error: { code: 'AGENT_TIMEOUT', message: 'The Agent did not finish before the deadline.', retryable: true },
+    }];
+    const failed = createSidecarClient(config(async (_input, init) => debugStreamResponse(init, failurePayloads)));
+    await expect(failed.chat(debugRequest)).rejects.toMatchObject({
+      code: 'SIDECAR_HTTP_ERROR', remoteCode: 'AGENT_TIMEOUT', retryable: true,
+    });
+
+    const tracePayloads: readonly AgentDebugFramePayload[] = [
+      {
+        kind: 'trace', traceId: 'trace-observer', timeUnixMs: 1, source: 'sidecar', stage: 'analysis',
+        status: 'started', title: 'Model execution started', elapsedMs: 0,
+      },
+      {
+        kind: 'completed', traceId: 'trace-observer', timeUnixMs: 2,
+        response: { requestId: request.requestId, runId: 'run-observer', message: 'ok', mood: 'neutral', intents: [] },
+      },
+    ];
+    const observerClient = createSidecarClient(config(async (_input, init) => debugStreamResponse(init, tracePayloads)));
+    await expect(observerClient.chat(debugRequest, { onDebugEvent: () => { throw new Error('closed consumer'); } }))
+      .rejects.toMatchObject({ code: 'SIDECAR_DEBUG_OBSERVER_FAILED' });
   });
 
   it('rejects unknown response fields, request-id mismatch, and protocol mismatch', async () => {

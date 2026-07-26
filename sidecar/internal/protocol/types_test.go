@@ -239,3 +239,43 @@ func TestGameRequestEnforcesSeatAndLegalAction(t *testing.T) {
 		t.Fatal("inactive seat accepted")
 	}
 }
+
+func TestAgentDebugProtocolUsesStrictProfileAndUTF16Bounds(t *testing.T) {
+	request := AgentDebugTraceRequest{
+		Profile: AgentDebugProfile,
+		Request: ChatRequest{
+			RequestID: "request-1", ThreadID: "thread-1", Message: "hello",
+			Context: ChatContext{OSRevision: ptr[int64](1)},
+		},
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	request.Profile = "agent-debug.v2"
+	if err := request.Validate(); err == nil {
+		t.Fatal("unknown debug profile was accepted")
+	}
+
+	payload := AgentDebugTracePayload{
+		Kind: "trace", TraceID: "trace-1", TimeUnixMS: 1, Source: "sidecar",
+		Stage: "analysis", Status: "info", Title: strings.Repeat("😀", 40),
+		Detail: strings.Repeat("😀", 120), ElapsedMS: 600000,
+	}
+	if err := payload.Validate(); err != nil {
+		t.Fatalf("boundary trace rejected: %v", err)
+	}
+	payload.Title += "a"
+	if err := payload.Validate(); err == nil {
+		t.Fatal("title beyond 80 UTF-16 units was accepted")
+	}
+	payload.Title = "safe"
+	payload.Detail += "a"
+	if err := payload.Validate(); err == nil {
+		t.Fatal("detail beyond 240 UTF-16 units was accepted")
+	}
+	payload.Detail = "safe"
+	payload.ElapsedMS++
+	if err := payload.Validate(); err == nil {
+		t.Fatal("elapsed time beyond 600000ms was accepted")
+	}
+}

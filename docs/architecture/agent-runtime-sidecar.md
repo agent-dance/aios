@@ -61,6 +61,7 @@ The HTTP contract is versioned as `1.0.0`:
 | --- | --- | --- |
 | `GET /v1/health` | Request HMAC + exact Origin + protocol | Readiness, resource limits, Codex driver and profile-link state |
 | `POST /v1/chat` | Request HMAC + exact Origin + protocol | Structured assistant response, at most one OS intent, optional restricted A2UI surface |
+| `POST /v1/chat/trace` | Request HMAC + exact Origin + chained frame HMAC | Opt-in, summary-only live Agent decision trace followed by the same structured assistant response |
 | `POST /v1/game/decide` | Request HMAC + exact Origin + protocol | Exactly one opaque `actionId` from the supplied legal set |
 
 Every non-preflight call carries `X-AIOS-Protocol-Version`, `X-AIOS-Timestamp` (Unix milliseconds), a fresh 128-bit lowercase-hex `X-AIOS-Nonce`, `X-AIOS-Content-SHA256`, and `X-AIOS-Signature`. The shared secret is never placed in an HTTP header or body. The request signature is lowercase-hex HMAC-SHA256 over this exact UTF-8 canonical value, with no final newline:
@@ -80,6 +81,14 @@ AIOS1-RESPONSE\n<REQUEST_NONCE>\n<REQUEST_ID>\n<HTTP_STATUS>\n<BODY_SHA256>\n<PR
 The browser reads at most 4 MiB, verifies the exact response bytes and signature with Web Crypto before JSON parsing, readiness handling, A2UI rendering, or intent execution. Therefore a process occupying the expected loopback port cannot forge `ready`, an Agent action, or an OS intent without the session secret. CORS allows only the authentication/content headers above and exposes only the five response-verification headers; it never uses a wildcard. `OPTIONS` is transport preflight rather than an application response, carries no request nonce, returns no application data, and is signed against an empty nonce for consistent diagnostics.
 
 The HMAC secret is a local session capability rather than a user identity or Agent seat credential. It must be randomly generated with at least 32 bytes, kept out of HTTP messages, URLs, browser persistence, chat data, diagnostics, and source control, and scoped to one launcher/session. Exact cross-language canonical vectors are enforced in both the browser and Go test suites.
+
+### Agent Debug decision trace
+
+Agent Debug is an explicit, session-only assistant mode and is disabled by default. Enabling it selects `POST /v1/chat/trace` with the closed profile `agent-debug.v1`; disabling it leaves the existing `/v1/chat` path byte-for-byte unchanged. Trace entries live only in the mounted browser host, are bounded to the newest 200 visible events, can be cleared by the user, and are never written to OS preferences, conversation history, sidecar storage, or logs.
+
+The stream uses `application/x-ndjson`, because the ordinary response HMAC can authenticate a body only after EOF. Each line has the canonical wire form `<sequence>.<base64url(payload)>.<mac>\n`. Sequence starts at 1, has no leading zero, base64url is unpadded and canonical, MAC values are lowercase 64-character hex, the first frame uses 64 zeroes as its previous MAC, and every later frame chains the preceding MAC. The frame HMAC binds the request nonce, generated transport request ID, normalized sidecar authority, method, path, HTTP status, trace profile, sequence, previous MAC, payload hash, and protocol version. The browser verifies a frame before JSON parsing or observer delivery, rejects gaps, replay, reordering, altered payloads, noncanonical encodings, cross-trace identity changes, over-limit data, and accepts a result only after exactly one authenticated terminal frame followed by clean EOF.
+
+The trace is an observability projection, not a chain-of-thought or authority channel. The allowlist contains host-owned lifecycle stages, categorical validated-output summaries, and browser Broker/receipt stages. It never contains prompts, history or response text copies, raw reasoning tokens, provider streams or stderr, tool arguments/results, environment variables, paths, credentials, hidden game state, raw observations, or unrestricted error text. Only a Broker receipt proves an OS effect. The pinned Codex adapter's native streaming path is intentionally not enabled: it switches transports, does not preserve this sidecar's strict structured-output/tool-disable contract, and currently persists app-server threads instead of honoring stateless `--ephemeral` execution.
 
 ### Browser configuration rule
 
