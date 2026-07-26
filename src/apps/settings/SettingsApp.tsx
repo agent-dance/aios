@@ -1,10 +1,25 @@
-import { Monitor, MoonStar, Palette, Sparkles, Volume2, Waves, Zap } from 'lucide-react';
+import { Bot, Library, LockKeyhole, Monitor, MoonStar, Palette, Sparkles, Volume2, Waves, Zap } from 'lucide-react';
 import type { CSSProperties, ReactNode } from 'react';
 import { useMemo, useState } from 'react';
 import { useSystemStore } from '../../system/useSystemStore';
 import type { SystemPreferences, Theme } from '../../system/types';
+import './SettingsApp.css';
 
-type SectionId = 'general' | 'appearance' | 'accessibility' | 'audio' | 'dock';
+type SectionId = 'general' | 'appearance' | 'accessibility' | 'audio' | 'dock' | 'ai';
+
+export interface AiPrivacyStatus {
+  runtime: 'connected' | 'offline' | 'unconfigured';
+  providerLabel: string;
+  authenticationLabel: string;
+  voiceInput: 'available' | 'unavailable' | 'permission-required';
+  installedAgentCount: number;
+  dataBoundary: string;
+}
+
+export interface SettingsAppProps {
+  aiStatus?: AiPrivacyStatus;
+  onOpenAgentLibrary?: () => void;
+}
 
 interface SectionDefinition {
   id: SectionId;
@@ -19,6 +34,7 @@ const SECTIONS: SectionDefinition[] = [
   { id: 'accessibility', label: 'Accessibility', description: 'Comfort and motion preferences.', icon: <Waves size={18} /> },
   { id: 'audio', label: 'Audio', description: 'System sound response.', icon: <Volume2 size={18} /> },
   { id: 'dock', label: 'Dock', description: 'Magnification and glance behavior.', icon: <Zap size={18} /> },
+  { id: 'ai', label: 'AI & Privacy', description: 'Runtime, Agent inventory, and data boundary.', icon: <Bot size={18} /> },
 ];
 
 const ACCENT_META: Record<SystemPreferences['accent'], { label: string; color: string; glow: string }> = {
@@ -181,7 +197,16 @@ function Toggle({
   );
 }
 
-export function SettingsApp() {
+const DEFAULT_AI_STATUS: AiPrivacyStatus = {
+  runtime: 'unconfigured',
+  providerLabel: 'No Agent runtime connected',
+  authenticationLabel: 'Credentials are not exposed to the browser',
+  voiceInput: 'unavailable',
+  installedAgentCount: 0,
+  dataBoundary: 'Only explicit requests and OS-authorized context may leave the browser through the sidecar.',
+};
+
+export function SettingsApp({ aiStatus = DEFAULT_AI_STATUS, onOpenAgentLibrary }: SettingsAppProps = {}) {
   const preferences = useSystemStore((state) => state.preferences);
   const updatePreferences = useSystemStore((state) => state.updatePreferences);
   const [activeSection, setActiveSection] = useState<SectionId>('appearance');
@@ -398,6 +423,65 @@ export function SettingsApp() {
         </SettingCard>
       </div>
     ),
+    ai: (
+      <div style={{ display: 'grid', gap: 18 }}>
+        <SettingCard
+          title="Agent runtime"
+          description="This is a read-only projection of the trusted sidecar connection. Runtime permissions are granted at the point of use, not through decorative switches."
+          theme={shellTheme}
+          action={(
+            <span
+              style={{
+                padding: '8px 11px', borderRadius: 999, border: `1px solid ${BORDER_COLOR[shellTheme]}`,
+                color: aiStatus.runtime === 'connected' ? accentMeta.color : MUTED_TEXT[shellTheme], fontSize: 12, fontWeight: 800,
+              }}
+            >
+              {aiStatus.runtime === 'connected' ? 'Connected' : aiStatus.runtime === 'offline' ? 'Offline' : 'Not configured'}
+            </span>
+          )}
+        >
+          <div className="settings-ai-facts" style={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 12 }}>
+            {[
+              ['Provider', aiStatus.providerLabel],
+              ['Authentication', aiStatus.authenticationLabel],
+              ['Voice input', aiStatus.voiceInput.replace('-', ' ')],
+              ['Installed Agents', String(aiStatus.installedAgentCount)],
+            ].map(([label, value]) => (
+              <div key={label} style={{ padding: 15, borderRadius: 18, border: `1px solid ${BORDER_COLOR[shellTheme]}`, background: shellTheme === 'aurora' ? 'rgba(255,255,255,.72)' : 'rgba(15,18,34,.82)' }}>
+                <div style={{ color: MUTED_TEXT[shellTheme], fontSize: 12 }}>{label}</div>
+                <strong style={{ display: 'block', marginTop: 7, fontSize: 14 }}>{value}</strong>
+              </div>
+            ))}
+          </div>
+          {onOpenAgentLibrary ? (
+            <button
+              type="button"
+              onClick={onOpenAgentLibrary}
+              style={{
+                display: 'inline-flex', alignItems: 'center', justifyContent: 'center', gap: 9, justifySelf: 'start',
+                padding: '11px 14px', borderRadius: 15, border: `1px solid ${accentMeta.color}`,
+                background: `${accentMeta.color}1f`, color: TEXT_COLOR[shellTheme], fontWeight: 750, cursor: 'pointer',
+              }}
+            >
+              <Library size={16} />
+              Open Agent Library
+            </button>
+          ) : null}
+        </SettingCard>
+        <SettingCard
+          title="Privacy boundary"
+          description="Agent packages declare capabilities, while the OS remains the authority that approves and executes actions."
+          theme={shellTheme}
+          action={<LockKeyhole size={19} color={accentMeta.color} />}
+        >
+          <div style={{ display: 'grid', gap: 10, color: MUTED_TEXT[shellTheme], fontSize: 14, lineHeight: 1.65 }}>
+            <div>{aiStatus.dataBoundary}</div>
+            <div>Installed does not mean authorized: sensitive operations still require a trusted OS decision surface.</div>
+            <div>Authentication secrets stay in the local sidecar profile and are never projected into app or Agent UI.</div>
+          </div>
+        </SettingCard>
+      </div>
+    ),
   };
 
   const sidebarButtonBase: CSSProperties = {
@@ -494,6 +578,7 @@ export function SettingsApp() {
                 {activeSection === 'accessibility' && 'Keep motion deliberate'}
                 {activeSection === 'audio' && 'Adjust auditory feedback'}
                 {activeSection === 'dock' && 'Refine Dock behavior'}
+                {activeSection === 'ai' && 'Inspect AI trust boundaries'}
               </strong>
               <p style={{ margin: 0, color: MUTED_TEXT[shellTheme], fontSize: 14, lineHeight: 1.65 }}>
                 Accent highlight: <span style={{ color: accentMeta.color, fontWeight: 700 }}>{accentMeta.label}</span>

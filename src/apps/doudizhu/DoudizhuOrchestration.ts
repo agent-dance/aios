@@ -22,6 +22,13 @@ export interface StickyManualClockOwnership {
   allowsRealtime(): boolean;
 }
 
+export interface DoudizhuAgentTurnGate {
+  tryBegin(): symbol | null;
+  finish(token: symbol): void;
+  cancelActive(): void;
+  isBusy(): boolean;
+}
+
 /** New Round is orchestration after terminal completion, never a live-match reset. */
 export function canCreateNextDoudizhuRound(terminal: boolean): boolean {
   return terminal;
@@ -43,6 +50,23 @@ export function createStickyManualClockOwnership(
       return true;
     },
     allowsRealtime: () => !manual,
+  });
+}
+
+/** A token-owned single-flight gate: only the run that acquired it may release it. */
+export function createDoudizhuAgentTurnGate(): DoudizhuAgentTurnGate {
+  let activeToken: symbol | null = null;
+  return Object.freeze({
+    tryBegin: () => {
+      if (activeToken !== null) return null;
+      activeToken = Symbol('doudizhu-agent-turn');
+      return activeToken;
+    },
+    finish: (token: symbol) => {
+      if (activeToken === token) activeToken = null;
+    },
+    cancelActive: () => { activeToken = null; },
+    isBusy: () => activeToken !== null,
   });
 }
 

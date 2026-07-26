@@ -1,6 +1,6 @@
 import { Minus, Square, X } from 'lucide-react';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { PointerEvent as ReactPointerEvent, ReactNode } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from 'react';
 import type { AppDefinition, WindowState } from '../system/types';
 import type { ShellSurfaceProps, ShellViewport } from './shellTypes';
 
@@ -28,8 +28,6 @@ type InteractionSession =
       startY: number;
       lastClientX: number;
       lastClientY: number;
-      originalTransform: string;
-      originalWillChange: string;
       previewTransform: string;
     }
   | {
@@ -41,8 +39,6 @@ type InteractionSession =
       startHeight: number;
       lastClientX: number;
       lastClientY: number;
-      originalTransform: string;
-      originalWillChange: string;
       previewTransform: string;
     };
 
@@ -78,7 +74,7 @@ export function AppWindow({
   className,
   style,
 }: AppWindowProps) {
-  const frameRef = useRef<HTMLDivElement | null>(null);
+  const frameRef = useRef<HTMLElement | null>(null);
   const interactionRef = useRef<InteractionSession | null>(null);
   const latestUpdateRef = useRef<PendingUpdate | null>(null);
   const previewFrameRef = useRef<number | null>(null);
@@ -149,11 +145,16 @@ export function AppWindow({
     latestUpdateRef.current = null;
     finishedInteractionRef.current = session;
 
-    if (update?.mode === 'drag' && (update.x !== window.position.x || update.y !== window.position.y)) {
+    if (
+      update?.mode === 'drag' &&
+      session.mode === 'drag' &&
+      (update.rect.left !== session.startX || update.rect.top !== session.startY)
+    ) {
       onMove(update.x, update.y);
     } else if (
       update?.mode === 'resize' &&
-      (update.width !== window.size.width || update.height !== window.size.height)
+      session.mode === 'resize' &&
+      (update.width !== session.startWidth || update.height !== session.startHeight)
     ) {
       onResize(update.width, update.height);
     }
@@ -196,8 +197,8 @@ export function AppWindow({
       }
       interactionRef.current = null;
       latestUpdateRef.current = null;
-      applyFinalStyleValue(frame, 'transform', style, session.originalTransform);
-      applyFinalStyleValue(frame, 'willChange', style, session.originalWillChange);
+      applyFinalStyleValue(frame, 'transform', style);
+      applyFinalStyleValue(frame, 'willChange', style);
       if (session.mode === 'resize') {
         applyFinalLength(frame, 'left', style, frameRect.left);
         applyFinalLength(frame, 'top', style, frameRect.top);
@@ -212,7 +213,7 @@ export function AppWindow({
     }
 
     if (session) {
-      session.previewTransform = resolveStyleValue(style, 'transform', session.previewTransform);
+      session.previewTransform = getPreviewTransform(frame, style);
       const update = calculateInteractionUpdate(
         session,
         session.lastClientX,
@@ -230,8 +231,8 @@ export function AppWindow({
       return;
     }
 
-    applyFinalStyleValue(frame, 'transform', style, finishedSession.originalTransform);
-    applyFinalStyleValue(frame, 'willChange', style, finishedSession.originalWillChange);
+    applyFinalStyleValue(frame, 'transform', style);
+    applyFinalStyleValue(frame, 'willChange', style);
     if (finishedSession.mode === 'resize') {
       applyFinalLength(frame, 'left', style, frameRect.left);
       applyFinalLength(frame, 'top', style, frameRect.top);
@@ -251,8 +252,9 @@ export function AppWindow({
   );
 
   useEffect(() => {
-    if (active) {
-      frameRef.current?.focus();
+    const frame = frameRef.current;
+    if (active && frame && !frame.contains(document.activeElement)) {
+      frame.focus();
     }
   }, [active]);
 
@@ -276,9 +278,7 @@ export function AppWindow({
       startY: frameRect.top,
       lastClientX: event.clientX,
       lastClientY: event.clientY,
-      originalTransform: frame?.style.transform ?? '',
-      originalWillChange: frame?.style.willChange ?? '',
-      previewTransform: frame ? getPreviewTransform(frame, style, frame.style.transform) : '',
+      previewTransform: frame ? getPreviewTransform(frame, style) : '',
     };
     if (!frame) {
       return;
@@ -313,9 +313,7 @@ export function AppWindow({
       startHeight: frameRect.height,
       lastClientX: event.clientX,
       lastClientY: event.clientY,
-      originalTransform: frame?.style.transform ?? '',
-      originalWillChange: frame?.style.willChange ?? '',
-      previewTransform: frame ? getPreviewTransform(frame, style, frame.style.transform) : '',
+      previewTransform: frame ? getPreviewTransform(frame, style) : '',
     };
     if (!frame) {
       return;
@@ -328,6 +326,27 @@ export function AppWindow({
     interactionRef.current = session;
     latestUpdateRef.current = null;
     setInteractionMode('resize');
+  };
+
+  const resizeWithKeyboard = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    const step = event.shiftKey ? 40 : 10;
+    const delta = getKeyboardResizeDelta(event.key, step);
+    if (!delta || window.isMaximized || interactionRef.current) {
+      return;
+    }
+
+    event.preventDefault();
+    event.stopPropagation();
+    onFocus();
+    const update = calculateResizeUpdate(
+      frameRect,
+      frameRect.width + delta.width,
+      frameRect.height + delta.height,
+      viewport,
+    );
+    if (update.width !== frameRect.width || update.height !== frameRect.height) {
+      onResize(update.width, update.height);
+    }
   };
 
   return (
@@ -386,7 +405,11 @@ export function AppWindow({
           <WindowChromeButton tone="#febc2e" label={`Minimize ${app.name}`} onClick={onMinimize}>
             <Minus size={11} strokeWidth={2.5} />
           </WindowChromeButton>
-          <WindowChromeButton tone="#28c840" label={`Maximize ${app.name}`} onClick={onToggleMaximize}>
+          <WindowChromeButton
+            tone="#28c840"
+            label={`${window.isMaximized ? 'Restore' : 'Maximize'} ${app.name}`}
+            onClick={onToggleMaximize}
+          >
             <Square size={10} strokeWidth={2.4} />
           </WindowChromeButton>
         </div>
@@ -425,7 +448,9 @@ export function AppWindow({
         <button
           type="button"
           aria-label={`Resize ${app.name}`}
+          aria-keyshortcuts="ArrowUp ArrowDown ArrowLeft ArrowRight"
           onPointerDown={startResize}
+          onKeyDown={resizeWithKeyboard}
           style={{
             position: 'absolute',
             right: 10,
@@ -564,13 +589,27 @@ function calculateInteractionUpdate(
     windowState.size.height,
     viewport,
   );
+  return calculateResizeUpdate(
+    baseRect,
+    session.startWidth + clientX - session.originX,
+    session.startHeight + clientY - session.originY,
+    viewport,
+  );
+}
+
+function calculateResizeUpdate(
+  baseRect: WindowRect,
+  requestedWidth: number,
+  requestedHeight: number,
+  viewport: ShellViewport,
+): Extract<PendingUpdate, { mode: 'resize' }> {
   const maxWidth = Math.max(MIN_WIDTH, viewport.width - baseRect.left - WINDOW_GAP);
   const maxHeight = Math.max(
     MIN_HEIGHT,
     viewport.height - viewport.bottomInset - baseRect.top - WINDOW_GAP,
   );
-  const nextWidth = clamp(session.startWidth + clientX - session.originX, MIN_WIDTH, maxWidth);
-  const nextHeight = clamp(session.startHeight + clientY - session.originY, MIN_HEIGHT, maxHeight);
+  const nextWidth = clamp(requestedWidth, MIN_WIDTH, maxWidth);
+  const nextHeight = clamp(requestedHeight, MIN_HEIGHT, maxHeight);
   return {
     mode: 'resize',
     rect: getWindowRect(baseRect.left, baseRect.top, nextWidth, nextHeight, viewport),
@@ -580,7 +619,7 @@ function calculateInteractionUpdate(
 }
 
 function applyPreviewToFrame(
-  frame: HTMLDivElement,
+  frame: HTMLElement,
   session: InteractionSession,
   update: PendingUpdate,
 ) {
@@ -609,34 +648,38 @@ type BoundsProperty = 'left' | 'top' | 'width' | 'height';
 type TransientStyleProperty = 'transform' | 'willChange';
 
 function getPreviewTransform(
-  frame: HTMLDivElement,
+  frame: HTMLElement,
   style: ShellSurfaceProps['style'],
-  fallback: string,
 ) {
   if (hasOwnStyleValue(style, 'transform')) {
-    return resolveStyleValue(style, 'transform', fallback);
+    return resolveStyleValue(style, 'transform');
   }
+
+  const previewTransform = frame.style.transform;
+  frame.style.removeProperty('transform');
   const computedTransform = getComputedStyle(frame).transform;
-  return computedTransform === 'none' ? fallback : computedTransform;
+  if (previewTransform) {
+    frame.style.transform = previewTransform;
+  }
+  return computedTransform === 'none' ? '' : computedTransform;
 }
 
 function applyFinalStyleValue(
-  frame: HTMLDivElement,
+  frame: HTMLElement,
   property: TransientStyleProperty,
   style: ShellSurfaceProps['style'],
-  fallback: string,
 ) {
-  frame.style[property] = resolveStyleValue(style, property, fallback);
+  if (!hasOwnStyleValue(style, property)) {
+    frame.style.removeProperty(property === 'willChange' ? 'will-change' : property);
+    return;
+  }
+  frame.style[property] = resolveStyleValue(style, property);
 }
 
 function resolveStyleValue(
   style: ShellSurfaceProps['style'],
   property: TransientStyleProperty,
-  fallback: string,
 ) {
-  if (!hasOwnStyleValue(style, property)) {
-    return fallback;
-  }
   const value = style?.[property];
   return value === null || value === undefined || typeof value === 'boolean' ? '' : String(value);
 }
@@ -646,7 +689,7 @@ function hasOwnStyleValue(style: ShellSurfaceProps['style'], property: string): 
 }
 
 function applyFinalLength(
-  frame: HTMLDivElement,
+  frame: HTMLElement,
   property: BoundsProperty,
   style: ShellSurfaceProps['style'],
   fallback: number,
@@ -657,5 +700,20 @@ function applyFinalLength(
     frame.style.removeProperty(property);
   } else {
     frame.style.setProperty(property, typeof value === 'number' ? `${value}px` : String(value));
+  }
+}
+
+function getKeyboardResizeDelta(key: string, step: number): { width: number; height: number } | null {
+  switch (key) {
+    case 'ArrowLeft':
+      return { width: -step, height: 0 };
+    case 'ArrowRight':
+      return { width: step, height: 0 };
+    case 'ArrowUp':
+      return { width: 0, height: -step };
+    case 'ArrowDown':
+      return { width: 0, height: step };
+    default:
+      return null;
   }
 }

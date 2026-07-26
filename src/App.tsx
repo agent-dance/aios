@@ -1,4 +1,5 @@
 import { lazy, Suspense } from 'react';
+import { useAgentRuntime } from './agent-runtime';
 import { CalculatorApp } from './apps/calculator';
 import { FinderApp } from './apps/finder';
 import { SettingsApp } from './apps/settings';
@@ -13,6 +14,9 @@ const SpaceGameApp = lazy(() =>
 const DoudizhuApp = lazy(() =>
   import('./apps/doudizhu').then((module) => ({ default: module.DoudizhuApp })),
 );
+const AssistantHost = lazy(() =>
+  import('./agent-runtime/AgentAssistantHost').then((module) => ({ default: module.AgentAssistantHost })),
+);
 
 function AppLoading({ label }: { label: string }) {
   return (
@@ -25,21 +29,36 @@ function AppLoading({ label }: { label: string }) {
 
 export default function App() {
   const preferences = useSystemStore((state) => state.preferences);
+  const activeAppId = useSystemStore((state) => state.activeAppId);
+  const controlCenterOpen = useSystemStore((state) => state.controlCenterOpen);
+  const clockOpen = useSystemStore((state) => state.clockOpen);
+  const openApp = useSystemStore((state) => state.openApp);
+  const agentRuntime = useAgentRuntime();
+  const activeGame = activeAppId === 'space-game' || activeAppId === 'doudizhu';
 
   const appContents: AppContentMap = {
     finder: ({ isActive }) => <FinderApp isActive={isActive} />,
     calculator: ({ isActive }) => <CalculatorApp isActive={isActive} />,
-    settings: <SettingsApp />,
+    settings: <SettingsApp aiStatus={agentRuntime.aiStatus} onOpenAgentLibrary={() => openApp('store')} />,
     terminal: <TerminalApp />,
-    store: <AppStoreApp />,
-    'space-game': ({ isActive }) => (
+    store: <AppStoreApp agentLibrary={agentRuntime.agentLibrary} />,
+    'space-game': ({ isActive, window }) => (
       <Suspense fallback={<AppLoading label="Cosmic Vanguard" />}>
-        <SpaceGameApp isActive={isActive} />
+        <SpaceGameApp
+          isActive={isActive}
+          simulationActive={window.isOpen}
+          controlMode="assist"
+          agentController={agentRuntime.connected ? agentRuntime.spaceGameController : undefined}
+        />
       </Suspense>
     ),
-    doudizhu: ({ isActive }) => (
+    doudizhu: ({ isActive, window }) => (
       <Suspense fallback={<AppLoading label="斗地主" />}>
-        <DoudizhuApp isActive={isActive} />
+        <DoudizhuApp
+          isActive={isActive}
+          simulationActive={window.isOpen}
+          agentControllerFactory={agentRuntime.connected ? agentRuntime.doudizhuControllerFactory : undefined}
+        />
       </Suspense>
     ),
   };
@@ -54,6 +73,19 @@ export default function App() {
       <DesktopShell
         className="desktop-shell"
         appContents={appContents}
+        assistant={
+          <Suspense fallback={null}>
+            <AssistantHost
+              client={agentRuntime.assistantClient}
+              activeAppId={activeAppId}
+              activeGame={activeGame}
+              modalOpen={controlCenterOpen || clockOpen}
+              reduceMotion={preferences.reduceMotion}
+              renderSurface={agentRuntime.renderSurface}
+              onSurfaceAction={agentRuntime.onSurfaceAction}
+            />
+          </Suspense>
+        }
         brand={
           <span className="brand-lockup">
             <span className="brand-lockup__glyph" aria-hidden="true">A</span>

@@ -3,6 +3,7 @@ import { AGAP_ERROR_CODES, AgapError } from '../../game-platform/agent';
 import type { DoudizhuAction } from './DoudizhuEngine';
 import {
   canCreateNextDoudizhuRound,
+  createDoudizhuAgentTurnGate,
   createNextDoudizhuRound,
   createNextDoudizhuRoundAfterTerminal,
   createSecureLocalDoudizhuMatch,
@@ -110,5 +111,23 @@ describe('Doudizhu sticky manual-clock ownership', () => {
     expect(ownership.isManual()).toBe(true);
     expect(ownership.allowsRealtime()).toBe(false);
     expect(ownership.requestManual()).toBe(false);
+  });
+});
+
+describe('Doudizhu asynchronous Agent turn gate', () => {
+  it('allows exactly one in-flight decision and requires the owner token to release it', () => {
+    const gate = createDoudizhuAgentTurnGate();
+    const first = gate.tryBegin();
+    expect(first).toBeTypeOf('symbol');
+    expect(gate.isBusy()).toBe(true);
+    expect(gate.tryBegin()).toBeNull();
+
+    gate.finish(Symbol('foreign-run'));
+    expect(gate.tryBegin()).toBeNull();
+    gate.finish(first!);
+    expect(gate.isBusy()).toBe(false);
+    expect(gate.tryBegin()).toBeTypeOf('symbol');
+    gate.cancelActive();
+    expect(gate.isBusy()).toBe(false);
   });
 });

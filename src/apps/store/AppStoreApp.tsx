@@ -14,11 +14,36 @@ import {
   SquareTerminal,
 } from 'lucide-react';
 import type { ReactNode } from 'react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { APP_REGISTRY } from '../../system/appRegistry';
 import { useSystemStore } from '../../system/useSystemStore';
 import type { AppId, SystemPreferences, Theme } from '../../system/types';
+import './AppStoreApp.css';
 
-type StoreCategory = 'all' | 'system' | 'productivity' | 'creative' | 'games';
+type StoreCategory = 'all' | 'system' | 'productivity' | 'creative' | 'games' | 'agents';
+
+export interface AgentLibraryEntry {
+  id: string;
+  name: string;
+  version: string;
+  publisher: string;
+  description: string;
+  capabilities: readonly string[];
+  installed: boolean;
+  enabled: boolean;
+}
+
+export interface AgentLibraryPort {
+  entries: readonly AgentLibraryEntry[];
+  install: (agentId: string) => void | Promise<void>;
+  enable: (agentId: string) => void | Promise<void>;
+  disable: (agentId: string) => void | Promise<void>;
+  uninstall: (agentId: string) => void | Promise<void>;
+}
+
+export interface AppStoreAppProps {
+  agentLibrary?: AgentLibraryPort;
+}
 
 interface StorePermission {
   name: string;
@@ -42,9 +67,8 @@ interface StoreListing {
   execution: string;
   updateDate: string;
   appId?: AppId;
+  agentId?: string;
 }
-
-const INSTALLED_KEY = 'alsniper-os-store-installed';
 
 const ACCENT_COLORS: Record<SystemPreferences['accent'], string> = {
   lime: '#C6F94D',
@@ -83,6 +107,7 @@ const CATEGORIES: { id: StoreCategory; label: string }[] = [
   { id: 'productivity', label: 'Productivity' },
   { id: 'creative', label: 'Creative' },
   { id: 'games', label: 'Games' },
+  { id: 'agents', label: 'Agents' },
 ];
 
 const LISTINGS: StoreListing[] = [
@@ -231,7 +256,7 @@ const LISTINGS: StoreListing[] = [
   },
 ];
 
-const FALLBACK_LISTING = LISTINGS[0]!;
+const FALLBACK_LISTING = LISTINGS.find((listing) => listing.id === 'doudizhu')!;
 
 const LISTING_ICONS: Record<string, ReactNode> = {
   'briefing-architect': <Sparkles size={18} />,
@@ -243,46 +268,53 @@ const LISTING_ICONS: Record<string, ReactNode> = {
   doudizhu: <Spade size={18} />,
 };
 
-function getInitialInstalledIds() {
-  if (typeof window === 'undefined') return ['store'];
-  try {
-    const raw = window.localStorage.getItem(INSTALLED_KEY);
-    if (!raw) return ['store'];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((value): value is string => typeof value === 'string') : ['store'];
-  } catch {
-    return ['store'];
-  }
+function agentListing(entry: AgentLibraryEntry): StoreListing {
+  return {
+    id: `agent:${entry.id}`,
+    agentId: entry.id,
+    name: entry.name,
+    category: 'agents',
+    publisher: entry.publisher,
+    tagline: entry.description,
+    description: entry.description,
+    featuredNote: `Installed Agent package ${entry.name} ${entry.version}. Capabilities remain subject to OS policy.`,
+    rating: 'Agent',
+    installs: entry.installed ? 'Installed' : 'Available',
+    verified: false,
+    capabilities: [...entry.capabilities],
+    permissions: entry.capabilities.map((capability) => ({
+      name: capability,
+      scope: 'OS capability broker',
+      reason: 'Execution is mediated by the installed Agent manifest and host policy.',
+    })),
+    execution: 'Local Agent package through the OS capability broker',
+    updateDate: entry.version,
+  };
 }
 
-export function AppStoreApp() {
+export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
   const preferences = useSystemStore((state) => state.preferences);
   const openApp = useSystemStore((state) => state.openApp);
   const windows = useSystemStore((state) => state.windows);
+  const appInstallations = useSystemStore((state) => state.appInstallations);
+  const installApp = useSystemStore((state) => state.installApp);
+  const enableApp = useSystemStore((state) => state.enableApp);
+  const disableApp = useSystemStore((state) => state.disableApp);
+  const uninstallApp = useSystemStore((state) => state.uninstallApp);
   const [query, setQuery] = useState('');
   const [category, setCategory] = useState<StoreCategory>('all');
-  const [installedIds, setInstalledIds] = useState<string[]>(getInitialInstalledIds);
-  const [installingId, setInstallingId] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string>(FALLBACK_LISTING.id);
-
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem(INSTALLED_KEY, JSON.stringify(installedIds));
-    }
-  }, [installedIds]);
-
-  useEffect(() => {
-    if (!installingId) return;
-    const timer = window.setTimeout(() => {
-      setInstalledIds((current) => (current.includes(installingId) ? current : [...current, installingId]));
-      setInstallingId(null);
-    }, 850);
-    return () => window.clearTimeout(timer);
-  }, [installingId]);
+  const [agentOperation, setAgentOperation] = useState<{ readonly listingId: string; readonly label: string } | null>(null);
+  const [agentOperationError, setAgentOperationError] = useState<{ readonly listingId: string; readonly message: string } | null>(null);
+  const agentOperationRef = useRef<string | null>(null);
+  const allListings = useMemo(
+    () => [...LISTINGS, ...(agentLibrary?.entries.map(agentListing) ?? [])],
+    [agentLibrary?.entries],
+  );
 
   const filtered = useMemo(() => {
     const lower = query.trim().toLowerCase();
-    return LISTINGS.filter((listing) => {
+    return allListings.filter((listing) => {
       if (category !== 'all' && listing.category !== category) return false;
       if (!lower) return true;
       return [listing.name, listing.publisher, listing.tagline, listing.description, listing.capabilities.join(' ')]
@@ -290,7 +322,7 @@ export function AppStoreApp() {
         .toLowerCase()
         .includes(lower);
     });
-  }, [category, query]);
+  }, [allListings, category, query]);
 
   useEffect(() => {
     if (!filtered.some((listing) => listing.id === selectedId)) {
@@ -298,21 +330,70 @@ export function AppStoreApp() {
     }
   }, [filtered, selectedId]);
 
-  const selected = filtered.find((listing) => listing.id === selectedId) ?? LISTINGS.find((listing) => listing.id === selectedId) ?? FALLBACK_LISTING;
+  const selected = filtered.find((listing) => listing.id === selectedId) ?? allListings.find((listing) => listing.id === selectedId) ?? FALLBACK_LISTING;
   const accent = ACCENT_COLORS[preferences.accent];
 
-  const isInstalled = (id: string) => installedIds.includes(id);
-  const canOpen = Boolean(selected.appId && isInstalled(selected.id));
+  const selectedAgent = selected.agentId ? agentLibrary?.entries.find((entry) => entry.id === selected.agentId) : undefined;
+  const selectedInstallation = selected.appId ? appInstallations[selected.appId] : undefined;
+  const isInstalled = (listing: StoreListing) => listing.appId
+    ? Boolean(appInstallations[listing.appId])
+    : listing.agentId
+      ? Boolean(agentLibrary?.entries.find((entry) => entry.id === listing.agentId)?.installed)
+      : false;
+  const isEnabled = (listing: StoreListing) => listing.appId
+    ? appInstallations[listing.appId]?.enabled === true
+    : listing.agentId
+      ? agentLibrary?.entries.find((entry) => entry.id === listing.agentId)?.enabled === true
+      : false;
+  const canOpen = Boolean(selected.appId && selectedInstallation?.enabled);
+  const selectedInstalled = isInstalled(selected);
+  const selectedEnabled = isEnabled(selected);
+  const primarySupported = Boolean(selected.appId || (selected.agentId && agentLibrary));
+  const selectedOperationPending = agentOperation?.listingId === selected.id;
+  const primaryDisabled = selectedOperationPending || !primarySupported || Boolean(selected.agentId && selectedAgent?.installed && selectedAgent.enabled);
   const isRunning = selected.appId ? Boolean(windows[selected.appId]?.isOpen && !windows[selected.appId]?.isMinimized) : false;
 
-  const handlePrimaryAction = (listing: StoreListing) => {
-    if (listing.appId && isInstalled(listing.id)) {
-      openApp(listing.appId);
+  const runAgentOperation = async (listing: StoreListing, label: string, operation: () => void | Promise<unknown>) => {
+    if (agentOperationRef.current !== null) return;
+    agentOperationRef.current = listing.id;
+    setAgentOperationError(null);
+    setAgentOperation({ listingId: listing.id, label });
+    try {
+      await operation();
+    } catch (error) {
+      setAgentOperationError({
+        listingId: listing.id,
+        message: error instanceof Error ? error.message : `${label} failed.`,
+      });
+    } finally {
+      agentOperationRef.current = null;
+      setAgentOperation(null);
+    }
+  };
+
+  const handlePrimaryAction = async (listing: StoreListing) => {
+    if (listing.appId) {
+      const installation = appInstallations[listing.appId];
+      if (!installation) installApp(listing.appId);
+      else if (!installation.enabled) enableApp(listing.appId);
+      else openApp(listing.appId);
       return;
     }
-    if (!isInstalled(listing.id) && !installingId) {
-      setInstallingId(listing.id);
+    if (listing.agentId && agentLibrary) {
+      const agent = agentLibrary.entries.find((entry) => entry.id === listing.agentId);
+      if (!agent?.installed) await runAgentOperation(listing, 'Install', () => agentLibrary.install(listing.agentId!));
+      else if (!agent.enabled) await runAgentOperation(listing, 'Enable', () => agentLibrary.enable(listing.agentId!));
     }
+  };
+
+  const handleDisable = async (listing: StoreListing) => {
+    if (listing.appId) disableApp(listing.appId);
+    else if (listing.agentId && agentLibrary) await runAgentOperation(listing, 'Disable', () => agentLibrary.disable(listing.agentId!));
+  };
+
+  const handleUninstall = async (listing: StoreListing) => {
+    if (listing.appId) uninstallApp(listing.appId);
+    else if (listing.agentId && agentLibrary) await runAgentOperation(listing, 'Uninstall', () => agentLibrary.uninstall(listing.agentId!));
   };
 
   return (
@@ -500,9 +581,11 @@ export function AppStoreApp() {
         >
           <div style={{ display: 'grid', gap: 12 }}>
             {filtered.map((listing) => {
-              const installed = isInstalled(listing.id);
+              const installed = isInstalled(listing);
+              const enabled = isEnabled(listing);
+              const actionable = Boolean(listing.appId || (listing.agentId && agentLibrary));
               const active = selected.id === listing.id;
-              const statusLabel = installingId === listing.id ? 'Installing...' : installed ? 'Installed' : 'Available';
+              const statusLabel = installed ? (enabled ? 'Enabled' : 'Disabled') : actionable ? 'Available' : 'Catalog only';
 
               return (
                 <button
@@ -627,6 +710,9 @@ export function AppStoreApp() {
                 <div style={{ display: 'grid', gap: 4 }}>
                   <strong style={{ fontSize: 22 }}>{selected.name}</strong>
                   <span style={{ fontSize: 13.5, color: MUTED[preferences.theme] }}>{selected.publisher}</span>
+                  {selected.agentId ? (
+                    <code style={{ fontSize: 12, color: MUTED[preferences.theme] }}>/agent {selected.agentId} &lt;需求&gt;</code>
+                  ) : null}
                 </div>
               </div>
               <p style={{ margin: 0, fontSize: 14, lineHeight: 1.65, color: MUTED[preferences.theme] }}>{selected.description}</p>
@@ -650,8 +736,8 @@ export function AppStoreApp() {
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
               <button
                 type="button"
-                onClick={() => handlePrimaryAction(selected)}
-                disabled={Boolean(installingId && installingId !== selected.id)}
+                onClick={() => { void handlePrimaryAction(selected); }}
+                disabled={primaryDisabled}
                 style={{
                   display: 'inline-flex',
                   alignItems: 'center',
@@ -662,13 +748,53 @@ export function AppStoreApp() {
                   background: accent,
                   color: '#111827',
                   fontWeight: 800,
-                  cursor: installingId && installingId !== selected.id ? 'not-allowed' : 'pointer',
-                  opacity: installingId && installingId !== selected.id ? 0.6 : 1,
+                  cursor: primaryDisabled ? 'not-allowed' : 'pointer',
+                  opacity: primaryDisabled ? 0.6 : 1,
                 }}
               >
-                {canOpen ? <ArrowRight size={16} /> : <Download size={16} />}
-                {installingId === selected.id ? 'Installing…' : canOpen ? 'Open' : isInstalled(selected.id) ? 'Installed' : 'Install'}
+                {selectedOperationPending ? <Clock3 size={16} /> : canOpen ? <ArrowRight size={16} /> : <Download size={16} />}
+                {selectedOperationPending
+                  ? agentOperation.label
+                  : canOpen
+                  ? 'Open'
+                  : selectedInstalled && !selectedEnabled
+                    ? 'Enable'
+                    : selected.agentId && selectedEnabled
+                      ? 'Enabled'
+                      : primarySupported
+                        ? 'Install'
+                        : 'Unavailable'}
               </button>
+              {selectedInstalled && selectedEnabled && (
+                !selected.appId || !APP_REGISTRY[selected.appId].protectedSystemApp
+              ) ? (
+                <button
+                  type="button"
+                  onClick={() => { void handleDisable(selected); }}
+                  disabled={selectedOperationPending}
+                  style={{
+                    padding: '13px 16px', borderRadius: 16, border: `1px solid ${BORDER[preferences.theme]}`,
+                    background: 'transparent', color: TEXT_COLOR[preferences.theme], fontWeight: 700, cursor: 'pointer',
+                  }}
+                >
+                  Disable
+                </button>
+              ) : null}
+              {selectedInstalled && (
+                !selected.appId || !APP_REGISTRY[selected.appId].protectedSystemApp
+              ) ? (
+                <button
+                  type="button"
+                  onClick={() => { void handleUninstall(selected); }}
+                  disabled={selectedOperationPending}
+                  style={{
+                    padding: '13px 16px', borderRadius: 16, border: `1px solid ${BORDER[preferences.theme]}`,
+                    background: 'transparent', color: MUTED[preferences.theme], fontWeight: 700, cursor: 'pointer',
+                  }}
+                >
+                  Uninstall
+                </button>
+              ) : null}
               {isRunning ? (
                 <span
                   style={{
@@ -686,6 +812,16 @@ export function AppStoreApp() {
                 </span>
               ) : null}
             </div>
+
+            {agentOperationError?.listingId === selected.id ? (
+              <div role="alert" style={{ color: '#ef4444', fontSize: 13.5, lineHeight: 1.5 }}>
+                {agentOperationError.message}
+              </div>
+            ) : selectedOperationPending ? (
+              <div role="status" aria-live="polite" style={{ color: MUTED[preferences.theme], fontSize: 13.5 }}>
+                {agentOperation.label} in progress…
+              </div>
+            ) : null}
 
             <section style={{ display: 'grid', gap: 10 }}>
               <strong style={{ fontSize: 16 }}>Capabilities</strong>

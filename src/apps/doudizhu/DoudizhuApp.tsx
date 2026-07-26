@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -9,6 +10,7 @@ import {
 import { createFixedStepRuntime } from '../../game-platform/runtime';
 import {
   hasVirtualTimeMarker,
+  shouldIgnoreGameplayKeyEvent,
   useFullscreenController,
   useGameAutomationBridge,
   useGameLifecycle,
@@ -23,9 +25,13 @@ import type { CombinationKind } from './DoudizhuCombinations';
 import type { DoudizhuSeatId } from './DoudizhuAgentAdapter';
 import type { DoudizhuAction, DoudizhuPhase, Seat } from './DoudizhuEngine';
 import {
+  createHeuristicDoudizhuAgentController,
+  type DoudizhuAgentController,
+  type DoudizhuAgentControllerFactory,
   type DoudizhuMatch,
 } from './DoudizhuMatch';
 import {
+  createDoudizhuAgentTurnGate,
   createNextDoudizhuRoundAfterTerminal,
   createSecureLocalDoudizhuMatch,
   createStickyManualClockOwnership,
@@ -93,6 +99,28 @@ const createAgentClock = () => createFixedStepRuntime<AgentClockState, AgentCloc
     ? { elapsedMs: state.elapsedMs }
     : { elapsedMs: state.elapsedMs + context.deltaMs },
 });
+
+export interface DoudizhuAgentAbortControllerOwner {
+  current: AbortController | null;
+}
+
+/** Replaces an aborted lifecycle generation so a retained timer can make progress after resume. */
+export function replaceDoudizhuAgentAbortController(
+  owner: DoudizhuAgentAbortControllerOwner,
+): AbortSignal {
+  const controller = new AbortController();
+  owner.current = controller;
+  return controller.signal;
+}
+
+export function abortDoudizhuAgentController(
+  owner: DoudizhuAgentAbortControllerOwner,
+  message: string,
+): void {
+  const active = owner.current;
+  active?.abort(new DOMException(message, 'AbortError'));
+  if (owner.current === active) owner.current = null;
+}
 
 function seatIdToIndex(seatId: DoudizhuSeatId): Seat {
   return Number(seatId.slice(-1)) as Seat;
@@ -275,12 +303,25 @@ function renderSeatZeroProjection(match: DoudizhuMatch): string {
 }
 
 export interface DoudizhuAppProps {
+  /** Foreground ownership for human keyboard input, Fullscreen, and the developer automation bridge. */
   readonly isActive?: boolean;
+  /**
+   * Match-runtime ownership. An open game may keep its Agent turns running while
+   * another OS window owns foreground input. Closing/unmounting still aborts it.
+   */
+  readonly simulationActive?: boolean;
   /** Dependency injection boundary for deterministic tests or a future remote authority. */
   readonly matchFactory?: DoudizhuMatchFactory;
+  /** Composition-root injection for sidecar or remote Agent implementations. */
+  readonly agentControllerFactory?: DoudizhuAgentControllerFactory;
 }
 
-export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalDoudizhuMatch }: DoudizhuAppProps) {
+export function DoudizhuApp({
+  isActive = true,
+  simulationActive = isActive,
+  matchFactory = createSecureLocalDoudizhuMatch,
+  agentControllerFactory = createHeuristicDoudizhuAgentController,
+}: DoudizhuAppProps) {
   const shellRef = useRef<HTMLDivElement>(null);
   const roundRef = useRef(0);
   const matchRef = useRef<DoudizhuMatch | null>(null);
@@ -307,7 +348,15 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
   if (!clockOwnershipRef.current) {
     clockOwnershipRef.current = createStickyManualClockOwnership(manualClock);
   }
-  const drivingRef = useRef(false);
+  const agentTurnGateRef = useRef<ReturnType<typeof createDoudizhuAgentTurnGate> | null>(null);
+  if (!agentTurnGateRef.current) agentTurnGateRef.current = createDoudizhuAgentTurnGate();
+  const activeAgentAbortRef = useRef<AbortController | null>(null);
+  const foregroundCapabilityRef = useRef(isActive);
+  const lifecycleSuspendedRef = useRef(false);
+  const controllerCacheRef = useRef<{
+    factory: DoudizhuAgentControllerFactory;
+    controllers: Map<string, DoudizhuAgentController>;
+  }>({ factory: agentControllerFactory, controllers: new Map() });
   const hintIndexRef = useRef(0);
   const cardRefs = useRef(new Map<CardId, HTMLButtonElement>());
 
@@ -325,14 +374,49 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
     hintIndexRef.current = 0;
   }, []);
 
-  const requestManualClock = useCallback(() => {
-    if (!clockOwnershipRef.current!.requestManual()) return;
-    setManualClock(true);
+  const abortActiveAgent = useCallback((message: string) => {
+    abortDoudizhuAgentController(activeAgentAbortRef, message);
+    agentTurnGateRef.current!.cancelActive();
   }, []);
 
-  const driveConsecutiveAgents = useCallback(() => {
-    if (drivingRef.current) return 0;
-    drivingRef.current = true;
+  const canUseHumanCapability = useCallback(
+    () => foregroundCapabilityRef.current && !lifecycleSuspendedRef.current,
+    [],
+  );
+
+  useLayoutEffect(() => {
+    foregroundCapabilityRef.current = isActive;
+    return () => { foregroundCapabilityRef.current = false; };
+  }, [isActive]);
+
+  useLayoutEffect(() => {
+    if (!simulationActive) {
+      abortActiveAgent('Game simulation is inactive');
+      return undefined;
+    }
+    return () => abortActiveAgent('Game simulation stopped');
+  }, [abortActiveAgent, simulationActive]);
+
+  useLayoutEffect(() => {
+    if (controllerCacheRef.current.factory === agentControllerFactory) return;
+    abortActiveAgent('Agent controller factory changed');
+    controllerCacheRef.current = { factory: agentControllerFactory, controllers: new Map() };
+    clock.replaceState({ elapsedMs: 0 });
+  }, [abortActiveAgent, agentControllerFactory, clock]);
+
+  useEffect(() => {
+    if (!isActive) resetInteraction();
+  }, [isActive, resetInteraction]);
+
+  const requestManualClock = useCallback(() => {
+    if (!clockOwnershipRef.current!.requestManual()) return;
+    abortActiveAgent('Manual clock took ownership');
+    setManualClock(true);
+  }, [abortActiveAgent]);
+
+  const driveHeuristicAgents = useCallback(() => {
+    const driveToken = agentTurnGateRef.current!.tryBegin();
+    if (!driveToken) return 0;
     let actionsTaken = 0;
     const acted = new Set<DoudizhuSeatId>();
     try {
@@ -366,9 +450,50 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
       setError(cause instanceof Error ? cause.message : 'Agent 行动失败');
       return actionsTaken;
     } finally {
-      drivingRef.current = false;
+      agentTurnGateRef.current!.finish(driveToken);
     }
   }, [refresh]);
+
+  const getAgentController = useCallback((currentMatch: DoudizhuMatch, seatId: DoudizhuSeatId) => {
+    const binding = currentMatch.getAgentControllerBinding(seatId);
+    const cache = controllerCacheRef.current.controllers;
+    const cached = cache.get(binding.seatKey);
+    if (cached) return cached;
+    const controller = controllerCacheRef.current.factory(binding);
+    cache.set(binding.seatKey, controller);
+    return controller;
+  }, []);
+
+  const driveActiveAgentAsync = useCallback(async (signal: AbortSignal) => {
+    const driveToken = agentTurnGateRef.current!.tryBegin();
+    if (!driveToken) return;
+    const currentMatch = matchRef.current!;
+    const actor = currentMatch.getActiveSeatId();
+    if (actor === null || currentMatch.getControllerKind(actor) !== 'agent') {
+      agentTurnGateRef.current!.finish(driveToken);
+      return;
+    }
+    setAgentActivities((current) => ({ ...current, [actor]: '思考中' }));
+    try {
+      const result = await currentMatch.driveAgentTurnAsync(getAgentController(currentMatch, actor), { signal });
+      if (signal.aborted || matchRef.current !== currentMatch) return;
+      if (result.status === 'committed') {
+        setAgentActivities((current) => ({ ...current, [actor]: '已行动' }));
+      } else if (result.reason !== 'aborted' && result.reason !== 'stale-window') {
+        setError(`Agent 行动失败：${result.reason}`);
+        setAgentActivities((current) => ({ ...current, [actor]: '等待中' }));
+      }
+      clock.reset({ state: { elapsedMs: 0 }, input: { suspended: false } });
+      refresh();
+    } catch (cause) {
+      if (!signal.aborted && matchRef.current === currentMatch) {
+        setError(cause instanceof Error ? cause.message : 'Agent 行动失败');
+        setAgentActivities((current) => ({ ...current, [actor]: '等待中' }));
+      }
+    } finally {
+      agentTurnGateRef.current!.finish(driveToken);
+    }
+  }, [clock, getAgentController, refresh]);
 
   const advanceGameTime = useCallback((milliseconds: number) => {
     const currentMatch = matchRef.current!;
@@ -380,26 +505,42 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
     const result = clock.advance(milliseconds);
     if (result.state.elapsedMs + Number.EPSILON < AGENT_THINK_MS) return;
     clock.replaceState({ elapsedMs: result.state.elapsedMs % AGENT_THINK_MS });
-    driveConsecutiveAgents();
-  }, [clock, driveConsecutiveAgents]);
+    driveHeuristicAgents();
+  }, [clock, driveHeuristicAgents]);
 
   const lifecycle = useGameLifecycle({
-    active: isActive,
+    active: simulationActive,
     suspendOnInactive: true,
     suspendOnBlur: true,
     suspendWhenHidden: true,
     resetInputOnSuspend: true,
     onResetInput: resetInteraction,
     onResetClock: () => clock.reset({ state: { elapsedMs: 0 }, input: { suspended: false } }),
-    onSuspend: () => clock.replaceInput({ suspended: true }),
-    onResume: () => clock.replaceInput({ suspended: false }),
+    onSuspend: () => {
+      lifecycleSuspendedRef.current = true;
+      abortActiveAgent('Game lifecycle suspended');
+      clock.replaceInput({ suspended: true });
+    },
+    onResume: () => {
+      lifecycleSuspendedRef.current = false;
+      if (simulationActive && !manualClock) replaceDoudizhuAgentAbortController(activeAgentAbortRef);
+      clock.replaceInput({ suspended: false });
+    },
   });
+
+  const humanInteractionEnabled = isActive && !lifecycle.suspended;
 
   useGameAutomationBridge({
     enabled: isActive,
-    renderGameToText: () => renderSeatZeroProjection(matchRef.current!),
-    advanceTime: advanceGameTime,
-    onManualClockRequested: requestManualClock,
+    renderGameToText: () => canUseHumanCapability()
+      ? renderSeatZeroProjection(matchRef.current!)
+      : JSON.stringify({ protocol: 'AGAP/1.0.0', unavailable: 'inactive' }),
+    advanceTime: (milliseconds) => {
+      if (canUseHumanCapability()) advanceGameTime(milliseconds);
+    },
+    onManualClockRequested: () => {
+      if (canUseHumanCapability()) requestManualClock();
+    },
   });
 
   const fullscreen = useFullscreenController({ target: shellRef });
@@ -407,7 +548,8 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
   useEffect(() => {
     if (!isActive) return undefined;
     const handleFullscreenKey = (event: globalThis.KeyboardEvent) => {
-      if (event.altKey || event.ctrlKey || event.metaKey || event.repeat) return;
+      if (!canUseHumanCapability()) return;
+      if (event.repeat || shouldIgnoreGameplayKeyEvent(event)) return;
       const key = event.key.toLowerCase();
       if (key === 'f') {
         event.preventDefault();
@@ -419,23 +561,43 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
     };
     window.addEventListener('keydown', handleFullscreenKey, { capture: true });
     return () => window.removeEventListener('keydown', handleFullscreenKey, { capture: true });
-  }, [fullscreen.active, fullscreen.exit, fullscreen.toggle, isActive]);
+  }, [canUseHumanCapability, fullscreen.active, fullscreen.exit, fullscreen.toggle, isActive]);
 
   useEffect(() => {
     if (
-      !isActive
+      !simulationActive
       || lifecycle.suspended
       || manualClock
       || observation.terminal
       || activeSeatId === null
       || matchRef.current!.getControllerKind(activeSeatId) !== 'agent'
     ) return undefined;
-    setAgentActivities((current) => ({ ...current, [activeSeatId]: '思考中' }));
+    replaceDoudizhuAgentAbortController(activeAgentAbortRef);
     const timer = window.setInterval(() => {
-      if (clockOwnershipRef.current!.allowsRealtime()) advanceGameTime(REALTIME_INTERVAL_MS);
+      if (!clockOwnershipRef.current!.allowsRealtime() || agentTurnGateRef.current!.isBusy()) return;
+      const activeAbort = activeAgentAbortRef.current;
+      if (!activeAbort || activeAbort.signal.aborted) return;
+      const result = clock.advance(REALTIME_INTERVAL_MS);
+      if (result.state.elapsedMs + Number.EPSILON < AGENT_THINK_MS) return;
+      clock.replaceState({ elapsedMs: result.state.elapsedMs % AGENT_THINK_MS });
+      void driveActiveAgentAsync(activeAbort.signal);
     }, REALTIME_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, [activeSeatId, advanceGameTime, isActive, lifecycle.suspended, manualClock, observation.terminal]);
+    return () => {
+      window.clearInterval(timer);
+      abortActiveAgent('Agent turn is no longer active');
+    };
+  }, [
+    activeSeatId,
+    abortActiveAgent,
+    agentControllerFactory,
+    clock,
+    driveActiveAgentAsync,
+    lifecycle.suspended,
+    manualClock,
+    observation.revision,
+    observation.terminal,
+    simulationActive,
+  ]);
 
   useEffect(() => {
     if (!notice) return undefined;
@@ -444,7 +606,7 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
   }, [notice]);
 
   const submit = useCallback((action: DoudizhuAction) => {
-    if (!isActive || lifecycle.suspended) return false;
+    if (!canUseHumanCapability()) return false;
     setError(null);
     try {
       matchRef.current!.submit(HUMAN_SEAT_ID, action);
@@ -457,7 +619,7 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
       refresh();
       return false;
     }
-  }, [clock, isActive, lifecycle.suspended, refresh, resetInteraction]);
+  }, [canUseHumanCapability, clock, refresh, resetInteraction]);
 
   const playActions = useMemo(
     () => projection.legalActions.filter(
@@ -468,56 +630,57 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
   const selectedPlay = matchingPlay(projection.legalActions, selectedCards);
 
   const toggleCard = useCallback((cardId: CardId) => {
-    if (!humanTurn || projection.phase !== 'playing') return;
+    if (!canUseHumanCapability() || !humanTurn || projection.phase !== 'playing') return;
     setSelectedCards((current) => {
       const next = new Set(current);
       if (next.has(cardId)) next.delete(cardId);
       else next.add(cardId);
       return next;
     });
-  }, [humanTurn, projection.phase]);
+  }, [canUseHumanCapability, humanTurn, projection.phase]);
 
   const hint = useCallback(() => {
-    if (!humanTurn || playActions.length === 0) return;
+    if (!canUseHumanCapability() || !humanTurn || playActions.length === 0) return;
     const action = playActions[hintIndexRef.current % playActions.length]!;
     hintIndexRef.current += 1;
     setSelectedCards(new Set(action.cards));
     setNotice(`提示：${COMBINATION_LABELS[action.combination.kind]}`);
-  }, [humanTurn, playActions]);
+  }, [canUseHumanCapability, humanTurn, playActions]);
 
   const pass = useCallback(() => {
     if (hasAction(projection.legalActions, 'pass')) submit({ type: 'pass' });
   }, [projection.legalActions, submit]);
 
   const playSelected = useCallback(() => {
+    if (!canUseHumanCapability()) return;
     const action = matchingPlay(projection.legalActions, selectedCards);
     if (action) submit({ type: 'play', cards: action.cards });
     else if (selectedCards.size > 0) setError('所选牌不是当前可出的合法牌型');
-  }, [projection.legalActions, selectedCards, submit]);
+  }, [canUseHumanCapability, projection.legalActions, selectedCards, submit]);
 
   const restart = useCallback(() => {
+    if (!canUseHumanCapability()) return;
     const nextSession = createNextDoudizhuRoundAfterTerminal(
       roundRef.current,
       matchRef.current!,
       matchFactory,
     );
     if (!nextSession) return;
+    abortActiveAgent('Match replaced');
     roundRef.current = nextSession.round;
     matchRef.current = nextSession.match;
+    controllerCacheRef.current.controllers.clear();
     clock.reset({ state: { elapsedMs: 0 }, input: { suspended: false } });
     resetInteraction();
     setAgentActivities({ 'seat-0': '等待中', 'seat-1': '等待中', 'seat-2': '等待中' });
     setNotice('新一局已开始');
     setError(null);
     refresh();
-  }, [clock, matchFactory, refresh, resetInteraction]);
+  }, [abortActiveAgent, canUseHumanCapability, clock, matchFactory, refresh, resetInteraction]);
 
   const handleKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (!isActive || event.altKey || event.ctrlKey || event.metaKey) return;
+    if (!canUseHumanCapability() || shouldIgnoreGameplayKeyEvent(event)) return;
     const key = event.key.toLowerCase();
-    const target = event.target;
-    const fromInteractiveControl = target instanceof HTMLElement
-      && (target.matches('button, input, select, textarea, a[href]') || target.isContentEditable);
     if (key === 'h') {
       event.preventDefault();
       hint();
@@ -538,7 +701,6 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
       }
       return;
     }
-    if (fromInteractiveControl && (key === ' ' || key === 'enter')) return;
     if (key === ' ' && projection.ownHand[focusedCardIndex]) {
       event.preventDefault();
       toggleCard(projection.ownHand[focusedCardIndex]);
@@ -557,7 +719,7 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
         submit({ type: 'bid', score });
       }
     }
-  }, [focusedCardIndex, hint, isActive, pass, playSelected, projection, submit, toggleCard]);
+  }, [canUseHumanCapability, focusedCardIndex, hint, pass, playSelected, projection, submit, toggleCard]);
 
   const bids = projection.legalActions.filter(
     (action): action is Extract<LegalActionDescriptor, { type: 'bid' }> => action.type === 'bid',
@@ -599,7 +761,7 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
             type="button"
             title={observation.terminal ? '新一局' : '本局结束后可开始新一局'}
             aria-label={observation.terminal ? '开始新一局' : '本局结束后可开始新一局'}
-            disabled={!observation.terminal}
+            disabled={!humanInteractionEnabled || !observation.terminal}
             onClick={restart}
           >↻</button>
           <button
@@ -608,8 +770,10 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
             title="全屏（F）"
             aria-label={fullscreen.active ? '退出全屏' : '进入全屏'}
             aria-pressed={fullscreen.active}
-            disabled={!fullscreen.supported || fullscreen.pending}
-            onClick={() => void fullscreen.toggle()}
+            disabled={!humanInteractionEnabled || !fullscreen.supported || fullscreen.pending}
+            onClick={() => {
+              if (canUseHumanCapability()) void fullscreen.toggle();
+            }}
           >
             {fullscreen.active ? '↙' : '↗'}
           </button>
@@ -657,6 +821,7 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
                     else cardRefs.current.delete(cardId);
                   }}
                   onClick={() => {
+                    if (!canUseHumanCapability()) return;
                     setFocusedCardIndex(index);
                     toggleCard(cardId);
                   }}
@@ -670,6 +835,7 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
                 key={action.score}
                 className={`ddz-action${action.score === 3 ? ' ddz-action-primary' : ''}`}
                 type="button"
+                disabled={!humanInteractionEnabled || !humanTurn}
                 onClick={() => submit({ type: 'bid', score: action.score })}
               >
                 {action.score === 0 ? '不叫' : `${action.score} 分`}
@@ -677,24 +843,24 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
             )) : null}
             {projection.phase === 'defender-double' ? (
               <>
-                <button className="ddz-action" type="button" disabled={!humanTurn} onClick={() => submit({ type: 'commit-defender-double', double: false })}>不加倍</button>
-                <button className="ddz-action ddz-action-primary" type="button" disabled={!humanTurn} onClick={() => submit({ type: 'commit-defender-double', double: true })}>加倍</button>
+                <button className="ddz-action" type="button" disabled={!humanInteractionEnabled || !humanTurn} onClick={() => submit({ type: 'commit-defender-double', double: false })}>不加倍</button>
+                <button className="ddz-action ddz-action-primary" type="button" disabled={!humanInteractionEnabled || !humanTurn} onClick={() => submit({ type: 'commit-defender-double', double: true })}>加倍</button>
               </>
             ) : null}
             {projection.phase === 'landlord-redouble' ? (
               <>
-                <button className="ddz-action" type="button" disabled={!humanTurn} onClick={() => submit({ type: 'landlord-redouble', redouble: false })}>不再加倍</button>
-                <button className="ddz-action ddz-action-primary" type="button" disabled={!humanTurn} onClick={() => submit({ type: 'landlord-redouble', redouble: true })}>再加倍</button>
+                <button className="ddz-action" type="button" disabled={!humanInteractionEnabled || !humanTurn} onClick={() => submit({ type: 'landlord-redouble', redouble: false })}>不再加倍</button>
+                <button className="ddz-action ddz-action-primary" type="button" disabled={!humanInteractionEnabled || !humanTurn} onClick={() => submit({ type: 'landlord-redouble', redouble: true })}>再加倍</button>
               </>
             ) : null}
             {projection.phase === 'playing' ? (
               <>
-                <button className="ddz-action" type="button" disabled={!humanTurn || playActions.length === 0} onClick={hint}>提示</button>
-                <button className="ddz-action ddz-action-warn" type="button" disabled={!humanTurn || !hasAction(projection.legalActions, 'pass')} onClick={pass}>不要</button>
-                <button className="ddz-action ddz-action-primary" type="button" disabled={!humanTurn || !selectedPlay} onClick={playSelected}>出牌</button>
+                <button className="ddz-action" type="button" disabled={!humanInteractionEnabled || !humanTurn || playActions.length === 0} onClick={hint}>提示</button>
+                <button className="ddz-action ddz-action-warn" type="button" disabled={!humanInteractionEnabled || !humanTurn || !hasAction(projection.legalActions, 'pass')} onClick={pass}>不要</button>
+                <button className="ddz-action ddz-action-primary" type="button" disabled={!humanInteractionEnabled || !humanTurn || !selectedPlay} onClick={playSelected}>出牌</button>
               </>
             ) : null}
-            {!humanTurn && !observation.terminal ? <span className="ddz-action-hint">Agent 正在行动，窗口失活时自动暂停</span> : null}
+            {!humanTurn && !observation.terminal ? <span className="ddz-action-hint">Agent 正在行动，切换窗口后牌局仍会继续</span> : null}
             {humanTurn ? <span className="ddz-action-hint">← → 选牌 · Space 勾选 · Enter 出牌 · H 提示 · P 不要</span> : null}
           </div>
         </section>
@@ -726,7 +892,7 @@ export function DoudizhuApp({ isActive = true, matchFactory = createSecureLocalD
               })}
             </div>
             <div className="ddz-settlement-footer">
-              <button className="ddz-action ddz-action-primary" type="button" onClick={restart}>再来一局</button>
+              <button className="ddz-action ddz-action-primary" type="button" disabled={!humanInteractionEnabled} onClick={restart}>再来一局</button>
             </div>
           </div>
         </section>

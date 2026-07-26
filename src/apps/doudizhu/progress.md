@@ -22,4 +22,16 @@ Original prompt: 这个项目是一个 AI 原生操作系统，因为这个操�
 - 生命周期真实验收：Fullscreen 进入为 true，`Escape` 退出恢复为 false；最小化后自动化桥移除且状态冻结，重新激活后桥和同一 revision 恢复；同步手动时钟在 400 ms + 250 ms 墙钟等待期间冻结，并只在累计 500 ms 虚拟时间后推进 Agent。
 - 新局编排闭环：仅终局后的“新一局”可创建全新 Host、256-bit seed、不透明 `matchId` 与座位绑定，进行中按钮禁用且 handler 二次拒绝，旧终局 Host 保持不可变；7 次端到端新局发布延迟中位数 39.9 ms、最大 46.5 ms，公开 ID 全部唯一且不含 seed。
 - DOM 性能复验：180 帧样本平均约 171.3 FPS，P50/P95/P99 为 5.9/6/6 ms，最大 6.6 ms，采样期 0 Long Task、0 Canvas/WebGL；最终生产懒加载 JS chunk 51,324 bytes，SHA-256 `5D433F9142EABF452282CEB7F7F58096089B9F9DEC95C660F8CC7A7CEF0E146C`。
-- 最终门禁：Node 10/10、Vitest 26 文件 / 199 项、`npm run typecheck`、`npm run build` 全部通过；斗地主/AGAP 聚焦 9 文件 / 79 项通过；当前无临时游戏目录、功能 TODO 或已知失败门禁。
+- 最终门禁：Node 10/10、Vitest 26 文件 / 199 项、`npm run typecheck`、`npm run build` 全部通过；斗地主/AGAP 聚焦 9 文件 / 79 项通过；当前无临时游戏目录、未完成项或已知失败门禁。
+- Sidecar 接缝升级：新增可注入 `DoudizhuAgentControllerFactory`，每个 `(matchId, seatId)` 使用独立 opaque `seatKey` 和 controller；默认控制器仍为只读座位投影驱动的确定性 heuristic，真实 sidecar 由 OS 组合根注入。
+- 异步权威保证：`driveAgentTurnAsync` 在 await 前原子捕获 seat observation、完整 legal-action set、revision、phase 与 turn nonce；controller 返回后仅使用原始决策窗口提交。stale、caller abort、timeout、controller error 与 illegal output 均有稳定结果，且只有显式 fallback policy 允许 heuristic fallback。
+- React 编排升级为 token-owned single-flight；活动席位/revision/窗口状态变化、手动时钟接管、新局替换和卸载都会 Abort 当前决策。实时异步 sidecar 与同步 `window.advanceTime` 完全分流，后者仍以 heuristic 确定性推进连续 Agent 回合。
+- 聚焦复验：`npx vitest run src/apps/doudizhu` 通过 8 文件 / 67 项；新增 async success、stale window、cancel、timeout、controller error、illegal output、fallback off、隐藏信息边界、三席 session-key 隔离和单飞 token 所有权测试。
+- 多游戏并行编排：OS 组合根将窗口 `isOpen` 作为独立 `simulationActive` 传给 Space Game 与斗地主；前台 `isActive` 仅保留人类输入、Fullscreen 和 active-only 自动化桥。用户授权的后台模拟例外只适用于仍打开且未显式暂停的游戏，页面隐藏/浏览器失焦/关闭/卸载仍走共享生命周期暂停与 Abort。
+- 斗地主 controller factory 生命周期加固：factory 变化在 layout effect 中中止旧请求、撤销旧单飞 token、清空 controller cache 并重置思考时钟；实时 effect 显式依赖 factory，旧异步结果经 AbortSignal 失效，不能提交到原 Match Authority。
+- 独立终审后的同步撤销加固：blur/hidden 的 lifecycle callback 与 simulation stop/unmount 的 layout cleanup 会先 Abort Agent；foreground/human/Fullscreen/automation 均使用调用时 capability ref 复验，关闭 passive-effect 窗口。聚焦 `typecheck` 与 App/斗地主/Space 13 文件 95 项通过。
+- 真实 Chromium 并行验收：Space 在 Finder 聚焦期间 observation tick 从 23 增至 72，后台发送 ArrowRight 后玩家 x 保持 0，且 automation bridge 为 `undefined`；斗地主在 Space 聚焦期间由两个 Agent 将 revision 1 推进至 3、阶段从 `defender-double` 进入 `playing`，后台 automation bridge 同样不可见。两条路径均 0 console/page error。
+- 官方 `develop-web-game` 客户端复验：Enter、右移、射击连续两轮后 observation tick 13→35、玩家 x 0→1.8、子弹/敌人投影更新，0 console/page error；补充 Chromium 全页游戏截图已人工检查，渲染与文本状态一致。
+- 快速 blur→focus 存活性终审：resume 会同步轮换新的 AbortController，实时 timer 每次从 ref 读取当前 signal，不再闭包捕获已撤销 signal；即使 React 批处理掉中间 suspended render，Agent 回合也会继续，普通 cleanup 仍会中止当前 ref 所有者。
+- 全局键盘隔离：Fullscreen 捕获监听与牌桌快捷键统一复用共享 fail-closed 谓词；Alt/Ctrl/Meta、IME、已处理事件以及 input/textarea/select/button/link/contenteditable 内的按键不会触发玩法或 `preventDefault`，因此助手输入框键入 `f` 不会切换斗地主全屏。
+- 契约回归：`DoudizhuApp.contract.test.ts` 锁定 Fullscreen 捕获与 scoped gameplay handler 都必须调用共享谓词，并禁止恢复本地分叉的 interactive-target 判断；与共享 web/Space 聚焦门禁合计 11 files / 66 tests 通过。

@@ -1,0 +1,36 @@
+@container (max-width: 700px) {
+  .store-app {
+    grid-template-rows: auto auto minmax(0, 1fr) !important;
+  }
+
+  .store-header {
+    padding: 12px 10px 8px !important;
+    align-items: flex-start !important;
+    flex-direction: column !important;
+    gap: 10px !important;
+  }
+
+  .store-header + div {
+    padding: 0 10px 10px !important;
+  }
+
+  .store-heading {
+    font-size: 19px !important;
+  }
+
+  .store-hero-grid,
+  .store-body-grid,
+  .store-stats-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .store-hero-grid > div,
+  .store-body-grid > * {
+    padding: 14px !important;
+    border-radius: 20px !important;
+  }
+
+  .store-body-grid {
+    padding: 0 10px 10px !important;
+  }
+}

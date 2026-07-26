@@ -1,0 +1,47 @@
+@container (max-width: 620px) {
+  .settings-app {
+    grid-template-columns: minmax(0, 1fr) !important;
+    grid-template-rows: auto minmax(0, 1fr) !important;
+  }
+
+  .settings-sidebar {
+    padding: 10px !important;
+    border-right: 0 !important;
+    border-bottom: 1px solid color-mix(in srgb, currentColor 14%, transparent) !important;
+    overflow: hidden !important;
+  }
+
+  .settings-sidebar-header {
+    display: none !important;
+  }
+
+  .settings-nav {
+    display: flex !important;
+    gap: 8px !important;
+    overflow-x: auto !important;
+    overscroll-behavior-inline: contain;
+    scrollbar-width: thin;
+  }
+
+  .settings-nav-item {
+    min-width: 124px !important;
+    padding: 9px 10px !important;
+  }
+
+  .settings-nav-item > span:last-child {
+    display: none !important;
+  }
+
+  .settings-main {
+    padding: 8px !important;
+  }
+
+  .settings-main section {
+    padding: 16px !important;
+    border-radius: 18px !important;
+  }
+
+  .settings-ai-facts {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+}

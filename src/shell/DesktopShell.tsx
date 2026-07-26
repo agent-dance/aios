@@ -1,7 +1,7 @@
-import type { ReactNode } from 'react';
+import type { ReactNode, RefObject } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { APP_REGISTRY, DOCK_APPS } from '../system/appRegistry';
-import type { AppId, WindowState } from '../system/types';
+import type { AppId, SystemStatusModel, WindowState } from '../system/types';
 import { useSystemStore } from '../system/useSystemStore';
 import { AppWindow } from './AppWindow';
 import { ClockPanel } from './ClockPanel';
@@ -16,13 +16,13 @@ import type {
   FocusSession,
   ShellSurfaceProps,
   ShellViewport,
-  SystemStatusModel,
 } from './shellTypes';
 import { useDismissibleLayer } from './useDismissibleLayer';
 
 export interface DesktopShellProps extends ShellSurfaceProps {
   appContents?: AppContentMap;
   children?: ReactNode;
+  assistant?: ReactNode;
   brand?: ReactNode;
   desktopIcons?: DesktopIconDefinition[];
 }
@@ -32,19 +32,6 @@ const MENU_BAR_HEIGHT = 68;
 // windows never sit underneath the launcher on short viewports.
 const DOCK_HEIGHT = 126;
 
-const DEFAULT_STATUS: SystemStatusModel = {
-  wifiEnabled: true,
-  wifiLabel: 'AlSniper Mesh',
-  bluetoothEnabled: true,
-  bluetoothLabel: 'Orbital Link',
-  healthScore: 98,
-  storageUsedGb: 612,
-  storageTotalGb: 1024,
-  energyMode: 'Balanced',
-  brightness: 72,
-  volume: 38,
-};
-
 const DEFAULT_FOCUS: FocusSession = {
   active: false,
   label: 'Deep Work',
@@ -52,7 +39,86 @@ const DEFAULT_FOCUS: FocusSession = {
   startedAt: null,
 };
 
-export function DesktopShell({ appContents = {}, children, brand, desktopIcons, className, style }: DesktopShellProps) {
+interface ClockSurfacesProps {
+  brand?: ReactNode;
+  activeAppId: AppId | null;
+  activeAppName?: string;
+  status: SystemStatusModel;
+  controlCenterOpen: boolean;
+  clockOpen: boolean;
+  onToggleControlCenter: () => void;
+  onToggleClock: () => void;
+  controlCenterButtonRef: RefObject<HTMLButtonElement | null>;
+  clockButtonRef: RefObject<HTMLButtonElement | null>;
+  clockPanelRef: RefObject<HTMLDivElement | null>;
+}
+
+function ClockSurfaces({
+  brand,
+  activeAppId,
+  activeAppName,
+  status,
+  controlCenterOpen,
+  clockOpen,
+  onToggleControlCenter,
+  onToggleClock,
+  controlCenterButtonRef,
+  clockButtonRef,
+  clockPanelRef,
+}: ClockSurfacesProps) {
+  const [now, setNow] = useState(() => new Date());
+  const [focus, setFocus] = useState<FocusSession>(DEFAULT_FOCUS);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => setNow(new Date()), 1000);
+    return () => window.clearInterval(intervalId);
+  }, []);
+
+  useEffect(() => {
+    if (!focus.active || focus.startedAt === null) return;
+    if (now.getTime() - focus.startedAt >= focus.durationMinutes * 60_000) {
+      setFocus((current) => ({ ...current, active: false, startedAt: null }));
+    }
+  }, [focus.active, focus.durationMinutes, focus.startedAt, now]);
+
+  return (
+    <>
+      <MenuBar
+        brand={brand}
+        activeAppId={activeAppId}
+        activeAppName={activeAppName}
+        now={now}
+        status={status}
+        controlCenterOpen={controlCenterOpen}
+        clockOpen={clockOpen}
+        onToggleControlCenter={onToggleControlCenter}
+        onToggleClock={onToggleClock}
+        controlCenterButtonRef={controlCenterButtonRef}
+        clockButtonRef={clockButtonRef}
+      />
+
+      <div style={{ position: 'absolute', top: 64, right: 12, zIndex: 130 }}>
+        <div ref={clockPanelRef}>
+          <ClockPanel
+            open={clockOpen}
+            now={now}
+            focus={focus}
+            onToggleFocus={() =>
+              setFocus((current) => ({
+                ...current,
+                active: !current.active,
+                startedAt: current.active ? null : Date.now(),
+              }))
+            }
+            onResetFocus={() => setFocus((current) => ({ ...current, active: false, startedAt: null }))}
+          />
+        </div>
+      </div>
+    </>
+  );
+}
+
+export function DesktopShell({ appContents = {}, children, assistant, brand, desktopIcons, className, style }: DesktopShellProps) {
   const shellRef = useRef<HTMLDivElement | null>(null);
   const controlCenterRef = useRef<HTMLDivElement | null>(null);
   const controlCenterButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -64,6 +130,8 @@ export function DesktopShell({ appContents = {}, children, brand, desktopIcons, 
   const controlCenterOpen = useSystemStore((state) => state.controlCenterOpen);
   const clockOpen = useSystemStore((state) => state.clockOpen);
   const preferences = useSystemStore((state) => state.preferences);
+  const appInstallations = useSystemStore((state) => state.appInstallations);
+  const status = useSystemStore((state) => state.systemStatus);
   const openApp = useSystemStore((state) => state.openApp);
   const closeApp = useSystemStore((state) => state.closeApp);
   const minimizeApp = useSystemStore((state) => state.minimizeApp);
@@ -74,10 +142,8 @@ export function DesktopShell({ appContents = {}, children, brand, desktopIcons, 
   const setControlCenterOpen = useSystemStore((state) => state.setControlCenterOpen);
   const setClockOpen = useSystemStore((state) => state.setClockOpen);
   const updatePreferences = useSystemStore((state) => state.updatePreferences);
+  const updateSystemStatus = useSystemStore((state) => state.updateSystemStatus);
 
-  const [now, setNow] = useState(() => new Date());
-  const [status, setStatus] = useState<SystemStatusModel>(DEFAULT_STATUS);
-  const [focus, setFocus] = useState<FocusSession>(DEFAULT_FOCUS);
   const [selectedDesktopAppId, setSelectedDesktopAppId] = useState<AppId | null>(null);
   const [viewport, setViewport] = useState<ShellViewport>({
     width: 1280,
@@ -85,11 +151,6 @@ export function DesktopShell({ appContents = {}, children, brand, desktopIcons, 
     topInset: MENU_BAR_HEIGHT,
     bottomInset: DOCK_HEIGHT,
   });
-
-  useEffect(() => {
-    const intervalId = window.setInterval(() => setNow(new Date()), 1000);
-    return () => window.clearInterval(intervalId);
-  }, []);
 
   useEffect(() => {
     const node = shellRef.current;
@@ -112,16 +173,6 @@ export function DesktopShell({ appContents = {}, children, brand, desktopIcons, 
     observer.observe(node);
     return () => observer.disconnect();
   }, []);
-
-  useEffect(() => {
-    if (!focus.active || focus.startedAt === null) {
-      return;
-    }
-
-    if (now.getTime() - focus.startedAt >= focus.durationMinutes * 60_000) {
-      setFocus((current) => ({ ...current, active: false, startedAt: null }));
-    }
-  }, [focus.active, focus.durationMinutes, focus.startedAt, now]);
 
   useDismissibleLayer({
     open: controlCenterOpen,
@@ -164,15 +215,15 @@ export function DesktopShell({ appContents = {}, children, brand, desktopIcons, 
 
   const visibleDesktopIcons = useMemo<DesktopIconDefinition[]>(
     () =>
-      desktopIcons ??
+      (desktopIcons ??
       DOCK_APPS.map((appId, index) => ({
         appId,
         position: {
           x: 28 + Math.floor(index / 5) * 104,
           y: 92 + (index % 5) * 116,
         },
-      })),
-    [desktopIcons],
+      }))).filter((icon) => appInstallations[icon.appId]?.enabled === true),
+    [appInstallations, desktopIcons],
   );
 
   const activeAppName = effectiveActiveAppId ? APP_REGISTRY[effectiveActiveAppId].name : undefined;
@@ -252,11 +303,10 @@ export function DesktopShell({ appContents = {}, children, brand, desktopIcons, 
 
       {children}
 
-      <MenuBar
+      <ClockSurfaces
         brand={brand}
         activeAppId={effectiveActiveAppId}
         activeAppName={activeAppName}
-        now={now}
         status={status}
         controlCenterOpen={controlCenterOpen}
         clockOpen={clockOpen}
@@ -264,6 +314,7 @@ export function DesktopShell({ appContents = {}, children, brand, desktopIcons, 
         onToggleClock={() => setClockOpen(!clockOpen)}
         controlCenterButtonRef={controlCenterButtonRef}
         clockButtonRef={clockButtonRef}
+        clockPanelRef={clockPanelRef}
       />
 
       <div
@@ -314,38 +365,22 @@ export function DesktopShell({ appContents = {}, children, brand, desktopIcons, 
         );
       })}
 
+      {assistant}
+
       <div style={{ position: 'absolute', top: 64, right: 12, zIndex: 130 }}>
         <div ref={controlCenterRef}>
           <ControlCenter
             open={controlCenterOpen}
             preferences={preferences}
             status={status}
-            onStatusChange={(patch) => setStatus((current) => ({ ...current, ...patch }))}
+            onStatusChange={(patch) => { updateSystemStatus(patch); }}
             onPreferencesChange={updatePreferences}
           />
         </div>
       </div>
 
-      <div style={{ position: 'absolute', top: 64, right: 12, zIndex: 130 }}>
-        <div ref={clockPanelRef}>
-          <ClockPanel
-            open={clockOpen}
-            now={now}
-            focus={focus}
-            onToggleFocus={() =>
-              setFocus((current) => ({
-                ...current,
-                active: !current.active,
-                startedAt: current.active ? null : Date.now(),
-              }))
-            }
-            onResetFocus={() => setFocus((current) => ({ ...current, active: false, startedAt: null }))}
-          />
-        </div>
-      </div>
-
       <Dock
-        apps={DOCK_APPS.map((appId) => APP_REGISTRY[appId])}
+        apps={DOCK_APPS.filter((appId) => appInstallations[appId]?.enabled === true).map((appId) => APP_REGISTRY[appId])}
         activeAppId={effectiveActiveAppId}
         openAppIds={openAppIds}
         magnification={preferences.dockMagnification}

@@ -3,6 +3,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -11,7 +12,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react';
 import * as THREE from 'three';
-import { createFixedStepRuntime } from '../../game-platform/runtime';
+import { isAgapError } from '../../game-platform/agent';
 import {
   AdaptiveDpr,
   FixedStepDriver,
@@ -22,19 +23,35 @@ import {
   useFullscreenController,
   useGameAutomationBridge,
   useGameLifecycle,
+  shouldIgnoreGameplayKeyEvent,
 } from '../../game-platform/web';
 import {
-  advanceGame,
-  createInitialGameState,
-  createInputState,
-  renderGameToText,
-  restartGame,
-  startGame,
-  togglePause,
   WORLD_BOUNDS,
   type GameMode,
-  type GameState,
 } from './gameEngine';
+import {
+  SPACE_GAME_SEAT_ID,
+  createInitialSpaceGameRenderProjection,
+  createSpaceGameMatch,
+  movementFromInput,
+  quantizeAimToCell,
+  type SpaceGameAction,
+  type SpaceGameControl,
+  type SpaceGameRenderProjection,
+} from './SpaceGameAgentAdapter';
+import {
+  createSpaceGameAgentDriver,
+  type SpaceGameAgentController,
+  type SpaceGameAgentDriver,
+} from './SpaceGameAgentController';
+import {
+  SpaceGameCapabilityRevokedError,
+  createCapabilityGuardedSpaceGameAgentController,
+  createSpaceGameCapabilityGate,
+  createSpaceGameControlModeLatch,
+  type SpaceGameCapabilityGate,
+  type SpaceGameControlMode,
+} from './SpaceGameCapabilities';
 import {
   RENDER_QUALITY_PROFILES,
   SPACE_GAME_QUALITY_CONFIG,
@@ -126,7 +143,7 @@ interface UiSnapshot {
   bulletCount: number;
 }
 
-const createUiSnapshot = (state: GameState): UiSnapshot => ({
+const createUiSnapshot = (state: SpaceGameRenderProjection): UiSnapshot => ({
   mode: state.mode,
   score: state.score,
   health: state.player.health,
@@ -135,7 +152,7 @@ const createUiSnapshot = (state: GameState): UiSnapshot => ({
   bulletCount: state.bullets.length,
 });
 
-const uiSnapshotMatchesState = (snapshot: UiSnapshot, state: GameState) =>
+const uiSnapshotMatchesState = (snapshot: UiSnapshot, state: SpaceGameRenderProjection) =>
   snapshot.mode === state.mode &&
   snapshot.score === state.score &&
   snapshot.health === state.player.health &&
@@ -143,10 +160,10 @@ const uiSnapshotMatchesState = (snapshot: UiSnapshot, state: GameState) =>
   snapshot.enemyCount === state.enemies.length &&
   snapshot.bulletCount === state.bullets.length;
 
-type GameStateRef = MutableRefObject<GameState>;
+type RenderProjectionRef = MutableRefObject<SpaceGameRenderProjection>;
 type QualityRef = MutableRefObject<RenderQuality>;
 
-const ShipView = memo(({ stateRef }: { stateRef: GameStateRef }) => {
+const ShipView = memo(({ stateRef }: { stateRef: RenderProjectionRef }) => {
   const groupRef = useRef<THREE.Group>(null);
 
   useFrame(() => {
@@ -175,7 +192,7 @@ const ShipView = memo(({ stateRef }: { stateRef: GameStateRef }) => {
 });
 ShipView.displayName = 'ShipView';
 
-const EnemyInstances = memo(({ stateRef }: { stateRef: GameStateRef }) => {
+const EnemyInstances = memo(({ stateRef }: { stateRef: RenderProjectionRef }) => {
   const coresRef = useRef<THREE.InstancedMesh>(null);
   const ringsRef = useRef<THREE.InstancedMesh>(null);
   const transform = useMemo(() => new THREE.Object3D(), []);
@@ -235,7 +252,7 @@ const EnemyInstances = memo(({ stateRef }: { stateRef: GameStateRef }) => {
 });
 EnemyInstances.displayName = 'EnemyInstances';
 
-const BulletInstances = memo(({ stateRef }: { stateRef: GameStateRef }) => {
+const BulletInstances = memo(({ stateRef }: { stateRef: RenderProjectionRef }) => {
   const meshRef = useRef<THREE.InstancedMesh>(null);
   const transform = useMemo(() => new THREE.Object3D(), []);
   const [capacity, setCapacity] = useState(INITIAL_BULLET_CAPACITY);
@@ -274,7 +291,7 @@ const BulletInstances = memo(({ stateRef }: { stateRef: GameStateRef }) => {
 });
 BulletInstances.displayName = 'BulletInstances';
 
-const ParticleInstances = memo(({ stateRef, qualityRef }: { stateRef: GameStateRef; qualityRef: QualityRef }) => {
+const ParticleInstances = memo(({ stateRef, qualityRef }: { stateRef: RenderProjectionRef; qualityRef: QualityRef }) => {
   const meshRef = useRef<THREE.InstancedMesh>(null);
   const lifeAttributeRef = useRef<THREE.InstancedBufferAttribute>(null);
   const transform = useMemo(() => new THREE.Object3D(), []);
@@ -385,7 +402,7 @@ const CombatScene = memo(
     manualClock,
     onFrame,
   }: {
-    stateRef: GameStateRef;
+    stateRef: RenderProjectionRef;
     shouldAnimate: boolean;
     manualClock: boolean;
     onFrame: (elapsedMs: number, now: number) => void;
@@ -490,14 +507,68 @@ const OverlayScreen = ({
 
 export interface SpaceGameAppProps {
   isActive?: boolean;
+  /** Separates simulation/Agent lifetime from foreground human input focus. */
+  simulationActive?: boolean;
+  /** Human is the default; assist shares the same formal pilot capability and Agent latches controls between plans. */
+  controlMode?: SpaceGameControlMode;
+  agentController?: SpaceGameAgentController;
+  agentSeatKey?: string;
 }
 
-export function SpaceGameApp({ isActive = true }: SpaceGameAppProps) {
+const createLocalMatchId = () => {
+  if (!globalThis.crypto?.getRandomValues) {
+    throw new Error('Secure randomness is required to create an opaque game match id.');
+  }
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+  return `space-${[...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+};
+
+const readInitialLifecycleSuspended = (simulationActive: boolean) => {
+  if (!simulationActive || typeof document === 'undefined') return !simulationActive;
+  try {
+    return document.visibilityState === 'hidden' || (typeof document.hasFocus === 'function' && !document.hasFocus());
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Revokes every component-owned capability before React's passive unmount
+ * cleanup. Late Agent completions and still-installed automation/key handlers
+ * therefore fail closed even when the shell removes the window immediately.
+ */
+export function revokeSpaceGameCapabilitiesOnUnmount(
+  capabilityGate: Pick<
+    SpaceGameCapabilityGate,
+    'setForeground' | 'setSimulationActive' | 'setLifecycleSuspended'
+  >,
+  stopAgentDriver: () => void,
+  resetInput: () => void,
+): void {
+  capabilityGate.setForeground(false);
+  capabilityGate.setSimulationActive(false);
+  capabilityGate.setLifecycleSuspended(true);
+  stopAgentDriver();
+  resetInput();
+}
+
+export function SpaceGameApp({
+  isActive = true,
+  simulationActive = isActive,
+  controlMode = 'human',
+  agentController,
+  agentSeatKey = 'cosmic-vanguard:pilot',
+}: SpaceGameAppProps) {
   const shellRef = useRef<HTMLDivElement | null>(null);
   const cooldownFillRef = useRef<HTMLDivElement | null>(null);
   const telemetryRef = useRef<HTMLDivElement | null>(null);
-  const stateRef = useRef<GameState>(createInitialGameState());
+  const stateRef = useRef<SpaceGameRenderProjection>(createInitialSpaceGameRenderProjection());
   const pressedKeysRef = useRef<Record<string, boolean>>({});
+  const keyboardFireLatchedRef = useRef(false);
+  const requestSequenceRef = useRef(0);
+  const agentDriverRef = useRef<SpaceGameAgentDriver | null>(null);
+  const agentControllerRef = useRef(agentController);
+  const lastAgentCriticalVersionRef = useRef(-1);
   // The official automation client installs this marker before React mounts;
   // taking clock ownership immediately prevents the start-button delay from
   // leaking one nondeterministic real-time fixed step into scripted runs.
@@ -505,11 +576,26 @@ export function SpaceGameApp({ isActive = true }: SpaceGameAppProps) {
     () => typeof window !== 'undefined' && '__vt_pending' in window,
   );
   const manualClockRef = useRef(manualClock);
+  const capabilityGateRef = useRef<ReturnType<typeof createSpaceGameCapabilityGate> | null>(null);
+  if (!capabilityGateRef.current) {
+    capabilityGateRef.current = createSpaceGameCapabilityGate({
+      foreground: isActive,
+      simulationActive,
+      lifecycleSuspended: readInitialLifecycleSuspended(simulationActive),
+      manualClock,
+    });
+  }
+  const capabilityGate = capabilityGateRef.current;
+  capabilityGate.setForeground(isActive);
+  capabilityGate.setSimulationActive(simulationActive);
+  agentControllerRef.current = agentController;
+  const controlModeLatchRef = useRef<ReturnType<typeof createSpaceGameControlModeLatch> | null>(null);
+  if (!controlModeLatchRef.current) controlModeLatchRef.current = createSpaceGameControlModeLatch(controlMode);
   const initialUiSnapshot = useMemo(() => createUiSnapshot(stateRef.current), []);
   const uiSnapshotRef = useRef(initialUiSnapshot);
   const [uiSnapshot, setUiSnapshot] = useState(initialUiSnapshot);
 
-  const syncLiveHud = useCallback((state: GameState) => {
+  const syncLiveHud = useCallback((state: SpaceGameRenderProjection) => {
     if (cooldownFillRef.current) {
       const percentage = Math.max(0, Math.min(100, (1 - state.player.cooldownMs / 220) * 100));
       cooldownFillRef.current.style.width = `${percentage}%`;
@@ -520,7 +606,7 @@ export function SpaceGameApp({ isActive = true }: SpaceGameAppProps) {
   }, []);
 
   const publishState = useCallback(
-    (nextState: GameState) => {
+    (nextState: SpaceGameRenderProjection) => {
       stateRef.current = nextState;
       syncLiveHud(nextState);
       if (!uiSnapshotMatchesState(uiSnapshotRef.current, nextState)) {
@@ -532,42 +618,81 @@ export function SpaceGameApp({ isActive = true }: SpaceGameAppProps) {
     [syncLiveHud],
   );
 
-  const runtime = useMemo(
-    () =>
-      createFixedStepRuntime({
-        createInitialState: createInitialGameState,
-        createInitialInput: createInputState,
-        simulate: (state, input, context) => advanceGame(state, input, context.deltaMs),
-        onPublish: publishState,
-      }),
-    [publishState],
-  );
+  const initialBindingModeRef = useRef(controlMode);
+  const matchId = useMemo(createLocalMatchId, []);
+  const session = useMemo(() => {
+    const nextMatch = createSpaceGameMatch({
+      matchId,
+      onPublish: publishState,
+    });
+    const nextPilotPort = nextMatch.bindParticipant({
+      seatId: SPACE_GAME_SEAT_ID,
+      participantId: initialBindingModeRef.current === 'human' ? 'local-human' : 'desktop-agent',
+      kind: initialBindingModeRef.current === 'human' ? 'human' : 'agent',
+    });
+    return Object.freeze({ match: nextMatch, pilotPort: nextPilotPort });
+  }, [matchId, publishState]);
+  const { match, pilotPort } = session;
+  const controlPolicy = controlModeLatchRef.current.resolve(Boolean(agentController));
+  const humanControlEnabledRef = useRef(controlPolicy.humanEnabled);
+  const agentPolicyEnabledRef = useRef(controlPolicy.agentEnabled);
+  humanControlEnabledRef.current = controlPolicy.humanEnabled;
+  agentPolicyEnabledRef.current = controlPolicy.agentEnabled;
 
   const fullscreen = useFullscreenController({ target: shellRef });
 
-  const requestManualClock = useCallback(() => {
-    if (manualClockRef.current) return;
-    manualClockRef.current = true;
-    setManualClock(true);
+  const stopAgentDriver = useCallback(() => {
+    const driver = agentDriverRef.current;
+    driver?.stop();
+    if (agentDriverRef.current === driver) agentDriverRef.current = null;
   }, []);
 
-  const recomputeMovement = useCallback(() => {
-    const pressedKeys = pressedKeysRef.current;
-    const moveX = (pressedKeys.d || pressedKeys.arrowright ? 1 : 0) - (pressedKeys.a || pressedKeys.arrowleft ? 1 : 0);
-    const moveY = (pressedKeys.w || pressedKeys.arrowup ? 1 : 0) - (pressedKeys.s || pressedKeys.arrowdown ? 1 : 0);
-    runtime.replaceInput({ ...runtime.getInput(), moveX, moveY });
-  }, [runtime]);
+  const requestManualClock = useCallback(() => {
+    if (manualClockRef.current) {
+      stopAgentDriver();
+      return;
+    }
+    if (!capabilityGate.requestManualClock()) {
+      throw new SpaceGameCapabilityRevokedError('automation');
+    }
+    stopAgentDriver();
+    manualClockRef.current = true;
+    setManualClock(true);
+  }, [capabilityGate, stopAgentDriver]);
 
   const resetInput = useCallback(() => {
     pressedKeysRef.current = {};
-    runtime.resetInput();
-  }, [runtime]);
+    keyboardFireLatchedRef.current = false;
+    match.resetInput();
+  }, [match]);
+
+  const canUseHumanInput = useCallback(
+    () => capabilityGate.canUseHumanInput() && humanControlEnabledRef.current,
+    [capabilityGate],
+  );
+
+  const assertAutomationAvailable = useCallback(() => {
+    if (!capabilityGate.canUseAutomation()) {
+      throw new SpaceGameCapabilityRevokedError('automation');
+    }
+  }, [capabilityGate]);
+
+  const notifyAgentIfCriticalChanged = useCallback(
+    (force = false) => {
+      const version = match.getCriticalObservationVersion();
+      if (!force && version === lastAgentCriticalVersionRef.current) return;
+      lastAgentCriticalVersionRef.current = version;
+      agentDriverRef.current?.notifyObservation(pilotPort.observe().observation);
+    },
+    [match, pilotPort],
+  );
 
   const runFixedSteps = useCallback(
     (elapsedMs: number) => {
-      runtime.advance(elapsedMs);
+      match.advance(elapsedMs);
+      notifyAgentIfCriticalChanged();
     },
-    [runtime],
+    [match, notifyAgentIfCriticalChanged],
   );
 
   const handleAnimationFrame = useCallback(
@@ -577,65 +702,216 @@ export function SpaceGameApp({ isActive = true }: SpaceGameAppProps) {
     [runFixedSteps],
   );
 
+  const commitAction = useCallback(
+    (action: SpaceGameAction, source: string) => {
+      requestSequenceRef.current += 1;
+      const requestId = `${source}:${requestSequenceRef.current}`;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const observation = pilotPort.observe();
+        try {
+          pilotPort.act({
+            requestId,
+            expectedRevision: observation.revision,
+            expectedPhase: observation.decision.phase,
+            turnNonce: observation.decision.turnNonce,
+            action,
+          });
+          notifyAgentIfCriticalChanged();
+          return true;
+        } catch (error) {
+          if (!isAgapError(error) || !error.retryable || attempt === 1) return false;
+        }
+      }
+      return false;
+    },
+    [notifyAgentIfCriticalChanged, pilotPort],
+  );
+
+  const commitControl = useCallback(
+    (control: SpaceGameControl) => {
+      if (!canUseHumanInput()) return false;
+      const current = match.getCurrentControl();
+      if (
+        control.movement === current.movement &&
+        control.fire === current.fire &&
+        control.aim.column === current.aim.column &&
+        control.aim.row === current.aim.row
+      ) {
+        return true;
+      }
+      return commitAction(
+        {
+          type: 'control',
+          movement: control.movement,
+          fire: control.fire,
+          aim: { ...control.aim },
+        },
+        'human-control',
+      );
+    },
+    [canUseHumanInput, commitAction, match],
+  );
+
+  const recomputeMovement = useCallback(() => {
+    const pressedKeys = pressedKeysRef.current;
+    const moveX = (pressedKeys.d || pressedKeys.arrowright ? 1 : 0) - (pressedKeys.a || pressedKeys.arrowleft ? 1 : 0);
+    const moveY = (pressedKeys.w || pressedKeys.arrowup ? 1 : 0) - (pressedKeys.s || pressedKeys.arrowdown ? 1 : 0);
+    commitControl({ ...match.getCurrentControl(), movement: movementFromInput({ moveX, moveY }) });
+  }, [commitControl, match]);
+
   const beginGame = useCallback(
     (shootOnStart = false) => {
-      runtime.resetClock();
+      if (!canUseHumanInput()) return;
+      if (!commitAction({ type: 'start' }, 'human-start')) return;
       if (shootOnStart) {
-        runtime.replaceInput({ ...runtime.getInput(), shootHeld: true });
-        runtime.replaceState(startGame());
-        runtime.advance(FIXED_STEP_MS);
-        return;
+        commitControl({ ...match.getCurrentControl(), fire: true });
+        match.advance(FIXED_STEP_MS);
       }
-      runtime.replaceState(startGame());
     },
-    [runtime],
+    [canUseHumanInput, commitAction, commitControl, match],
   );
 
   const restart = useCallback(() => {
+    if (!canUseHumanInput()) return;
     pressedKeysRef.current = {};
-    runtime.reset({ state: restartGame() });
-  }, [runtime]);
+    keyboardFireLatchedRef.current = false;
+    commitAction({ type: 'restart' }, 'human-restart');
+  }, [canUseHumanInput, commitAction]);
 
   const togglePauseState = useCallback(() => {
-    runtime.replaceState(togglePause(runtime.getState()));
-  }, [runtime]);
+    if (!canUseHumanInput()) return;
+    const mode = match.getPhase();
+    if (mode === 'playing') commitAction({ type: 'pause' }, 'human-pause');
+    if (mode === 'paused') commitAction({ type: 'resume' }, 'human-resume');
+  }, [canUseHumanInput, commitAction, match]);
 
   const updateAim = useCallback((clientX: number, clientY: number) => {
+    if (!canUseHumanInput()) return;
     const element = shellRef.current;
     if (!element) return;
     const rect = element.getBoundingClientRect();
     const normalizedX = rect.width > 0 ? (clientX - rect.left) / rect.width : 0.5;
     const normalizedY = rect.height > 0 ? (clientY - rect.top) / rect.height : 0.5;
-    runtime.replaceInput({
-      ...runtime.getInput(),
-      aimX: (normalizedX * 2 - 1) * WORLD_BOUNDS.x,
-      aimY: (1 - normalizedY * 2) * WORLD_BOUNDS.y,
+    commitControl({
+      ...match.getCurrentControl(),
+      aim: quantizeAimToCell(
+        (normalizedX * 2 - 1) * WORLD_BOUNDS.x,
+        (1 - normalizedY * 2) * WORLD_BOUNDS.y,
+      ),
     });
-  }, [runtime]);
+  }, [canUseHumanInput, commitControl, match]);
 
   const lifecycle = useGameLifecycle({
-    active: isActive,
+    active: simulationActive,
     resetInputOnSuspend: true,
     resetInputOnResume: false,
     onResetInput: resetInput,
-    onResetClock: runtime.resetClock,
+    onResetClock: match.resetClock,
     onSuspend: (snapshot) => {
-      if (snapshot.reasons.includes('inactive') && runtime.getState().mode === 'playing') {
-        runtime.replaceState(togglePause(runtime.getState()));
+      capabilityGate.setLifecycleSuspended(true);
+      stopAgentDriver();
+      if (snapshot.reasons.includes('inactive') && match.getPhase() === 'playing') {
+        commitAction({ type: 'pause' }, 'lifecycle-pause');
       }
     },
+    onResume: () => {
+      capabilityGate.setLifecycleSuspended(false);
+    },
   });
+  capabilityGate.setLifecycleSuspended(lifecycle.suspended);
+
+  useLayoutEffect(() => {
+    // React Strict Mode replays layout effects; restore the current mounted
+    // capability snapshot after its development-only cleanup rehearsal.
+    capabilityGate.setForeground(isActive);
+    capabilityGate.setSimulationActive(simulationActive);
+    capabilityGate.setLifecycleSuspended(lifecycle.suspended);
+    return () => {
+      revokeSpaceGameCapabilitiesOnUnmount(capabilityGate, stopAgentDriver, resetInput);
+    };
+    // These objects are stable for the authority-session lifetime. Prop and
+    // lifecycle transitions are synchronously reflected above and by the
+    // lifecycle callbacks without turning every focus change into an unmount.
+  }, [capabilityGate, resetInput, stopAgentDriver]);
 
   useGameAutomationBridge({
     enabled: isActive,
-    renderGameToText: () => renderGameToText(runtime.getState()),
-    advanceTime: runFixedSteps,
+    renderGameToText: () => {
+      assertAutomationAvailable();
+      return match.renderVisibleState();
+    },
+    advanceTime: (elapsedMs) => {
+      assertAutomationAvailable();
+      runFixedSteps(elapsedMs);
+    },
     onManualClockRequested: requestManualClock,
   });
 
   useEffect(() => {
+    publishState(match.getRenderProjection());
+    requestSequenceRef.current = 0;
+    lastAgentCriticalVersionRef.current = -1;
+  }, [match, publishState]);
+
+  useLayoutEffect(() => {
+    if (!isActive) resetInput();
+  }, [isActive, resetInput]);
+
+  useLayoutEffect(() => {
+    if (simulationActive) return;
+    resetInput();
+    stopAgentDriver();
+  }, [resetInput, simulationActive, stopAgentDriver]);
+
+  useLayoutEffect(() => {
+    stopAgentDriver();
+  }, [agentController, stopAgentDriver]);
+
+  useEffect(() => {
+    const controller = agentController;
+    if (
+      !controller ||
+      !controlPolicy.agentEnabled ||
+      !capabilityGate.canUseAgent() ||
+      agentControllerRef.current !== controller ||
+      manualClockRef.current
+    ) {
+      stopAgentDriver();
+      return;
+    }
+    const guardedController = createCapabilityGuardedSpaceGameAgentController(
+      controller,
+      () => agentControllerRef.current === controller && agentPolicyEnabledRef.current,
+      capabilityGate,
+    );
+    const driver = createSpaceGameAgentDriver({
+      controller: guardedController,
+      port: pilotPort,
+      seatSessionKey: agentSeatKey,
+    });
+    agentDriverRef.current = driver;
+    notifyAgentIfCriticalChanged(true);
+    driver.start();
+    return () => {
+      driver.stop();
+      if (agentDriverRef.current === driver) agentDriverRef.current = null;
+    };
+  }, [
+    agentController,
+    agentSeatKey,
+    capabilityGate,
+    controlPolicy.agentEnabled,
+    lifecycle.suspended,
+    manualClock,
+    notifyAgentIfCriticalChanged,
+    pilotPort,
+    simulationActive,
+    stopAgentDriver,
+  ]);
+
+  useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (!isActive) return;
+      if (!canUseHumanInput() || shouldIgnoreGameplayKeyEvent(event)) return;
       const key = event.key.toLowerCase();
 
       if (key === 'f' && !event.repeat) {
@@ -647,28 +923,31 @@ export function SpaceGameApp({ isActive = true }: SpaceGameAppProps) {
         if (fullscreen.active) {
           event.preventDefault();
           void fullscreen.exit();
-        } else if (runtime.getState().mode === 'playing') {
+        } else if (match.getPhase() === 'playing') {
           event.preventDefault();
-          runtime.replaceState(togglePause(runtime.getState()));
+          togglePauseState();
         }
         return;
       }
       if (key === 'p' && !event.repeat) {
         event.preventDefault();
-        runtime.replaceState(togglePause(runtime.getState()));
+        togglePauseState();
         return;
       }
-      if (key === 'r' && runtime.getState().mode === 'game-over' && !event.repeat) {
+      if (key === 'r' && match.getPhase() === 'game-over' && !event.repeat) {
         event.preventDefault();
         restart();
         return;
       }
-      if ((key === 'enter' || key === ' ') && runtime.getState().mode === 'start' && !event.repeat) {
+      if ((key === 'enter' || key === ' ') && match.getPhase() === 'start' && !event.repeat) {
         event.preventDefault();
         beginGame(key === ' ');
+        if (key === ' ' && match.getPhase() === 'playing' && match.getCurrentControl().fire) {
+          keyboardFireLatchedRef.current = true;
+        }
         return;
       }
-      if (key === ' ' && runtime.getState().mode === 'game-over' && !event.repeat) {
+      if (key === ' ' && match.getPhase() === 'game-over' && !event.repeat) {
         event.preventDefault();
         restart();
         return;
@@ -678,19 +957,30 @@ export function SpaceGameApp({ isActive = true }: SpaceGameAppProps) {
         pressedKeysRef.current[key] = true;
         recomputeMovement();
       }
-      if (key === ' ' && runtime.getState().mode === 'playing') {
+      if (key === ' ' && match.getPhase() === 'playing') {
         event.preventDefault();
-        runtime.replaceInput({ ...runtime.getInput(), shootHeld: true });
+        if (commitControl({ ...match.getCurrentControl(), fire: true })) {
+          keyboardFireLatchedRef.current = true;
+        }
       }
     };
 
     const handleKeyUp = (event: KeyboardEvent) => {
       const key = event.key.toLowerCase();
-      if (['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) {
+      const movementKey = ['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key);
+      const movementWasLatched = movementKey && Boolean(pressedKeysRef.current[key]);
+      const fireWasLatched = key === ' ' && keyboardFireLatchedRef.current;
+      if (movementKey) {
         pressedKeysRef.current[key] = false;
-        recomputeMovement();
       }
-      if (key === ' ') runtime.replaceInput({ ...runtime.getInput(), shootHeld: false });
+      if (key === ' ') keyboardFireLatchedRef.current = false;
+      // Modifier/editor keyups that did not originate from gameplay are inert.
+      // A previously accepted gameplay key still releases safely to avoid a
+      // stuck movement/fire latch when focus changes while it is held.
+      if (!movementWasLatched && !fireWasLatched) return;
+      if (!canUseHumanInput()) return;
+      if (movementWasLatched) recomputeMovement();
+      if (fireWasLatched) commitControl({ ...match.getCurrentControl(), fire: false });
     };
 
     window.addEventListener('keydown', handleKeyDown);
@@ -699,23 +989,28 @@ export function SpaceGameApp({ isActive = true }: SpaceGameAppProps) {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, [beginGame, fullscreen, isActive, recomputeMovement, restart, runtime]);
+  }, [beginGame, canUseHumanInput, commitControl, fullscreen, match, recomputeMovement, restart, togglePauseState]);
 
-  const handlePointerMove = useCallback((event: ReactPointerEvent<HTMLDivElement>) => updateAim(event.clientX, event.clientY), [updateAim]);
+  const handlePointerMove = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (canUseHumanInput()) updateAim(event.clientX, event.clientY);
+    },
+    [canUseHumanInput, updateAim],
+  );
   const handlePointerDown = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
-      if (event.button !== 0 || (event.target as HTMLElement).closest('button')) return;
+      if (!canUseHumanInput() || event.button !== 0 || (event.target as HTMLElement).closest('button')) return;
       event.currentTarget.setPointerCapture(event.pointerId);
       updateAim(event.clientX, event.clientY);
-      if (runtime.getState().mode === 'playing') {
-        runtime.replaceInput({ ...runtime.getInput(), shootHeld: true });
+      if (match.getPhase() === 'playing') {
+        commitControl({ ...match.getCurrentControl(), fire: true });
       }
     },
-    [runtime, updateAim],
+    [canUseHumanInput, commitControl, match, updateAim],
   );
   const releaseFire = useCallback(() => {
-    runtime.replaceInput({ ...runtime.getInput(), shootHeld: false });
-  }, [runtime]);
+    if (canUseHumanInput()) commitControl({ ...match.getCurrentControl(), fire: false });
+  }, [canUseHumanInput, commitControl, match]);
   const handlePointerUp = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
@@ -740,9 +1035,9 @@ export function SpaceGameApp({ isActive = true }: SpaceGameAppProps) {
       <CombatScene
         stateRef={stateRef}
         shouldAnimate={
-          isActive &&
+          simulationActive &&
           uiSnapshot.mode === 'playing' &&
-          (!lifecycle.suspended || manualClock)
+          !lifecycle.suspended
         }
         manualClock={manualClock}
         onFrame={handleAnimationFrame}
@@ -756,6 +1051,18 @@ export function SpaceGameApp({ isActive = true }: SpaceGameAppProps) {
               ['Score', uiSnapshot.score],
               ['Health', uiSnapshot.health],
               ['Wave', uiSnapshot.wave],
+              [
+                'Pilot',
+                controlPolicy.mode === 'human'
+                  ? 'Human'
+                  : controlPolicy.agentEnabled
+                    ? controlPolicy.mode === 'assist'
+                      ? 'Human + AI'
+                      : 'AI'
+                    : controlPolicy.usingHumanFallback
+                      ? 'Human fallback'
+                      : 'Human · AI offline',
+              ],
             ].map(([label, value]) => (
               <div key={label} style={hudPillStyle}>
                 <div style={{ fontSize: 11, letterSpacing: '0.18em', textTransform: 'uppercase', color: '#8dcde8' }}>{label}</div>
@@ -768,7 +1075,13 @@ export function SpaceGameApp({ isActive = true }: SpaceGameAppProps) {
               {uiSnapshot.mode === 'paused' ? 'Resume' : 'Pause'}
             </button>
             <button type="button" style={secondaryButtonStyle} onClick={restart}>Restart</button>
-            <button type="button" style={secondaryButtonStyle} onClick={() => void fullscreen.toggle()}>
+            <button
+              type="button"
+              style={secondaryButtonStyle}
+              onClick={() => {
+                if (canUseHumanInput()) void fullscreen.toggle();
+              }}
+            >
               {fullscreen.active ? 'Exit Fullscreen' : 'Fullscreen'}
             </button>
           </div>

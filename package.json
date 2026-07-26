@@ -4,19 +4,26 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "agent:run": "go -C sidecar run ./cmd/alsniper-agent",
+    "agent:test": "go -C sidecar test ./...",
+    "agent:vet": "go -C sidecar vet ./...",
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
     "game:create": "node tools/game-scaffold/create-game.mjs",
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc -b --pretty false",
-    "test": "node --test tools/game-scaffold/*.test.mjs && vitest run --exclude \"tools/game-scaffold/*.test.mjs\""
+    "test": "node --test tools/game-scaffold/*.test.mjs && vitest run --exclude \"tools/game-scaffold/*.test.mjs\"",
+    "verify": "npm run typecheck && npm test && npm run build && npm run agent:test && npm run agent:vet"
   },
   "dependencies": {
+    "@a2ui/react": "0.10.2",
+    "@a2ui/web_core": "0.10.5",
     "@react-three/fiber": "9.6.1",
     "lucide-react": "1.26.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "three": "0.185.1",
+    "zod": "3.25.76",
     "zustand": "5.0.14"
   },
   "devDependencies": {
@@ -27,5 +34,8 @@
     "typescript": "7.0.2",
     "vite": "8.1.5",
     "vitest": "4.1.0"
+  },
+  "overrides": {
+    "dompurify": "3.4.12"
   }
 }
