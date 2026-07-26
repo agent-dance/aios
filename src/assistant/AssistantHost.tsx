@@ -10,6 +10,7 @@ import {
 } from 'react';
 import { AssistantComposer } from './AssistantComposer';
 import { AssistantDebugTimeline } from './AssistantDebugTimeline';
+import { normalizeAssistantError } from './errors';
 import { AssistantSurfaceView } from './AssistantSurfaceView';
 import { reduceAssistantDebugTimeline } from './debug';
 import {
@@ -42,11 +43,6 @@ import './assistant.css';
 const createId = () => {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID();
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-};
-
-const normalizeError = (error: unknown) => {
-  if (error instanceof Error && error.message.trim()) return error.message;
-  return 'Agent 暂时无法响应，请稍后重试。';
 };
 
 const ASSISTANT_MODEL_HISTORY_LIMIT = 12;
@@ -236,7 +232,7 @@ export function AssistantHost<TSurface = AssistantSurface>({
           setLiveStatus('已取消本次请求');
           return;
         }
-        const message = normalizeError(requestError);
+        const message = normalizeAssistantError(requestError);
         setError(message);
         setMood('error');
         setLiveStatus(message);
@@ -369,7 +365,7 @@ export function AssistantHost<TSurface = AssistantSurface>({
               id: createId(),
               label: '交互操作',
               status: 'failed',
-              detail: normalizeError(actionError),
+              detail: normalizeAssistantError(actionError),
             },
           },
           ASSISTANT_RECEIPT_HISTORY_LIMIT,

@@ -1,3 +1,4 @@
+import type { HealthResponse } from '../agent-platform/protocol';
 import type { SidecarClient } from '../agent-platform/sidecarClient';
 
 export interface SidecarHealthMonitor {
@@ -11,7 +12,7 @@ interface HealthMonitorOptions {
 
 export const startSidecarHealthMonitor = (
   client: SidecarClient,
-  publishConnection: (connected: boolean) => void,
+  publishHealth: (health: HealthResponse | undefined) => void,
   options: HealthMonitorOptions = {},
 ): SidecarHealthMonitor => {
   const intervalMs = options.intervalMs ?? 15_000;
@@ -30,9 +31,9 @@ export const startSidecarHealthMonitor = (
   const poll = async (): Promise<void> => {
     try {
       const health = await client.health({ signal: controller.signal, timeoutMs });
-      if (!disposed) publishConnection(health.status === 'ready');
+      if (!disposed) publishHealth(health);
     } catch {
-      if (!disposed && !controller.signal.aborted) publishConnection(false);
+      if (!disposed && !controller.signal.aborted) publishHealth(undefined);
     } finally {
       if (!disposed) timer = setTimeout(() => { void poll(); }, intervalMs);
     }

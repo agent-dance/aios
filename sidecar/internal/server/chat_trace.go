@@ -208,8 +208,8 @@ func (s *Server) chatTrace(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), false, request.Request.RequestID)
 		return
 	}
-	if !s.ready(r.Context()) {
-		s.writeError(w, r, http.StatusServiceUnavailable, "AGENT_UNAVAILABLE", "The local Codex runtime is not ready.", true, request.Request.RequestID)
+	if err := s.readinessError(r.Context()); err != nil {
+		s.writeAgentError(w, r, err, request.Request.RequestID)
 		return
 	}
 
@@ -325,7 +325,7 @@ func (s *Server) agentDebugTracePayload(traceID string, started time.Time, signa
 		base.Stage, base.Status, base.Title = "request", "completed", "Context validated"
 	case agent.ChatTraceExecutionStarted:
 		base.Stage, base.Status, base.Title = "analysis", "started", "Model execution started"
-		base.Detail = "Waiting for one schema-constrained response."
+		base.Detail = "Waiting for one locally schema-validated response."
 	case agent.ChatTraceExecutionComplete:
 		base.Stage, base.Status, base.Title = "analysis", "completed", "Model execution completed"
 	case agent.ChatTraceOutputValidated:
@@ -346,18 +346,5 @@ func yesNo(value bool) string {
 }
 
 func (s *Server) agentDebugFailure(err error) protocol.AgentDebugFailureBody {
-	switch {
-	case errors.Is(err, agent.ErrBusy):
-		return protocol.AgentDebugFailureBody{Code: "BUSY", Message: "The sidecar concurrency limit is reached.", Retryable: true}
-	case errors.Is(err, agent.ErrConflict):
-		return protocol.AgentDebugFailureBody{Code: "CONFLICT", Message: "This Agent session already has an active turn.", Retryable: true}
-	case errors.Is(err, context.DeadlineExceeded):
-		return protocol.AgentDebugFailureBody{Code: "AGENT_TIMEOUT", Message: "The Agent did not finish before the deadline.", Retryable: true}
-	case errors.Is(err, context.Canceled):
-		return protocol.AgentDebugFailureBody{Code: "REQUEST_CANCELLED", Message: "The request was cancelled.", Retryable: true}
-	case errors.Is(err, agent.ErrInvalidAI):
-		return protocol.AgentDebugFailureBody{Code: "INVALID_AGENT_OUTPUT", Message: "The Agent returned an invalid structured response.", Retryable: true}
-	default:
-		return protocol.AgentDebugFailureBody{Code: "AGENT_FAILED", Message: "The local Agent run failed.", Retryable: true}
-	}
+	return classifyAgentError(err).body
 }

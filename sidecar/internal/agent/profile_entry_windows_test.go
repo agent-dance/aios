@@ -53,7 +53,7 @@ func TestNewCodexRunnerRejectsWindowsJunctionRootsAndParents(t *testing.T) {
 				workspace = filepath.Join(junction, "workspace")
 			}
 			t.Setenv("CODEX_HOME", source)
-			if _, err := NewCodexRunner(testRunnerConfig(profile, workspace, "go")); err == nil {
+			if _, err := NewCodexRunner(testRunnerConfig(t, profile, workspace, "go")); err == nil {
 				t.Fatalf("%s Windows junction was accepted", testCase)
 			}
 			untouched := workspace

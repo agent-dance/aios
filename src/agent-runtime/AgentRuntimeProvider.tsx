@@ -42,6 +42,7 @@ import type { BrokerIntent, OsIntent } from '../agent-platform/intents';
 import {
   AIOS_AGENT_DEBUG_PROFILE,
   type AgentDebugEvent,
+  type HealthResponse,
   type OsContextSnapshot,
 } from '../agent-platform/protocol';
 import { createSidecarClient, type SidecarClient } from '../agent-platform/sidecarClient';
@@ -158,6 +159,16 @@ export const describeAgentDataBoundary = (
 ): string => persistenceMode === 'persistent'
   ? base
   : `${base} Agent packages are available for this session only because browser persistence is unavailable.`;
+
+export const describeProviderAuthentication = (health: HealthResponse | undefined): string => {
+  if (health === undefined) return 'Unavailable';
+  const authenticationLink = health.checks.find((check) => check.code === 'auth_link');
+  if (authenticationLink?.status === 'fail') return 'Not signed in — run codex login, then retry';
+  const providerAuthentication = health.checks.find((check) => check.code === 'auth_provider');
+  if (providerAuthentication?.status === 'fail') return 'Rejected — run codex login, then retry';
+  if (providerAuthentication?.status === 'pass') return 'Verified local authentication';
+  return 'Linked; provider verification pending';
+};
 
 interface ReceiptAgentIdentity {
   readonly name: string;
@@ -752,8 +763,10 @@ export function AgentRuntimeProvider({ children }: { readonly children: ReactNod
         refreshAgents();
         const runtime = assembleRuntime(client, registry, refreshAgents);
         const agentLibrary = createAgentLibraryPort(registry, refreshAgents);
-        const publishConnection = (connected: boolean): void => {
+        const publishConnection = (health: HealthResponse | undefined): void => {
           if (disposed) return;
+          const connected = health?.status === 'ready';
+          const authenticationLabel = describeProviderAuthentication(health);
           setValue({
             assistantClient: runtime.assistantClient,
             renderSurface,
@@ -764,7 +777,7 @@ export function AgentRuntimeProvider({ children }: { readonly children: ReactNod
             aiStatus: {
               runtime: connected ? 'connected' : 'offline',
               providerLabel: 'Codex via agent-adaptor',
-              authenticationLabel: connected ? 'Linked local authentication' : 'Unavailable',
+              authenticationLabel,
               voiceInput: voiceAvailability(),
               installedAgentCount: registry.list().length,
               dataBoundary: 'Credentials and model processes remain in the loopback Go sidecar; OS effects require Broker receipts.',

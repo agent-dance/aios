@@ -27,14 +27,21 @@ func main() {
 		logger.Error("initialize Codex runtime", "error", err)
 		os.Exit(2)
 	}
+	closeRunner := func() {
+		if err := runner.Close(); err != nil {
+			logger.Error("release Codex profile lease", "error", err)
+		}
+	}
 	service, err := agent.NewService(runner, cfg.MaxConcurrentRuns)
 	if err != nil {
 		logger.Error("initialize Agent service", "error", err)
+		closeRunner()
 		os.Exit(2)
 	}
 	handler, err := server.New(cfg, service)
 	if err != nil {
 		logger.Error("initialize HTTP service", "error", err)
+		closeRunner()
 		os.Exit(2)
 	}
 	httpServer := &http.Server{
@@ -48,7 +55,9 @@ func main() {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	shutdownDone := make(chan struct{})
 	go func() {
+		defer close(shutdownDone)
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -57,8 +66,14 @@ func main() {
 		}
 	}()
 	logger.Info("AlSniper Agent sidecar listening", "address", cfg.ListenAddress, "protocol", "1.0.0")
-	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logger.Error("HTTP server failed", "error", err)
+	serveErr := httpServer.ListenAndServe()
+	if ctx.Err() != nil {
+		<-shutdownDone
+	}
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		logger.Error("HTTP server failed", "error", serveErr)
+		closeRunner()
 		os.Exit(1)
 	}
+	closeRunner()
 }

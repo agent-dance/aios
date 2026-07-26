@@ -14,10 +14,12 @@ import (
 )
 
 var (
-	ErrBusy      = errors.New("agent concurrency limit reached")
-	ErrConflict  = errors.New("agent invocation already has an active turn")
-	ErrAgent     = errors.New("agent execution failed")
-	ErrInvalidAI = errors.New("agent returned an invalid structured response")
+	ErrBusy           = errors.New("agent concurrency limit reached")
+	ErrConflict       = errors.New("agent invocation already has an active turn")
+	ErrUnavailable    = errors.New("agent runtime is unavailable")
+	ErrAgent          = errors.New("agent execution failed")
+	ErrAuthentication = errors.New("Codex authentication was rejected")
+	ErrInvalidAI      = errors.New("agent returned an invalid structured response")
 )
 
 type RunRequest struct {

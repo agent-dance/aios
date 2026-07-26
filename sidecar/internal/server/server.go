@@ -140,8 +140,8 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), false, req.RequestID)
 		return
 	}
-	if !s.ready(r.Context()) {
-		s.writeError(w, r, http.StatusServiceUnavailable, "AGENT_UNAVAILABLE", "The local Codex runtime is not ready.", true, req.RequestID)
+	if err := s.readinessError(r.Context()); err != nil {
+		s.writeAgentError(w, r, err, req.RequestID)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.ChatTimeout)
@@ -168,8 +168,8 @@ func (s *Server) decide(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), false, req.RequestID)
 		return
 	}
-	if !s.ready(r.Context()) {
-		s.writeError(w, r, http.StatusServiceUnavailable, "AGENT_UNAVAILABLE", "The local Codex runtime is not ready.", true, req.RequestID)
+	if err := s.readinessError(r.Context()); err != nil {
+		s.writeAgentError(w, r, err, req.RequestID)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.GameTimeout)
@@ -323,10 +323,10 @@ func readBoundedBody(body io.ReadCloser, limit int64) ([]byte, bool, error) {
 	return data, int64(len(data)) > limit, nil
 }
 
-func (s *Server) ready(parent context.Context) bool {
+func (s *Server) readinessError(parent context.Context) error {
 	ctx, cancel := context.WithTimeout(parent, s.cfg.ReadinessTimeout)
 	defer cancel()
-	return s.service.Readiness(ctx).Ready
+	return classifyReadiness(s.service.Readiness(ctx))
 }
 
 func (s *Server) decode(r *http.Request, dst any) error {
@@ -345,20 +345,8 @@ func (s *Server) decode(r *http.Request, dst any) error {
 }
 
 func (s *Server) writeAgentError(w http.ResponseWriter, r *http.Request, err error, requestID string) {
-	switch {
-	case errors.Is(err, agent.ErrBusy):
-		s.writeError(w, r, http.StatusTooManyRequests, "BUSY", "The sidecar concurrency limit is reached.", true, requestID)
-	case errors.Is(err, agent.ErrConflict):
-		s.writeError(w, r, http.StatusConflict, "CONFLICT", "This Agent session already has an active turn.", true, requestID)
-	case errors.Is(err, context.DeadlineExceeded):
-		s.writeError(w, r, http.StatusGatewayTimeout, "AGENT_TIMEOUT", "The Agent did not finish before the deadline.", true, requestID)
-	case errors.Is(err, context.Canceled):
-		s.writeError(w, r, 499, "REQUEST_CANCELLED", "The request was cancelled.", true, requestID)
-	case errors.Is(err, agent.ErrInvalidAI):
-		s.writeError(w, r, http.StatusBadGateway, "INVALID_AGENT_OUTPUT", "The Agent returned an invalid structured response.", true, requestID)
-	default:
-		s.writeError(w, r, http.StatusBadGateway, "AGENT_FAILED", "The local Agent run failed.", true, requestID)
-	}
+	classified := classifyAgentError(err)
+	s.writeError(w, r, classified.status, classified.body.Code, classified.body.Message, classified.body.Retryable, requestID)
 }
 
 func (s *Server) writeError(w http.ResponseWriter, r *http.Request, status int, code, message string, retryable bool, requestID string) {

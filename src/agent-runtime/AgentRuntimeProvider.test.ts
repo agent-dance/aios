@@ -17,8 +17,44 @@ import {
   assembleRuntime,
   createAgentLibraryPort,
   describeAgentDataBoundary,
+  describeProviderAuthentication,
   type AgentRuntimeHostPort,
 } from './AgentRuntimeProvider';
+
+const authenticationHealth = (checks: HealthResponse['checks']): HealthResponse => ({
+  protocolVersion: '1.0.0',
+  status: checks.some((check) => check.status === 'fail') ? 'not_ready' : 'ready',
+  agent: { driver: 'codex', authMode: 'linked', profileIsolated: true },
+  limits: { maxBodyBytes: 262_144, maxConcurrentRuns: 8 },
+  checks,
+});
+
+describe('provider authentication status', () => {
+  it('treats a missing auth link as signed out even while provider verification is pending', () => {
+    const health = authenticationHealth([
+      { code: 'auth_link', status: 'fail', message: 'Authentication is missing.' },
+      { code: 'auth_provider', status: 'warn', message: 'Not verified yet.' },
+    ]);
+    expect(describeProviderAuthentication(health)).toContain('Not signed in');
+    expect(describeProviderAuthentication(health)).not.toContain('Linked');
+  });
+
+  it('distinguishes rejected, verified, pending, and unavailable states', () => {
+    expect(describeProviderAuthentication(undefined)).toBe('Unavailable');
+    expect(describeProviderAuthentication(authenticationHealth([
+      { code: 'auth_link', status: 'pass', message: 'Linked.' },
+      { code: 'auth_provider', status: 'fail', message: 'Rejected.' },
+    ]))).toContain('Rejected');
+    expect(describeProviderAuthentication(authenticationHealth([
+      { code: 'auth_link', status: 'pass', message: 'Linked.' },
+      { code: 'auth_provider', status: 'pass', message: 'Verified.' },
+    ]))).toContain('Verified');
+    expect(describeProviderAuthentication(authenticationHealth([
+      { code: 'auth_link', status: 'pass', message: 'Linked.' },
+      { code: 'auth_provider', status: 'warn', message: 'Pending.' },
+    ]))).toContain('pending');
+  });
+});
 
 const emptyRegistry: AgentRegistry = {
   list: () => [],

@@ -1,11 +1,52 @@
 package agent
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
+)
+
+func validateExactProfileMarker(path, expected, label string) error {
+	if err := validateProfileEntry(path, false, false); err != nil {
+		return fmt.Errorf("%s is missing or unsafe", label)
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil || pathInfo.Size() != int64(len(expected)) {
+		return fmt.Errorf("%s has an invalid size", label)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", label, err)
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(pathInfo, openedInfo) {
+		return fmt.Errorf("%s changed identity while opening", label)
+	}
+	contents, err := io.ReadAll(io.LimitReader(file, int64(len(expected)+1)))
+	if err != nil {
+		return fmt.Errorf("read %s: %w", label, err)
+	}
+	currentInfo, err := os.Lstat(path)
+	if err != nil || !os.SameFile(openedInfo, currentInfo) {
+		return fmt.Errorf("%s changed identity while reading", label)
+	}
+	if !bytes.Equal(contents, []byte(expected)) {
+		return fmt.Errorf("%s is invalid", label)
+	}
+	return nil
+}
+
+const (
+	sdkProfileLockName          = ".agent-adaptor-profile.lock"
+	sdkProfileManifestName      = ".agent-adaptor-profile-manifest.json"
+	sdkProfileQuiesceWindow     = 2 * time.Second
+	sdkProfileResidueStaleAfter = 10 * time.Minute
 )
 
 // inspectRealDirectoryPath walks every existing path component with Lstat.
@@ -111,7 +152,7 @@ func preflightDedicatedProfile(profileDir, sourceAuth string, createMissing bool
 			return err
 		}
 	}
-	if err := isolatedProfileContents(profileDir); err != nil {
+	if err := isolatedProfileContentsQuiescent(profileDir); err != nil {
 		return fmt.Errorf("isolated profile is not dedicated: %w", err)
 	}
 
@@ -125,22 +166,182 @@ func preflightDedicatedProfile(profileDir, sourceAuth string, createMissing bool
 		return fmt.Errorf("inspect isolated profile authentication: %w", err)
 	}
 	if !sameFile(sourceAuth, authPath) {
+		// A sidecar-owned profile may legitimately point at the previous OAuth
+		// credential generation after `codex login` atomically replaces the
+		// native file. The SDK's auth-only clone reconciliation is authorized to
+		// repair this fixed entry before a strict runtime preflight. Unclaimed
+		// profiles remain immutable and are rejected above.
+		if profileOwnershipValid(profileDir) {
+			return nil
+		}
 		return errors.New("isolated profile auth.json is not the native Codex authentication file")
 	}
 	return nil
+}
+
+// isolatedProfileContentsQuiescent never accepts SDK materialization files as
+// profile content. Instead it waits for the pinned SDK's bounded lock/tmp
+// transaction to disappear, then validates the original closed allowlist.
+// Rechecking transient state after the scan closes the appear/disappear race
+// between independent Agent seats without serializing their model processes.
+func isolatedProfileContentsQuiescent(profileDir string) error {
+	deadline := time.Now().Add(sdkProfileQuiesceWindow)
+	for {
+		if err := recoverStaleSDKProfileResidue(profileDir, time.Now()); err != nil {
+			return err
+		}
+		beforeTransient, err := sdkProfileTransactionPresent(profileDir)
+		if err != nil {
+			return err
+		}
+		if !beforeTransient {
+			contentsErr := isolatedProfileContents(profileDir)
+			afterTransient, transientErr := sdkProfileTransactionPresent(profileDir)
+			if transientErr != nil {
+				return transientErr
+			}
+			if !afterTransient {
+				if contentsErr == nil {
+					return nil
+				}
+				// The transaction may have completed between the directory scan and
+				// the second transient check. One clean re-scan distinguishes that
+				// case from a persistent unknown profile entry.
+				if retryErr := isolatedProfileContents(profileDir); retryErr == nil {
+					return nil
+				} else {
+					retryTransient, retryStateErr := sdkProfileTransactionPresent(profileDir)
+					if retryStateErr != nil {
+						return retryStateErr
+					}
+					if !retryTransient {
+						return retryErr
+					}
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return errors.New("agent-adaptor profile materialization did not become quiescent")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func sdkProfileTransactionPresent(profileDir string) (bool, error) {
+	entries, err := os.ReadDir(profileDir)
+	if err != nil {
+		return false, fmt.Errorf("inspect isolated profile transaction state: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if sdkProfileTransactionFileName(name) {
+			info, err := os.Lstat(filepath.Join(profileDir, name))
+			if os.IsNotExist(err) {
+				continue
+			}
+			if err != nil {
+				return false, fmt.Errorf("inspect agent-adaptor transaction residue %q: %w", name, err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 || profileEntryHasReparsePoint(info) || !info.Mode().IsRegular() {
+				return false, fmt.Errorf("agent-adaptor transaction residue %q must be a real regular file", name)
+			}
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// recoverStaleSDKProfileResidue mirrors the pinned SDK's ten-minute stale lock
+// threshold and recognizes only its exact lock plus numeric CreateTemp names.
+// Recovery is limited to sidecar-owned profiles and real regular files, so a
+// near-match, link, reparse point, directory, or fresh transaction is never
+// removed.
+func recoverStaleSDKProfileResidue(profileDir string, now time.Time) error {
+	if !profileOwnershipValid(profileDir) {
+		return nil
+	}
+	entries, err := os.ReadDir(profileDir)
+	if err != nil {
+		return fmt.Errorf("inspect isolated profile transaction residue: %w", err)
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if !sdkProfileTransactionFileName(name) {
+			continue
+		}
+		path := filepath.Join(profileDir, name)
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspect agent-adaptor transaction residue %q: %w", name, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || profileEntryHasReparsePoint(info) || !info.Mode().IsRegular() {
+			return fmt.Errorf("agent-adaptor transaction residue %q must be a real regular file", name)
+		}
+		if info.ModTime().Add(sdkProfileResidueStaleAfter).After(now) {
+			continue
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale agent-adaptor transaction residue %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func sdkProfileTransactionFileName(name string) bool {
+	if name == sdkProfileLockName {
+		return true
+	}
+	for _, base := range append([]string{sdkProfileManifestName}, codexSDKSettingsFiles[:]...) {
+		prefix := "." + base + ".tmp-"
+		suffix, ok := strings.CutPrefix(name, prefix)
+		if !ok || suffix == "" || len(suffix) > 10 {
+			continue
+		}
+		numeric := true
+		for _, char := range suffix {
+			if char < '0' || char > '9' {
+				numeric = false
+				break
+			}
+		}
+		if numeric {
+			return true
+		}
+	}
+	return false
 }
 
 func prepareDedicatedProfile(profileDir, sourceAuth string) error {
 	if err := preflightDedicatedProfile(profileDir, sourceAuth, true); err != nil {
 		return err
 	}
-	if err := ensureNativeAuthLink(profileDir, sourceAuth); err != nil {
-		return err
-	}
 	if err := ensureProfileOwnership(profileDir); err != nil {
 		return err
 	}
 	return preflightDedicatedProfile(profileDir, sourceAuth, false)
+}
+
+// claimDedicatedProfileForLease performs only link-safe directory creation and
+// ownership validation. It deliberately does not scan, recover, remove, or
+// reconcile profile contents; those mutations are authorized only after the
+// caller holds the cross-process process-lifetime lease.
+func claimDedicatedProfileForLease(profileDir string) error {
+	existed, err := inspectRealDirectoryPath(profileDir, "isolated profile", true)
+	if err != nil {
+		return err
+	}
+	if !existed {
+		if err := ensureProfileOwnership(profileDir); err != nil {
+			return err
+		}
+	}
+	if !profileOwnershipValid(profileDir) {
+		return errors.New("existing isolated profile is unclaimed")
+	}
+	return nil
 }
 
 func preflightRuntimeProfile(profileDir, sourceAuth string) error {
@@ -154,8 +355,81 @@ func preflightRuntimeProfile(profileDir, sourceAuth string) error {
 	if err := preflightDedicatedProfile(profileDir, sourceAuth, false); err != nil {
 		return err
 	}
+	if _, err := os.Lstat(sourceAuth); err != nil {
+		return fmt.Errorf("%w: native Codex authentication is unavailable before Codex execution", ErrAuthentication)
+	}
 	if _, err := os.Lstat(filepath.Join(profileDir, "auth.json")); err != nil {
-		return errors.New("isolated profile authentication is unavailable before Codex execution")
+		return fmt.Errorf("%w: isolated profile authentication is unavailable before Codex execution", ErrAuthentication)
+	}
+	if !sameFile(sourceAuth, filepath.Join(profileDir, "auth.json")) {
+		return fmt.Errorf("%w: isolated profile authentication is not the current native Codex credential", ErrAuthentication)
+	}
+	if err := validateClonedCodexSettings(filepath.Dir(sourceAuth), profileDir); err != nil {
+		return err
+	}
+	return nil
+}
+
+// postflightReconciledProfile validates the SDK-owned auth-only clone without
+// requiring a login to exist during readiness. When native auth is present,
+// however, reconciliation must have produced the exact same file identity.
+func postflightReconciledProfile(sourceHome, profileDir, sourceAuth string, requireAuth bool) error {
+	exists, err := inspectRealDirectoryPath(profileDir, "isolated profile", false)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.New("isolated profile disappeared before authentication validation")
+	}
+	if err := preflightDedicatedProfile(profileDir, sourceAuth, false); err != nil {
+		return err
+	}
+	sourceInfo, sourceErr := os.Lstat(sourceAuth)
+	if os.IsNotExist(sourceErr) {
+		if requireAuth {
+			return fmt.Errorf("%w: native Codex authentication is unavailable", ErrAuthentication)
+		}
+		if _, targetErr := os.Lstat(filepath.Join(profileDir, "auth.json")); targetErr == nil {
+			return errors.New("isolated profile retains authentication after native logout")
+		} else if !os.IsNotExist(targetErr) {
+			return fmt.Errorf("inspect isolated profile authentication after native logout: %w", targetErr)
+		}
+		return validateClonedCodexSettings(sourceHome, profileDir)
+	}
+	if sourceErr != nil {
+		return fmt.Errorf("inspect native Codex authentication: %w", sourceErr)
+	}
+	if sourceInfo.Mode()&os.ModeSymlink != 0 || profileEntryHasReparsePoint(sourceInfo) || !sourceInfo.Mode().IsRegular() {
+		return errors.New("native Codex auth.json must be a real regular file")
+	}
+	if !sameFile(sourceAuth, filepath.Join(profileDir, "auth.json")) {
+		return errors.New("SDK authentication clone is not linked to the current native Codex credential")
+	}
+	return validateClonedCodexSettings(sourceHome, profileDir)
+}
+
+func removeSidecarOwnedAuthIfSourceMissing(profileDir, sourceAuth string) error {
+	if _, err := os.Lstat(sourceAuth); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect native Codex authentication before logout reconciliation: %w", err)
+	}
+	if !profileOwnershipValid(profileDir) {
+		return errors.New("isolated profile authentication can only be reconciled after sidecar ownership is established")
+	}
+	authPath := filepath.Join(profileDir, "auth.json")
+	info, err := os.Lstat(authPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect stale isolated authentication: %w", err)
+	}
+	if info.IsDir() || (!info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && !profileEntryHasReparsePoint(info)) {
+		return errors.New("stale isolated authentication must be a file or authentication link")
+	}
+	if err := os.Remove(authPath); err != nil {
+		return fmt.Errorf("remove stale isolated authentication after native logout: %w", err)
 	}
 	return nil
 }
@@ -167,7 +441,7 @@ func preflightNativeCodexHome(sourceHome string) error {
 	authPath := filepath.Join(sourceHome, "auth.json")
 	info, err := os.Lstat(authPath)
 	if os.IsNotExist(err) {
-		return nil
+		return validateNativeCodexSettings(sourceHome)
 	}
 	if err != nil {
 		return fmt.Errorf("inspect native Codex authentication: %w", err)
@@ -175,16 +449,12 @@ func preflightNativeCodexHome(sourceHome string) error {
 	if info.Mode()&os.ModeSymlink != 0 || profileEntryHasReparsePoint(info) || !info.Mode().IsRegular() {
 		return errors.New("native Codex auth.json must be a real regular file")
 	}
-	return nil
+	return validateNativeCodexSettings(sourceHome)
 }
 
 func profileOwnershipValid(profileDir string) bool {
 	marker := filepath.Join(profileDir, profileOwnershipMarker)
-	if err := validateProfileEntry(marker, false, false); err != nil {
-		return false
-	}
-	contents, err := os.ReadFile(marker)
-	return err == nil && string(contents) == profileOwnershipMarker+"\n"
+	return validateExactProfileMarker(marker, profileOwnershipMarker+"\n", "isolated profile ownership marker") == nil
 }
 
 func ensureProfileOwnership(profileDir string) error {
@@ -210,49 +480,6 @@ func ensureProfileOwnership(profileDir string) error {
 	}
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close isolated profile ownership marker: %w", err)
-	}
-	return nil
-}
-
-func ensureNativeAuthLink(profileDir, sourceAuth string) error {
-	sourceInfo, err := os.Lstat(sourceAuth)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("inspect native Codex authentication: %w", err)
-	}
-	if sourceInfo.Mode()&os.ModeSymlink != 0 || profileEntryHasReparsePoint(sourceInfo) || !sourceInfo.Mode().IsRegular() {
-		return errors.New("native Codex auth.json must be a real regular file")
-	}
-
-	authPath := filepath.Join(profileDir, "auth.json")
-	if _, err := os.Lstat(authPath); err == nil {
-		if !sameFile(sourceAuth, authPath) {
-			return errors.New("isolated profile auth.json is not the native Codex authentication file")
-		}
-		return nil
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("inspect isolated profile authentication: %w", err)
-	}
-
-	symlinkErr := os.Symlink(sourceAuth, authPath)
-	if symlinkErr == nil {
-		return nil
-	}
-	if _, err := os.Lstat(authPath); err == nil {
-		if sameFile(sourceAuth, authPath) {
-			return nil
-		}
-		return errors.New("isolated profile auth.json appeared concurrently and is not the native authentication file")
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("inspect concurrently-created isolated authentication: %w", err)
-	}
-	if linkErr := os.Link(sourceAuth, authPath); linkErr != nil {
-		if _, err := os.Lstat(authPath); err == nil && sameFile(sourceAuth, authPath) {
-			return nil
-		}
-		return fmt.Errorf("link native Codex authentication without replacement: symlink failed: %v; hardlink failed: %w", symlinkErr, linkErr)
 	}
 	return nil
 }
@@ -285,6 +512,13 @@ func preflightRuntimeWorkspace(root, workspace string) error {
 	}
 	if !workspaceExists {
 		return errors.New("isolated run workspace disappeared before Codex execution")
+	}
+	entries, err := os.ReadDir(workspace)
+	if err != nil {
+		return fmt.Errorf("inspect isolated run workspace contents: %w", err)
+	}
+	if len(entries) != 0 {
+		return errors.New("isolated run workspace must remain empty before Codex execution")
 	}
 	canonicalRoot, err := canonicalPathForOverlap(root)
 	if err != nil {
@@ -324,12 +558,8 @@ func validateDedicatedWorkspaceContents(root string, requireOwnership bool) erro
 			if err := validateProfileEntry(path, false, false); err != nil {
 				return errors.New("isolated workspace ownership marker must be a regular file")
 			}
-			contents, err := os.ReadFile(path)
-			if err != nil {
-				return fmt.Errorf("read isolated workspace ownership marker: %w", err)
-			}
-			if string(contents) != workspaceOwnershipMarker+"\n" {
-				return errors.New("isolated workspace ownership marker is invalid")
+			if err := validateExactProfileMarker(path, workspaceOwnershipMarker+"\n", "isolated workspace ownership marker"); err != nil {
+				return err
 			}
 			continue
 		}

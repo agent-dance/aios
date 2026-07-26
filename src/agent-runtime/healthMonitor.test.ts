@@ -30,11 +30,11 @@ describe('sidecar health monitor', () => {
     const publish = vi.fn();
     const monitor = startSidecarHealthMonitor(clientWithHealth(run), publish, { intervalMs: 100, timeoutMs: 100 });
     await Promise.resolve();
-    expect(publish).toHaveBeenLastCalledWith(true);
+    expect(publish).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'ready' }));
     await vi.advanceTimersByTimeAsync(100);
-    expect(publish).toHaveBeenLastCalledWith(false);
+    expect(publish).toHaveBeenLastCalledWith(undefined);
     await vi.advanceTimersByTimeAsync(100);
-    expect(publish).toHaveBeenLastCalledWith(false);
+    expect(publish).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'not_ready' }));
     expect(run).toHaveBeenCalledTimes(3);
 
     monitor.dispose();
