@@ -69,7 +69,7 @@ export function registerWeChatIpc(
   register(WECHAT_IPC_CHANNELS.unmount, (_event, args) => {
     assertArgumentCount(args, 0);
     assertNoPayload(args[0]);
-    controller.unmount();
+    return controller.unmount();
   });
   register(WECHAT_IPC_CHANNELS.getState, (_event, args) => {
     assertArgumentCount(args, 0);

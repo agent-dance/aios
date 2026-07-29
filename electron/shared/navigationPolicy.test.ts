@@ -7,9 +7,14 @@ import {
   parseLoopbackDevServerUrl,
   sanitizeElectronUserAgent,
   WECHAT_ENTRY_URL,
+  WECHAT_SESSION_PARTITION,
 } from './navigationPolicy.js';
 
 describe('WeChat navigation policy', () => {
+  it('uses a fixed on-disk Electron partition for browser-managed WeChat state', () => {
+    expect(WECHAT_SESSION_PARTITION).toBe('persist:alsniper-wechat');
+  });
+
   it.each([
     WECHAT_ENTRY_URL,
     'https://wx2.qq.com/cgi-bin/mmwebwx-bin/webwxnewloginpage?ticket=opaque',

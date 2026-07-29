@@ -24,9 +24,10 @@ Run policy and controller unit tests with the repository Vitest command. Electro
 ## Security boundary
 
 - The WeChat target is a main-process constant. Renderer IPC never accepts a URL.
-- The partition is fixed to `persist:alsniper-wechat` and is never shared with the local shell.
+- The partition is fixed to `persist:alsniper-wechat`, is never shared with the local shell, and is not cleared when the WeChat app is unmounted or its window is closed. Chromium keeps browser-managed persistent cookies, local storage, IndexedDB, service workers, and HTTP cache for that partition in Electron's application data directory.
 - Navigation, redirects, subframes, popups, permissions, device permissions, and downloads are fail-closed.
 - IPC calls require the exact shell `webContents` and its main frame, exact argument counts, and cloned closed-schema values.
-- Closing or unmounting explicitly detaches the native view and closes its `webContents`.
+- After each official document navigation, the host installs a fixed user-origin stylesheet and verifies the computed outer geometry before revealing the view. It removes only Web WeChat's outer `.main`, `.main_inner`, and `.login` browser-page constraints so the service fills the application body; conversation and contact-pane scrolling remains owned by WeChat.
+- Closing or unmounting explicitly detaches the native view and closes its `webContents` without deleting the persistent partition. View unmount, window shutdown, and application shutdown perform a synchronous DOM-storage checkpoint and a bounded cookie-store checkpoint before returning or exiting.
 
-Embedding the official page does not bypass Tencent account eligibility, login risk controls, regional availability, or server-side decisions. The desktop host preserves those controls.
+Embedding the official page does not bypass Tencent account eligibility, login risk controls, regional availability, or server-side decisions. The desktop host preserves those controls. The persistent partition can retain only data that WeChat Web actually stores in the browser. Tencent controls server-side chat history, synchronization, retention, and login-token validity, so the host cannot guarantee that every conversation or login remains available indefinitely.

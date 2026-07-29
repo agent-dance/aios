@@ -11,6 +11,8 @@ class FakeWebContents extends EventEmitter {
   readonly reload = vi.fn();
   readonly focus = vi.fn();
   readonly stop = vi.fn();
+  readonly insertCSS = vi.fn(async () => 'layout-key');
+  readonly executeJavaScript = vi.fn(async () => true);
   readonly close = vi.fn(() => {
     this.destroyed = true;
   });
@@ -54,6 +56,7 @@ function createHarness(contentSize = { width: 1000, height: 700 }) {
   const view = new FakeView();
   const addChildView = vi.fn();
   const removeChildView = vi.fn();
+  const checkpointStorage = vi.fn(async () => undefined);
   const states: unknown[] = [];
   const hostWindow = {
     contentView: { addChildView, removeChildView },
@@ -65,14 +68,16 @@ function createHarness(contentSize = { width: 1000, height: 700 }) {
     focus: vi.fn(),
   } as unknown as BrowserWindow;
 
+  const logger = { error: vi.fn(), warn: vi.fn() };
   const controller = new WeChatViewController({
     hostWindow,
     createView: () => view as unknown as WebContentsView,
+    checkpointStorage,
     publishState: (state) => states.push(state),
-    logger: { error: vi.fn(), warn: vi.fn() },
+    logger,
   });
 
-  return { controller, view, addChildView, removeChildView, states };
+  return { controller, view, addChildView, removeChildView, checkpointStorage, states, logger };
 }
 
 describe('WeChatViewController', () => {
@@ -88,26 +93,139 @@ describe('WeChatViewController', () => {
     expect(state).toEqual({ phase: 'loading', visible: false, canGoBack: false });
   });
 
-  it('does not let mount or IPC select a URL and only shows when ready after an explicit visibility command', () => {
+  it('does not let mount or IPC select a URL and only shows when ready after an explicit visibility command', async () => {
     const { controller, view } = createHarness();
     controller.mount({ x: 0, y: 0, width: 800, height: 600 });
 
     expect(controller.setVisible(true)).toEqual({ phase: 'loading', visible: false, canGoBack: false });
     view.webContents.emit('dom-ready');
-    expect(controller.getState()).toEqual({ phase: 'ready', visible: true, canGoBack: false });
+    await vi.waitFor(() => {
+      expect(controller.getState()).toEqual({ phase: 'ready', visible: true, canGoBack: false });
+    });
     expect(view.setVisible).toHaveBeenLastCalledWith(true);
 
     controller.mount({ x: 20, y: 30, width: 700, height: 500 });
     expect(view.webContents.loadURL).toHaveBeenCalledTimes(1);
   });
 
-  it('becomes ready at an allowlisted DOM without waiting for a never-ending load event', () => {
+  it('becomes ready at an allowlisted DOM without waiting for a never-ending load event', async () => {
     const { controller, view } = createHarness();
     controller.mount({ x: 0, y: 0, width: 800, height: 600 });
 
     view.webContents.emit('dom-ready');
 
-    expect(controller.getState()).toEqual({ phase: 'ready', visible: false, canGoBack: false });
+    await vi.waitFor(() => {
+      expect(controller.getState()).toEqual({ phase: 'ready', visible: false, canGoBack: false });
+    });
+    expect(view.webContents.insertCSS).toHaveBeenCalledWith(expect.stringContaining('.main_inner'), {
+      cssOrigin: 'user',
+    });
+  });
+
+  it('does not expose a remote document until full-bleed layout is installed', async () => {
+    let resolveLayout!: (key: string) => void;
+    const layoutReady = new Promise<string>((resolve) => {
+      resolveLayout = resolve;
+    });
+    const { controller, view } = createHarness();
+    view.webContents.insertCSS.mockImplementationOnce(() => layoutReady);
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+    controller.setVisible(true);
+
+    view.webContents.emit('dom-ready');
+    expect(controller.getState()).toEqual({ phase: 'loading', visible: false, canGoBack: false });
+    expect(view.setVisible).toHaveBeenLastCalledWith(false);
+
+    resolveLayout('layout-key');
+    await vi.waitFor(() => expect(controller.getState().phase).toBe('ready'));
+    expect(controller.getState().visible).toBe(true);
+  });
+
+  it('atomically hides a ready view throughout reload layout preparation', async () => {
+    const { controller, view } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+    controller.setVisible(true);
+    view.webContents.emit('dom-ready');
+    await vi.waitFor(() => expect(controller.getState()).toEqual({
+      phase: 'ready',
+      visible: true,
+      canGoBack: false,
+    }));
+
+    let resolveReloadLayout!: (key: string) => void;
+    const reloadLayout = new Promise<string>((resolve) => {
+      resolveReloadLayout = resolve;
+    });
+    view.webContents.insertCSS.mockImplementationOnce(() => reloadLayout);
+
+    controller.reload();
+    expect(controller.getState()).toEqual({ phase: 'loading', visible: false, canGoBack: false });
+    expect(view.setVisible).toHaveBeenLastCalledWith(false);
+
+    view.webContents.emit('did-start-loading');
+    view.webContents.emit('dom-ready');
+    expect(controller.getState()).toEqual({ phase: 'loading', visible: false, canGoBack: false });
+    expect(view.setVisible).toHaveBeenLastCalledWith(false);
+
+    resolveReloadLayout('reload-layout-key');
+    await vi.waitFor(() => expect(controller.getState()).toEqual({
+      phase: 'ready',
+      visible: true,
+      canGoBack: false,
+    }));
+    expect(view.setVisible).toHaveBeenLastCalledWith(true);
+  });
+
+  it('reapplies the layout after navigation and fails closed if insertion fails', async () => {
+    const { controller, view, logger } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+
+    view.webContents.emit('dom-ready');
+    await vi.waitFor(() => expect(controller.getState().phase).toBe('ready'));
+    expect(view.webContents.insertCSS).toHaveBeenCalledTimes(1);
+
+    view.webContents.emit('did-start-loading');
+    view.webContents.insertCSS.mockRejectedValueOnce(new Error('insertion failed'));
+    view.webContents.emit('dom-ready');
+    await vi.waitFor(() => expect(controller.getState()).toEqual({
+      phase: 'failed',
+      visible: false,
+      canGoBack: false,
+      errorCode: 'VIEW_UNAVAILABLE',
+    }));
+    expect(view.webContents.insertCSS).toHaveBeenCalledTimes(2);
+    expect(logger.error).toHaveBeenCalledWith(
+      'Failed to apply the embedded WeChat document layout.',
+      expect.any(Error),
+    );
+  });
+
+  it('cannot become visible from a stale layout completion after an unresponsive event', async () => {
+    let resolveStaleLayout!: (key: string) => void;
+    const staleLayout = new Promise<string>((resolve) => {
+      resolveStaleLayout = resolve;
+    });
+    const { controller, view } = createHarness();
+    view.webContents.insertCSS.mockImplementationOnce(() => staleLayout);
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+    controller.setVisible(true);
+
+    view.webContents.emit('dom-ready');
+    view.webContents.emit('unresponsive');
+    expect(controller.getState()).toMatchObject({ phase: 'failed', visible: false });
+
+    resolveStaleLayout('stale-key');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(controller.getState()).toMatchObject({ phase: 'failed', visible: false });
+
+    view.webContents.emit('responsive');
+    await vi.waitFor(() => expect(controller.getState()).toEqual({
+      phase: 'ready',
+      visible: true,
+      canGoBack: false,
+    }));
+    expect(view.webContents.insertCSS).toHaveBeenCalledTimes(2);
   });
 
   it('blocks popup and navigation escape attempts', () => {
@@ -181,11 +299,12 @@ describe('WeChatViewController', () => {
     expect(view.webContents.navigationHistory.goBack).toHaveBeenCalledOnce();
   });
 
-  it('hides on host visibility loss, reconciles requested visibility, and explicitly releases ownership', () => {
-    const { controller, view, removeChildView } = createHarness();
+  it('hides on host visibility loss, reconciles requested visibility, and checkpoints released ownership', async () => {
+    const { controller, view, removeChildView, checkpointStorage } = createHarness();
     controller.mount({ x: 0, y: 0, width: 800, height: 600 });
     controller.setVisible(true);
     view.webContents.emit('dom-ready');
+    await vi.waitFor(() => expect(controller.getState().phase).toBe('ready'));
 
     controller.handleHostVisibilityLoss();
     expect(controller.getState().visible).toBe(false);
@@ -195,9 +314,10 @@ describe('WeChatViewController', () => {
     expect(controller.getState().visible).toBe(true);
     expect(view.setVisible).toHaveBeenLastCalledWith(true);
 
-    controller.unmount();
+    await controller.unmount();
     expect(removeChildView).toHaveBeenCalledWith(view);
     expect(view.webContents.close).toHaveBeenCalledOnce();
+    expect(checkpointStorage).toHaveBeenCalledOnce();
     expect(controller.getState()).toEqual({ phase: 'idle', visible: false, canGoBack: false });
   });
 });

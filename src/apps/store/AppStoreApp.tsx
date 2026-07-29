@@ -269,10 +269,10 @@ const LISTINGS: StoreListing[] = [
     rating: 'Web integration',
     installs: 'Available',
     verified: true,
-    capabilities: ['Official wx.qq.com service', 'Isolated desktop web view', 'Desktop icon and window integration'],
+    capabilities: ['Official wx.qq.com service', 'Isolated desktop web view', 'Persistent isolated browser session', 'Desktop icon and window integration'],
     permissions: [
       { name: 'Open the official WeChat web service', scope: 'https://wx.qq.com only', reason: 'Load Web WeChat in the app-owned isolated WebContentsView.' },
-      { name: 'Store local app state', scope: 'AlSniper OS desktop profile', reason: 'Remember installation state and expose the desktop icon.' },
+      { name: 'Preserve the WeChat browser session', scope: 'Dedicated AlSniper OS WeChat profile', reason: 'Retain browser-managed cookies, local storage, IndexedDB, service workers, and cache written by the official service across restarts.' },
     ],
     execution: 'AlSniper OS desktop WebContentsView loading https://wx.qq.com; Tencent owns authentication, accounts, messages, and service policy',
     updateDate: '2026-07-29',

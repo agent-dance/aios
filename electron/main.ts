@@ -11,6 +11,10 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { registerWeChatIpc } from './main/ipcRouter.js';
 import { hardenWeChatSession } from './main/sessionPolicy.js';
+import {
+  WeChatSessionPersistence,
+  WeChatStorageExitGate,
+} from './main/sessionPersistence.js';
 import { WeChatViewController } from './main/WeChatViewController.js';
 import {
   isAllowedShellNavigation,
@@ -29,6 +33,8 @@ const shellSessionPolicies = new WeakSet<Session>();
 let mainWindow: BrowserWindow | null = null;
 let weChatController: WeChatViewController | null = null;
 let unregisterWeChatIpc: (() => void) | null = null;
+let weChatSessionPersistence: WeChatSessionPersistence | null = null;
+let weChatStorageExitGate: WeChatStorageExitGate | null = null;
 
 app.enableSandbox();
 protocol.registerSchemesAsPrivileged([{
@@ -185,10 +191,19 @@ async function createMainWindow(): Promise<BrowserWindow> {
 
   const wechatSession = session.fromPartition(WECHAT_SESSION_PARTITION, { cache: true });
   hardenWeChatSession(wechatSession);
+  let sessionPersistence = weChatSessionPersistence;
+  if (sessionPersistence === null) {
+    sessionPersistence = new WeChatSessionPersistence(wechatSession);
+    weChatSessionPersistence = sessionPersistence;
+    weChatStorageExitGate = new WeChatStorageExitGate(app, sessionPersistence);
+  }
 
   const controller = new WeChatViewController({
     hostWindow: shellWindow,
     createView: () => createWeChatView(wechatSession),
+    checkpointStorage: async () => {
+      await sessionPersistence.flush('view-unmount');
+    },
     publishState: (state) => publishWeChatState(shellWindow, state),
   });
   weChatController = controller;
@@ -206,7 +221,13 @@ async function createMainWindow(): Promise<BrowserWindow> {
       shellWindow.show();
     }
   });
-  shellWindow.once('close', () => {
+  shellWindow.on('close', (event) => {
+    if (
+      weChatStorageExitGate !== null
+      && !weChatStorageExitGate.handleWindowClose(event, shellWindow, () => controller.dispose())
+    ) {
+      return;
+    }
     controller.dispose();
   });
   shellWindow.once('closed', () => {
@@ -276,10 +297,19 @@ if (!hasSingleInstanceLock) {
     }
   });
 
-  app.on('before-quit', () => {
-    unregisterWeChatIpc?.();
-    unregisterWeChatIpc = null;
-    weChatController?.dispose();
-    weChatController = null;
+  app.on('before-quit', (event) => {
+    const prepareForQuit = (): void => {
+      unregisterWeChatIpc?.();
+      unregisterWeChatIpc = null;
+      weChatController?.dispose();
+      weChatController = null;
+    };
+    if (
+      weChatStorageExitGate !== null
+      && !weChatStorageExitGate.handleBeforeQuit(event, prepareForQuit)
+    ) {
+      return;
+    }
+    prepareForQuit();
   });
 }

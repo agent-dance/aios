@@ -13,11 +13,13 @@ describe('WeChatApp browser fallback', () => {
     expect(markup).not.toContain('href=');
   });
 
-  it('keeps native navigation controls unavailable without the desktop host', () => {
+  it('reserves the entire renderer body for one embedded surface', () => {
     const markup = renderToStaticMarkup(<WeChatApp bridge={null} />);
 
-    expect(markup).toContain('aria-label="后退"');
-    expect(markup).toContain('aria-label="刷新微信"');
-    expect(markup.match(/disabled=""/g)).toHaveLength(2);
+    expect(markup).toMatch(/^<div class="wechat-app"[^>]*><main class="wechat-app__surface"/);
+    expect(markup).not.toContain('<header');
+    expect(markup).not.toContain('<footer');
+    expect(markup).not.toContain('微信浏览控制');
+    expect(markup).not.toContain('aria-label="刷新微信"');
   });
 });

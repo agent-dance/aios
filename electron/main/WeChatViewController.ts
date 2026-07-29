@@ -1,4 +1,5 @@
 import type { BrowserWindow, WebContents, WebContentsView } from 'electron';
+import { applyWeChatDocumentLayout } from './documentLayoutPolicy.js';
 import { fitBoundsToContent } from '../shared/layout.js';
 import {
   isAllowedWeChatMainFrameUrl,
@@ -21,6 +22,7 @@ export interface WeChatControllerLogger {
 export interface WeChatViewControllerOptions {
   readonly hostWindow: BrowserWindow;
   readonly createView: () => WebContentsView;
+  readonly checkpointStorage: () => Promise<void>;
   readonly publishState: (state: WeChatState) => void;
   readonly logger?: WeChatControllerLogger;
 }
@@ -33,6 +35,7 @@ const defaultLogger: WeChatControllerLogger = {
 export class WeChatViewController {
   readonly #hostWindow: BrowserWindow;
   readonly #createView: () => WebContentsView;
+  readonly #checkpointStorage: () => Promise<void>;
   readonly #publishState: (state: WeChatState) => void;
   readonly #logger: WeChatControllerLogger;
 
@@ -41,12 +44,18 @@ export class WeChatViewController {
   #requestedVisible = false;
   #state: WeChatState = createWeChatState('idle', false, false);
   #generation = 0;
+  #documentSequence = 0;
+  #documentLayoutApplication: {
+    readonly sequence: number;
+    readonly operation: Promise<string>;
+  } | null = null;
   #certificateFailureGeneration: number | null = null;
   #disposed = false;
 
   constructor(options: WeChatViewControllerOptions) {
     this.#hostWindow = options.hostWindow;
     this.#createView = options.createView;
+    this.#checkpointStorage = options.checkpointStorage;
     this.#publishState = options.publishState;
     this.#logger = options.logger ?? defaultLogger;
   }
@@ -71,6 +80,7 @@ export class WeChatViewController {
     try {
       const view = this.#createView();
       this.#view = view;
+      this.#invalidateRemoteDocument();
       this.#configureWebContents(view.webContents, generation);
       this.#hostWindow.contentView.addChildView(view);
       this.#applyBounds();
@@ -179,15 +189,24 @@ export class WeChatViewController {
     return this.getState();
   }
 
-  unmount(): void {
+  async unmount(): Promise<void> {
     this.#assertActive();
     ++this.#generation;
     this.#releaseCurrentView();
     this.#requestedBounds = null;
     this.#requestedVisible = false;
+    this.#invalidateRemoteDocument();
     this.#certificateFailureGeneration = null;
     this.#state = createWeChatState('idle', false, false);
     this.#emitState();
+
+    try {
+      await this.#checkpointStorage();
+    } catch (error) {
+      // The view is already detached; persistence failure must not strand the
+      // renderer-side operation or make the app impossible to close/reopen.
+      this.#logger.error('Failed to checkpoint embedded WeChat storage after unmount.', error);
+    }
   }
 
   handleHostResize(): void {
@@ -245,6 +264,7 @@ export class WeChatViewController {
       return;
     }
     this.#certificateFailureGeneration = this.#generation;
+    this.#invalidateRemoteDocument();
     this.#transition('failed', 'CERTIFICATE_ERROR');
   }
 
@@ -257,6 +277,7 @@ export class WeChatViewController {
     this.#releaseCurrentView();
     this.#requestedBounds = null;
     this.#requestedVisible = false;
+    this.#invalidateRemoteDocument();
     this.#certificateFailureGeneration = null;
     this.#state = createWeChatState('idle', false, false);
   }
@@ -328,6 +349,7 @@ export class WeChatViewController {
 
     contents.on('did-start-loading', () => {
       if (this.#isCurrent(generation, contents)) {
+        this.#invalidateRemoteDocument();
         this.#certificateFailureGeneration = null;
         this.#transition('loading');
       }
@@ -342,7 +364,7 @@ export class WeChatViewController {
         this.#transition('failed', 'NAVIGATION_BLOCKED');
         return;
       }
-      this.#transition('ready');
+      this.#prepareRemoteDocument(contents, generation);
     });
 
     contents.on('did-finish-load', () => {
@@ -354,15 +376,14 @@ export class WeChatViewController {
         this.#transition('failed', 'NAVIGATION_BLOCKED');
         return;
       }
-      if (this.#state.phase !== 'ready') {
-        this.#transition('ready');
-      }
+      this.#prepareRemoteDocument(contents, generation);
     });
 
     contents.on('did-fail-load', (_event, errorCode, _errorDescription, _validatedUrl, isMainFrame) => {
       if (!isMainFrame || errorCode === -3 || !this.#isCurrent(generation, contents)) {
         return;
       }
+      this.#invalidateRemoteDocument();
       this.#transition(
         'failed',
         this.#certificateFailureGeneration === generation ? 'CERTIFICATE_ERROR' : 'NETWORK_ERROR',
@@ -389,12 +410,14 @@ export class WeChatViewController {
 
     contents.on('render-process-gone', () => {
       if (generation === this.#generation && this.#view?.webContents === contents) {
+        this.#invalidateRemoteDocument();
         this.#transition('failed', 'RENDERER_CRASHED');
       }
     });
 
     contents.on('unresponsive', () => {
       if (this.#isCurrent(generation, contents)) {
+        this.#invalidateRemoteDocument();
         this.#transition('failed', 'RENDERER_CRASHED');
       }
     });
@@ -405,19 +428,66 @@ export class WeChatViewController {
         && this.#state.phase === 'failed'
         && this.#state.errorCode === 'RENDERER_CRASHED'
       ) {
-        this.#transition(contents.isLoading() ? 'loading' : 'ready');
+        this.#transition('loading');
+        if (!contents.isLoading()) {
+          this.#prepareRemoteDocument(contents, generation);
+        }
       }
     });
   }
 
+  #prepareRemoteDocument(contents: WebContents, generation: number): void {
+    const sequence = this.#documentSequence;
+    if (this.#documentLayoutApplication?.sequence === sequence) {
+      return;
+    }
+
+    let operation: Promise<string>;
+    try {
+      operation = applyWeChatDocumentLayout(contents);
+    } catch (error) {
+      this.#logger.error('Failed to apply the embedded WeChat document layout.', error);
+      this.#transition('failed', 'VIEW_UNAVAILABLE');
+      return;
+    }
+    this.#documentLayoutApplication = { sequence, operation };
+    void operation
+      .then(() => {
+        if (
+          !this.#isCurrent(generation, contents)
+          || sequence !== this.#documentSequence
+        ) {
+          return;
+        }
+        if (!isAllowedWeChatMainFrameUrl(contents.getURL())) {
+          contents.stop();
+          this.#transition('failed', 'NAVIGATION_BLOCKED');
+          return;
+        }
+        this.#transition('ready');
+      })
+      .catch((error: unknown) => {
+        if (!this.#isCurrent(generation, contents) || sequence !== this.#documentSequence) {
+          return;
+        }
+        this.#logger.error('Failed to apply the embedded WeChat document layout.', error);
+        this.#transition('failed', 'VIEW_UNAVAILABLE');
+      });
+  }
+
+  #invalidateRemoteDocument(): void {
+    ++this.#documentSequence;
+    this.#documentLayoutApplication = null;
+  }
+
   #transition(phase: WeChatState['phase'], errorCode?: WeChatErrorCode): void {
     const view = this.#getMountedView();
-    if (phase === 'failed' && view !== null) {
+    if (phase !== 'ready' && view !== null) {
       view.setVisible(false);
     }
     this.#state = createWeChatState(
       phase,
-      view !== null && phase !== 'failed' ? this.#state.visible : false,
+      view !== null && phase === 'ready' ? this.#state.visible : false,
       this.#hasSafeBackTarget(),
       errorCode,
     );
