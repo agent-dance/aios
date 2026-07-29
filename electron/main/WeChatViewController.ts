@@ -82,23 +82,24 @@ export class WeChatViewController {
     const generation = ++this.#generation;
     try {
       const view = this.#createView();
+      const contents = view.webContents;
       this.#view = view;
       this.#invalidateRemoteDocument();
-      this.#configureWebContents(view.webContents, generation);
+      this.#configureWebContents(contents, generation);
       this.#hostWindow.contentView.addChildView(view);
       this.#applyBounds();
       view.setVisible(false);
       this.#state = createWeChatState('loading', false, false);
       this.#emitState();
-      this.#armDocumentReadyWatchdog(generation, view.webContents);
+      this.#armDocumentReadyWatchdog(generation, contents);
 
-      void view.webContents.loadURL(WECHAT_ENTRY_URL).catch((error: unknown) => {
-        if (!this.#isCurrent(generation, view.webContents)) {
+      void contents.loadURL(WECHAT_ENTRY_URL).catch((error: unknown) => {
+        if (!this.#isCurrent(generation, contents)) {
           return;
         }
         if (
           this.#state.phase === 'ready'
-          && isAllowedWeChatMainFrameUrl(view.webContents.getURL())
+          && isAllowedWeChatMainFrameUrl(contents.getURL())
         ) {
           return;
         }
@@ -353,11 +354,16 @@ export class WeChatViewController {
       event.preventDefault();
     });
 
-    contents.on('did-start-navigation', (details) => {
+    contents.on('did-start-navigation', (details, _url, isInPlace, isMainFrame) => {
+      // Electron 43 exposes the modern fields on the first event argument, but
+      // keeps the positional values for compatibility. Accept both shapes so a
+      // full navigation can never retain an attestation from the previous page.
+      const navigationIsMainFrame = details.isMainFrame ?? isMainFrame;
+      const navigationIsSameDocument = details.isSameDocument ?? isInPlace;
       if (
         this.#isCurrent(generation, contents)
-        && details.isMainFrame
-        && !details.isSameDocument
+        && navigationIsMainFrame
+        && !navigationIsSameDocument
       ) {
         this.#invalidateRemoteDocument();
         this.#certificateFailureGeneration = null;
@@ -410,7 +416,16 @@ export class WeChatViewController {
         this.#transition('failed', 'NAVIGATION_BLOCKED');
         return;
       }
-      this.#emitState();
+      // did-navigate is the defensive document boundary. Even if a Chromium
+      // version omits modern fields on did-start-navigation, a completed main
+      // navigation must discard the previous document's CSS and attestation.
+      this.#invalidateRemoteDocument();
+      this.#certificateFailureGeneration = null;
+      this.#transition('loading');
+      this.#armDocumentReadyWatchdog(generation, contents);
+      if (!contents.isLoading()) {
+        this.#prepareRemoteDocument(contents, generation);
+      }
     });
 
     contents.on('did-navigate-in-page', () => {

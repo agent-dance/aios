@@ -191,11 +191,13 @@ describe('WeChatViewController', () => {
     expect(controller.getState()).toEqual({ phase: 'loading', visible: false, canGoBack: false });
     expect(view.setVisible).toHaveBeenLastCalledWith(false);
 
-    view.webContents.emit('did-start-navigation', {
-      isMainFrame: true,
-      isSameDocument: false,
-      url: WECHAT_ENTRY_URL,
-    });
+    view.webContents.emit(
+      'did-start-navigation',
+      {},
+      WECHAT_ENTRY_URL,
+      false,
+      true,
+    );
     view.webContents.emit('dom-ready');
     expect(controller.getState()).toEqual({ phase: 'loading', visible: false, canGoBack: false });
     expect(view.setVisible).toHaveBeenLastCalledWith(false);
@@ -235,6 +237,31 @@ describe('WeChatViewController', () => {
       'Failed to apply the embedded WeChat document layout.',
       expect.any(Error),
     );
+  });
+
+  it('reattests a completed main navigation when its start event was unavailable', async () => {
+    const { controller, view } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+    controller.setVisible(true);
+    view.webContents.emit('dom-ready');
+    await vi.waitFor(() => expect(controller.getState().phase).toBe('ready'));
+
+    view.webContents.loading = true;
+    view.webContents.emit('did-navigate');
+    expect(controller.getState()).toEqual({
+      phase: 'loading',
+      visible: false,
+      canGoBack: false,
+    });
+    expect(view.setVisible).toHaveBeenLastCalledWith(false);
+
+    view.webContents.emit('dom-ready');
+    await vi.waitFor(() => expect(controller.getState()).toEqual({
+      phase: 'ready',
+      visible: true,
+      canGoBack: false,
+    }));
+    expect(view.webContents.insertCSS).toHaveBeenCalledTimes(2);
   });
 
   it('keeps an attested view ready during spinner, subframe, and same-document activity', async () => {

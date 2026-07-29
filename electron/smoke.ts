@@ -1,4 +1,8 @@
 import { app, BrowserWindow, session, WebContentsView } from 'electron';
+import {
+  applyWeChatDocumentLayout,
+  WECHAT_LAYOUT_STYLE_ELEMENT_ID,
+} from './main/documentLayoutPolicy.js';
 import { hardenWeChatSession } from './main/sessionPolicy.js';
 import { WeChatViewController } from './main/WeChatViewController.js';
 import {
@@ -30,7 +34,31 @@ interface RemoteProbe {
   readonly loginOverflowY: string | null;
 }
 
+interface FixtureRect {
+  readonly left: number;
+  readonly top: number;
+  readonly right: number;
+  readonly bottom: number;
+  readonly width: number;
+  readonly height: number;
+}
+
 const SMOKE_TIMEOUT_MS = 45_000;
+const SIGNED_IN_FIXTURE_HTML = `<!doctype html>
+<html><head><meta charset="utf-8"><style>
+html,body{width:100%;height:100%;margin:0}
+.main{display:none;height:80%;min-height:600px;padding-top:100px}
+.main_inner{max-width:1000px;min-width:800px;height:100%;margin:0 auto;overflow:hidden}
+.panel{position:relative;float:left;width:280px;height:100%;background:#2e3238}
+[ui-view="contentView"]{height:100%}
+.box{position:relative;width:auto;height:100%;overflow:hidden;background:#eee}
+.login{display:block;min-width:860px;min-height:700px;overflow:auto}
+.loaded .main{display:block}.loaded .login{display:none}
+.unlogin .main{display:none}.unlogin .login{display:block}
+</style></head><body class="unlogin">
+<section class="login"></section>
+<main class="main"><div class="main_inner"><aside class="panel"></aside><div ui-view="contentView"></div></div></main>
+</body></html>`;
 const REMOTE_PROBE_SOURCE = `(() => {
   const bodyText = document.body?.innerText ?? '';
   const qrSelector = [
@@ -89,6 +117,106 @@ function safeHost(rawUrl: string): string {
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function near(actual: number, expected: number): boolean {
+  return Math.abs(actual - expected) <= 1;
+}
+
+async function runSignedInLayoutFixtureSmoke(): Promise<void> {
+  const hostWindow = new BrowserWindow({
+    show: false,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+      webviewTag: false,
+      backgroundThrottling: false,
+    },
+  });
+  const view = new WebContentsView({
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+      webviewTag: false,
+      backgroundThrottling: false,
+    },
+  });
+  hostWindow.contentView.addChildView(view);
+  view.setBounds({ x: 0, y: 0, width: 1024, height: 640 });
+
+  try {
+    await view.webContents.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(SIGNED_IN_FIXTURE_HTML)}`);
+    await applyWeChatDocumentLayout(view.webContents);
+    const geometry = await view.webContents.mainFrame.executeJavaScript(`(() => {
+      document.body.className = 'loaded';
+      const outlet = document.querySelector('.main_inner > [ui-view="contentView"]');
+      if (!(outlet instanceof HTMLElement)) return null;
+      outlet.innerHTML = '<section class="box"></section>';
+      const rect = (selector) => {
+        const node = document.querySelector(selector);
+        if (!(node instanceof HTMLElement)) return null;
+        const bounds = node.getBoundingClientRect();
+        return { left: bounds.left, top: bounds.top, right: bounds.right, bottom: bounds.bottom, width: bounds.width, height: bounds.height };
+      };
+      return {
+        viewport: { width: innerWidth, height: innerHeight },
+        main: rect('.main'),
+        inner: rect('.main_inner'),
+        panel: rect('.main_inner > .panel'),
+        outlet: rect('.main_inner > [ui-view="contentView"]'),
+        box: rect('.main_inner > [ui-view="contentView"] > .box'),
+        styleElementPresent: document.getElementById(${JSON.stringify(WECHAT_LAYOUT_STYLE_ELEMENT_ID)}) instanceof HTMLStyleElement,
+        rootScroll: { width: document.documentElement.scrollWidth, height: document.documentElement.scrollHeight }
+      };
+    })()`, false) as {
+      viewport: { width: number; height: number };
+      main: FixtureRect;
+      inner: FixtureRect;
+      panel: FixtureRect;
+      outlet: FixtureRect;
+      box: FixtureRect;
+      styleElementPresent: boolean;
+      rootScroll: { width: number; height: number };
+    } | null;
+    if (
+      geometry === null
+      || !geometry.styleElementPresent
+      || !near(geometry.main.left, 0)
+      || !near(geometry.main.right, geometry.viewport.width)
+      || !near(geometry.inner.left, 0)
+      || !near(geometry.inner.right, geometry.viewport.width)
+      || !near(geometry.panel.left, 0)
+      || !near(geometry.panel.width, 280)
+      || !near(geometry.outlet.left, geometry.panel.right)
+      || !near(geometry.outlet.right, geometry.viewport.width)
+      || !near(geometry.box.left, geometry.outlet.left)
+      || !near(geometry.box.right, geometry.outlet.right)
+      || geometry.rootScroll.width > geometry.viewport.width
+      || geometry.rootScroll.height > geometry.viewport.height
+    ) {
+      throw new Error('The signed-in WeChat fixture did not remain full-bleed after its SPA state transition.');
+    }
+    console.log(JSON.stringify({
+      event: 'signed-in-layout-fixture',
+      ok: true,
+      viewport: `${geometry.viewport.width}x${geometry.viewport.height}`,
+      panelWidth: geometry.panel.width,
+      contentExtent: `${geometry.outlet.left}-${geometry.outlet.right}`,
+      styleElementPresent: geometry.styleElementPresent,
+    }));
+  } finally {
+    hostWindow.contentView.removeChildView(view);
+    if (!view.webContents.isDestroyed()) {
+      view.webContents.close();
+    }
+    if (!hostWindow.isDestroyed()) {
+      hostWindow.destroy();
+    }
+  }
 }
 
 async function waitForRemoteSurface(view: WebContentsView, isProbeReady: () => boolean): Promise<RemoteProbe> {
@@ -276,7 +404,17 @@ async function runSmoke(): Promise<void> {
 }
 
 app.whenReady()
-  .then(runSmoke)
+  .then(async () => {
+    const keepAliveWindow = new BrowserWindow({ show: false });
+    try {
+      await runSignedInLayoutFixtureSmoke();
+      await runSmoke();
+    } finally {
+      if (!keepAliveWindow.isDestroyed()) {
+        keepAliveWindow.destroy();
+      }
+    }
+  })
   .then(() => app.quit())
   .catch((error: unknown) => {
     console.error(error instanceof Error ? error.message : 'Unknown WeChat smoke failure.');

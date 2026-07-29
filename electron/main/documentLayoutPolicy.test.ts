@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   applyWeChatDocumentLayout,
   WECHAT_FULL_BLEED_CSS,
+  WECHAT_LAYOUT_STYLE_ELEMENT_ID,
   type WeChatLayoutTarget,
 } from './documentLayoutPolicy.js';
 
@@ -22,6 +23,9 @@ describe('Web WeChat document layout policy', () => {
     expect(WECHAT_FULL_BLEED_CSS).toMatch(/\.main\s*\{[^}]*position:\s*fixed\s*!important[^}]*inset:\s*0\s*!important/s);
     expect(WECHAT_FULL_BLEED_CSS).toMatch(/\.main_inner\s*\{[^}]*width:\s*100%\s*!important[^}]*max-width:\s*none\s*!important/s);
     expect(WECHAT_FULL_BLEED_CSS).toMatch(/\.main_inner\s*\{[^}]*position:\s*absolute\s*!important[^}]*inset:\s*0\s*!important/s);
+    expect(WECHAT_FULL_BLEED_CSS).toMatch(/\.main_inner > \.panel\s*\{[^}]*position:\s*absolute\s*!important[^}]*width:\s*280px\s*!important/s);
+    expect(WECHAT_FULL_BLEED_CSS).toMatch(/\.main_inner > \[ui-view="contentView"\]\s*\{[^}]*inset:\s*0 0 0 280px\s*!important/s);
+    expect(WECHAT_FULL_BLEED_CSS).toMatch(/\.main_inner > \[ui-view="contentView"\] > \.box\s*\{[^}]*width:\s*100%\s*!important/s);
     expect(WECHAT_FULL_BLEED_CSS).toMatch(/\.login\s*\{[^}]*min-height:\s*0\s*!important[^}]*overflow:\s*hidden\s*!important/s);
     expect(WECHAT_FULL_BLEED_CSS).toMatch(/\.main \.copyright\s*\{[^}]*display:\s*none\s*!important/s);
   });
@@ -29,7 +33,7 @@ describe('Web WeChat document layout policy', () => {
   it('does not disable scrolling in conversation or contact panes', () => {
     expect(WECHAT_FULL_BLEED_CSS).not.toContain('::-webkit-scrollbar');
     expect(WECHAT_FULL_BLEED_CSS).not.toMatch(/(^|\n)\s*\*/u);
-    expect(WECHAT_FULL_BLEED_CSS).not.toMatch(/\.box(?:\s|,|\{)/u);
+    expect(WECHAT_FULL_BLEED_CSS).not.toMatch(/(^|\n)\s*\.box\s*\{/u);
     expect(WECHAT_FULL_BLEED_CSS).not.toContain('.chat');
     expect(WECHAT_FULL_BLEED_CSS).not.toContain('.contact');
   });
@@ -42,6 +46,35 @@ describe('Web WeChat document layout policy', () => {
     expect(target.insertCSS).toHaveBeenCalledWith(WECHAT_FULL_BLEED_CSS, { cssOrigin: 'user' });
     expect(executeJavaScript).toHaveBeenCalledWith(expect.stringContaining('mainInnerStyle.maxWidth'), false);
     expect(executeJavaScript).toHaveBeenCalledWith(expect.stringContaining('mainReady || loginReady'), false);
+    expect(executeJavaScript).toHaveBeenCalledWith(expect.stringContaining(WECHAT_LAYOUT_STYLE_ELEMENT_ID), false);
+    expect(executeJavaScript).toHaveBeenCalledWith(expect.stringContaining('signedInShellReady'), false);
+    expect(executeJavaScript).toHaveBeenCalledWith(expect.stringContaining("style.visibility !== 'hidden'"), false);
+  });
+
+  it('does not accept an attestation that completed in a superseded main frame', async () => {
+    const firstFrame = {
+      executeJavaScript: vi.fn(async () => true),
+      isDestroyed: vi.fn(() => false),
+    };
+    const secondFrame = {
+      executeJavaScript: vi.fn(async () => true),
+      isDestroyed: vi.fn(() => false),
+    };
+    let mainFrameReads = 0;
+    const target: WeChatLayoutTarget = {
+      insertCSS: vi.fn(async () => 'layout-key'),
+      get mainFrame() {
+        mainFrameReads += 1;
+        return mainFrameReads === 1 ? firstFrame : secondFrame;
+      },
+    };
+
+    await expect(applyWeChatDocumentLayout(target, {
+      verificationTimeoutMs: 100,
+      retryIntervalMs: 1,
+    })).resolves.toBe('layout-key');
+    expect(firstFrame.executeJavaScript).toHaveBeenCalledOnce();
+    expect(secondFrame.executeJavaScript).toHaveBeenCalledOnce();
   });
 
   it('retries bounded attestation until a delayed login or main shell is ready', async () => {
