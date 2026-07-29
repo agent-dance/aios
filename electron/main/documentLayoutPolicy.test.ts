@@ -5,6 +5,16 @@ import {
   type WeChatLayoutTarget,
 } from './documentLayoutPolicy.js';
 
+function createTarget(executeJavaScript = vi.fn(async () => true)): WeChatLayoutTarget {
+  return {
+    insertCSS: vi.fn(async () => 'layout-key'),
+    mainFrame: {
+      executeJavaScript,
+      isDestroyed: vi.fn(() => false),
+    },
+  };
+}
+
 describe('Web WeChat document layout policy', () => {
   it('removes only the official outer-shell constraints', () => {
     expect(WECHAT_FULL_BLEED_CSS).toMatch(/html,\s*body\s*\{[^}]*overflow:\s*hidden\s*!important/s);
@@ -24,25 +34,46 @@ describe('Web WeChat document layout policy', () => {
     expect(WECHAT_FULL_BLEED_CSS).not.toContain('.contact');
   });
 
-  it('inserts the fixed stylesheet at user cascade origin', async () => {
-    const target: WeChatLayoutTarget = {
-      insertCSS: vi.fn(async () => 'layout-key'),
-      executeJavaScript: vi.fn(async () => true),
-    };
+  it('inserts user-origin CSS and attests through WebFrameMain while loading can continue', async () => {
+    const executeJavaScript = vi.fn(async () => true);
+    const target = createTarget(executeJavaScript);
 
     await expect(applyWeChatDocumentLayout(target)).resolves.toBe('layout-key');
     expect(target.insertCSS).toHaveBeenCalledWith(WECHAT_FULL_BLEED_CSS, { cssOrigin: 'user' });
-    expect(target.executeJavaScript).toHaveBeenCalledWith(expect.stringContaining('mainInnerStyle.maxWidth'), false);
+    expect(executeJavaScript).toHaveBeenCalledWith(expect.stringContaining('mainInnerStyle.maxWidth'), false);
+    expect(executeJavaScript).toHaveBeenCalledWith(expect.stringContaining('mainReady || loginReady'), false);
   });
 
-  it('rejects the document instead of revealing an unattested layout', async () => {
-    const target: WeChatLayoutTarget = {
-      insertCSS: vi.fn(async () => 'layout-key'),
-      executeJavaScript: vi.fn(async () => false),
-    };
+  it('retries bounded attestation until a delayed login or main shell is ready', async () => {
+    const executeJavaScript = vi.fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const target = createTarget(executeJavaScript);
+
+    await expect(applyWeChatDocumentLayout(target, {
+      verificationTimeoutMs: 100,
+      retryIntervalMs: 1,
+    })).resolves.toBe('layout-key');
+    expect(executeJavaScript).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails closed within a hard deadline instead of leaving the host loading forever', async () => {
+    const neverSettles = new Promise<unknown>(() => undefined);
+    const target = createTarget(vi.fn(() => neverSettles));
+
+    await expect(applyWeChatDocumentLayout(target, {
+      verificationTimeoutMs: 20,
+      retryIntervalMs: 1,
+    })).rejects.toThrow('before the verification deadline');
+  });
+
+  it('rejects a destroyed main frame before attempting remote execution', async () => {
+    const target = createTarget();
+    vi.mocked(target.mainFrame.isDestroyed).mockReturnValue(true);
 
     await expect(applyWeChatDocumentLayout(target)).rejects.toThrow(
-      'The embedded WeChat document rejected the full-bleed layout contract.',
+      'main frame was destroyed before layout verification',
     );
+    expect(target.mainFrame.executeJavaScript).not.toHaveBeenCalled();
   });
 });

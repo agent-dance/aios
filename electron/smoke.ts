@@ -1,9 +1,8 @@
 import { app, BrowserWindow, session, WebContentsView } from 'electron';
-import { applyWeChatDocumentLayout } from './main/documentLayoutPolicy.js';
 import { hardenWeChatSession } from './main/sessionPolicy.js';
+import { WeChatViewController } from './main/WeChatViewController.js';
 import {
   isAllowedWeChatMainFrameUrl,
-  isAllowedWeChatNavigation,
   WECHAT_ENTRY_URL,
 } from './shared/navigationPolicy.js';
 
@@ -101,7 +100,7 @@ async function waitForRemoteSurface(view: WebContentsView, isProbeReady: () => b
       && isAllowedWeChatMainFrameUrl(view.webContents.getURL())
     ) {
       const probe = await Promise.race([
-        view.webContents.executeJavaScript(REMOTE_PROBE_SOURCE, true) as Promise<RemoteProbe>,
+        view.webContents.mainFrame.executeJavaScript(REMOTE_PROBE_SOURCE, true) as Promise<RemoteProbe>,
         delay(5_000).then(() => {
           throw new Error('WeChat DOM execution timed out after the QR resource loaded.');
         }),
@@ -122,7 +121,6 @@ async function runSmoke(): Promise<void> {
   const smokeSession = session.fromPartition('alsniper-wechat-smoke', { cache: false });
   hardenWeChatSession(smokeSession);
   let qrResourceLoaded = false;
-  let stopForProbe: (() => void) | null = null;
   const proxy = await smokeSession.resolveProxy(WECHAT_ENTRY_URL);
   console.log(JSON.stringify({ event: 'proxy', modes: proxy.split(';').map((entry) => entry.trim().split(/\s+/u)[0]) }));
 
@@ -134,7 +132,6 @@ async function runSmoke(): Promise<void> {
       && details.statusCode < 300
     ) {
       qrResourceLoaded = true;
-      stopForProbe?.();
     }
     if (details.resourceType === 'mainFrame' || safeHost(details.url).includes('login')) {
       console.log(JSON.stringify({
@@ -164,6 +161,7 @@ async function runSmoke(): Promise<void> {
       webviewTag: false,
     },
   });
+  hostWindow.setContentSize(1024, 768);
   const view = new WebContentsView({
     webPreferences: {
       session: smokeSession,
@@ -180,50 +178,8 @@ async function runSmoke(): Promise<void> {
       backgroundThrottling: false,
     },
   });
-  hostWindow.contentView.addChildView(view);
-  view.setBounds({ x: 0, y: 0, width: 1024, height: 768 });
-  view.setVisible(false);
-  let domReady = false;
-  let layoutApplied = false;
-  let layoutFailure: Error | null = null;
-  let stoppedForProbe = false;
-  stopForProbe = () => {
-    if (domReady && qrResourceLoaded && !stoppedForProbe && !view.webContents.isDestroyed()) {
-      stoppedForProbe = true;
-      view.webContents.stop();
-    }
-  };
-
-  view.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  view.webContents.on('will-frame-navigate', (event) => {
-    if (!isAllowedWeChatNavigation(event.url, event.isMainFrame)) {
-      event.preventDefault();
-    }
-  });
-  view.webContents.on('will-redirect', (event) => {
-    if (!isAllowedWeChatNavigation(event.url, event.isMainFrame)) {
-      event.preventDefault();
-    }
-  });
-  view.webContents.on('did-start-navigation', (_event, _url, _isInPlace, isMainFrame) => {
-    if (isMainFrame) {
-      domReady = false;
-      layoutApplied = false;
-      layoutFailure = null;
-    }
-  });
   view.webContents.on('dom-ready', () => {
-    domReady = true;
     console.log(JSON.stringify({ event: 'dom-ready', host: safeHost(view.webContents.getURL()) }));
-    void applyWeChatDocumentLayout(view.webContents)
-      .then(() => {
-        layoutApplied = true;
-        console.log(JSON.stringify({ event: 'full-bleed-layout-applied' }));
-        stopForProbe?.();
-      })
-      .catch((error: unknown) => {
-        layoutFailure = error instanceof Error ? error : new Error('Unknown layout insertion failure.');
-      });
   });
   view.webContents.on('did-finish-load', () => {
     console.log(JSON.stringify({ event: 'did-finish-load', host: safeHost(view.webContents.getURL()) }));
@@ -237,18 +193,27 @@ async function runSmoke(): Promise<void> {
     }));
   });
 
-  try {
-    void view.webContents.loadURL(WECHAT_ENTRY_URL).catch((error: unknown) => {
-      console.error(JSON.stringify({
-        event: 'load-url-rejected',
-        error: error instanceof Error ? error.name : 'UnknownError',
+  const controller = new WeChatViewController({
+    hostWindow,
+    createView: () => view,
+    checkpointStorage: async () => undefined,
+    publishState: (state) => {
+      console.log(JSON.stringify({
+        event: 'controller-state',
+        phase: state.phase,
+        errorCode: state.errorCode ?? null,
       }));
-    });
+    },
+  });
+
+  try {
+    controller.mount({ x: 0, y: 0, width: 1024, height: 768 });
     const probe = await waitForRemoteSurface(view, () => {
-      if (layoutFailure !== null) {
-        throw layoutFailure;
+      const state = controller.getState();
+      if (state.phase === 'failed') {
+        throw new Error(`WeChat controller failed with ${state.errorCode ?? 'UNKNOWN_ERROR'}.`);
       }
-      return domReady && layoutApplied && qrResourceLoaded && stoppedForProbe;
+      return state.phase === 'ready' && qrResourceLoaded;
     });
     const finalUrl = view.webContents.getURL();
     if (!isAllowedWeChatMainFrameUrl(finalUrl)) {
@@ -290,6 +255,8 @@ async function runSmoke(): Promise<void> {
       hasLoginSurface: probe.hasLoginSurface,
       hasQrSurface: probe.hasQrSurface,
       qrResourceLoaded,
+      controllerPhase: controller.getState().phase,
+      webContentsLoadingAtProbe: view.webContents.isLoading(),
       requireType: probe.requireType,
       processType: probe.processType,
       rootViewport: `${probe.rootClientWidth}x${probe.rootClientHeight}`,
@@ -301,10 +268,7 @@ async function runSmoke(): Promise<void> {
       loginOverflowY: probe.loginOverflowY,
     }));
   } finally {
-    hostWindow.contentView.removeChildView(view);
-    if (!view.webContents.isDestroyed()) {
-      view.webContents.close();
-    }
+    controller.dispose();
     if (!hostWindow.isDestroyed()) {
       hostWindow.destroy();
     }

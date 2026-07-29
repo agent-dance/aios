@@ -80,6 +80,9 @@ export function DesktopIcons({
             left: 16,
             zIndex: 1,
             overflow: 'auto',
+            minWidth: 0,
+            minHeight: 0,
+            overscrollBehavior: 'contain',
           }}
     >
       {visibleDesktopIcons.map((icon) => {
@@ -336,7 +339,8 @@ export function DesktopShell({ appContents = {}, children, assistant, brand, des
       style={{
         position: 'relative',
         width: '100%',
-        minHeight: '100vh',
+        height: '100%',
+        minHeight: 0,
         overflow: 'hidden',
         background: themeGradient,
         color: '#f7fbff',

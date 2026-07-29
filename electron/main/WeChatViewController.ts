@@ -32,6 +32,8 @@ const defaultLogger: WeChatControllerLogger = {
   warn: (message) => console.warn(message),
 };
 
+export const WECHAT_DOCUMENT_READY_TIMEOUT_MS = 15_000;
+
 export class WeChatViewController {
   readonly #hostWindow: BrowserWindow;
   readonly #createView: () => WebContentsView;
@@ -49,6 +51,7 @@ export class WeChatViewController {
     readonly sequence: number;
     readonly operation: Promise<string>;
   } | null = null;
+  #documentReadyTimer: ReturnType<typeof setTimeout> | null = null;
   #certificateFailureGeneration: number | null = null;
   #disposed = false;
 
@@ -87,6 +90,7 @@ export class WeChatViewController {
       view.setVisible(false);
       this.#state = createWeChatState('loading', false, false);
       this.#emitState();
+      this.#armDocumentReadyWatchdog(generation, view.webContents);
 
       void view.webContents.loadURL(WECHAT_ENTRY_URL).catch((error: unknown) => {
         if (!this.#isCurrent(generation, view.webContents)) {
@@ -167,6 +171,7 @@ export class WeChatViewController {
     }
 
     this.#transition('loading');
+    this.#armDocumentReadyWatchdog(this.#generation, view.webContents);
     view.webContents.reload();
     return this.getState();
   }
@@ -185,6 +190,7 @@ export class WeChatViewController {
     }
 
     this.#transition('loading');
+    this.#armDocumentReadyWatchdog(this.#generation, view.webContents);
     navigationHistory.goBack();
     return this.getState();
   }
@@ -347,11 +353,16 @@ export class WeChatViewController {
       event.preventDefault();
     });
 
-    contents.on('did-start-loading', () => {
-      if (this.#isCurrent(generation, contents)) {
+    contents.on('did-start-navigation', (details) => {
+      if (
+        this.#isCurrent(generation, contents)
+        && details.isMainFrame
+        && !details.isSameDocument
+      ) {
         this.#invalidateRemoteDocument();
         this.#certificateFailureGeneration = null;
         this.#transition('loading');
+        this.#armDocumentReadyWatchdog(generation, contents);
       }
     });
 
@@ -429,6 +440,7 @@ export class WeChatViewController {
         && this.#state.errorCode === 'RENDERER_CRASHED'
       ) {
         this.#transition('loading');
+        this.#armDocumentReadyWatchdog(generation, contents);
         if (!contents.isLoading()) {
           this.#prepareRemoteDocument(contents, generation);
         }
@@ -476,11 +488,40 @@ export class WeChatViewController {
   }
 
   #invalidateRemoteDocument(): void {
+    this.#clearDocumentReadyWatchdog();
     ++this.#documentSequence;
     this.#documentLayoutApplication = null;
   }
 
+  #armDocumentReadyWatchdog(generation: number, contents: WebContents): void {
+    this.#clearDocumentReadyWatchdog();
+    const sequence = this.#documentSequence;
+    const timer = setTimeout(() => {
+      if (
+        this.#isCurrent(generation, contents)
+        && sequence === this.#documentSequence
+        && this.#state.phase === 'loading'
+      ) {
+        this.#logger.error('The embedded WeChat document did not become ready before the loading deadline.');
+        this.#invalidateRemoteDocument();
+        this.#transition('failed', 'NETWORK_ERROR');
+      }
+    }, WECHAT_DOCUMENT_READY_TIMEOUT_MS);
+    timer.unref();
+    this.#documentReadyTimer = timer;
+  }
+
+  #clearDocumentReadyWatchdog(): void {
+    if (this.#documentReadyTimer !== null) {
+      clearTimeout(this.#documentReadyTimer);
+      this.#documentReadyTimer = null;
+    }
+  }
+
   #transition(phase: WeChatState['phase'], errorCode?: WeChatErrorCode): void {
+    if (phase !== 'loading') {
+      this.#clearDocumentReadyWatchdog();
+    }
     const view = this.#getMountedView();
     if (phase !== 'ready' && view !== null) {
       view.setVisible(false);
@@ -518,6 +559,7 @@ export class WeChatViewController {
   }
 
   #releaseCurrentView(): void {
+    this.#clearDocumentReadyWatchdog();
     const view = this.#view;
     this.#view = null;
     if (view === null) {

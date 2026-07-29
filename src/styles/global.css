@@ -55,11 +55,18 @@ button, [role='button'] { -webkit-tap-highlight-color: transparent; }
   display: grid;
   grid-auto-flow: column;
   grid-auto-columns: 88px;
-  grid-template-rows: repeat(auto-fill, minmax(104px, 1fr));
+  grid-template-rows: repeat(auto-fill, minmax(128px, 1fr));
   align-content: start;
   justify-content: start;
   gap: 4px 8px;
-  scrollbar-width: thin;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.alsniper-desktop-icons--adaptive::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
 .alsniper-desktop-icons--adaptive > .alsniper-desktop-icon {
@@ -178,7 +185,7 @@ button, [role='button'] { -webkit-tap-highlight-color: transparent; }
   .desktop-watermark { display: none; }
   .alsniper-desktop-icons--adaptive {
     grid-auto-columns: 80px;
-    grid-template-rows: repeat(auto-fill, minmax(96px, 1fr));
+    grid-template-rows: repeat(auto-fill, minmax(112px, 1fr));
     gap: 2px 4px;
   }
   .alsniper-desktop-icons--adaptive > .alsniper-desktop-icon {

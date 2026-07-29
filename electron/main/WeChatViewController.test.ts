@@ -1,7 +1,10 @@
 import { EventEmitter } from 'node:events';
 import type { BrowserWindow, WebContents, WebContentsView } from 'electron';
 import { describe, expect, it, vi } from 'vitest';
-import { WeChatViewController } from './WeChatViewController.js';
+import {
+  WeChatViewController,
+  WECHAT_DOCUMENT_READY_TIMEOUT_MS,
+} from './WeChatViewController.js';
 import { WECHAT_ENTRY_URL } from '../shared/navigationPolicy.js';
 
 class FakeWebContents extends EventEmitter {
@@ -12,7 +15,10 @@ class FakeWebContents extends EventEmitter {
   readonly focus = vi.fn();
   readonly stop = vi.fn();
   readonly insertCSS = vi.fn(async () => 'layout-key');
-  readonly executeJavaScript = vi.fn(async () => true);
+  readonly mainFrame = {
+    executeJavaScript: vi.fn(async () => true),
+    isDestroyed: () => this.destroyed,
+  };
   readonly close = vi.fn(() => {
     this.destroyed = true;
   });
@@ -122,6 +128,29 @@ describe('WeChatViewController', () => {
     });
   });
 
+  it('fails closed when an initial document never reaches dom-ready', () => {
+    vi.useFakeTimers();
+    const { controller, logger } = createHarness();
+    try {
+      controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+
+      vi.advanceTimersByTime(WECHAT_DOCUMENT_READY_TIMEOUT_MS);
+
+      expect(controller.getState()).toEqual({
+        phase: 'failed',
+        visible: false,
+        canGoBack: false,
+        errorCode: 'NETWORK_ERROR',
+      });
+      expect(logger.error).toHaveBeenCalledWith(
+        'The embedded WeChat document did not become ready before the loading deadline.',
+      );
+    } finally {
+      controller.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it('does not expose a remote document until full-bleed layout is installed', async () => {
     let resolveLayout!: (key: string) => void;
     const layoutReady = new Promise<string>((resolve) => {
@@ -162,7 +191,11 @@ describe('WeChatViewController', () => {
     expect(controller.getState()).toEqual({ phase: 'loading', visible: false, canGoBack: false });
     expect(view.setVisible).toHaveBeenLastCalledWith(false);
 
-    view.webContents.emit('did-start-loading');
+    view.webContents.emit('did-start-navigation', {
+      isMainFrame: true,
+      isSameDocument: false,
+      url: WECHAT_ENTRY_URL,
+    });
     view.webContents.emit('dom-ready');
     expect(controller.getState()).toEqual({ phase: 'loading', visible: false, canGoBack: false });
     expect(view.setVisible).toHaveBeenLastCalledWith(false);
@@ -184,7 +217,11 @@ describe('WeChatViewController', () => {
     await vi.waitFor(() => expect(controller.getState().phase).toBe('ready'));
     expect(view.webContents.insertCSS).toHaveBeenCalledTimes(1);
 
-    view.webContents.emit('did-start-loading');
+    view.webContents.emit('did-start-navigation', {
+      isMainFrame: true,
+      isSameDocument: false,
+      url: WECHAT_ENTRY_URL,
+    });
     view.webContents.insertCSS.mockRejectedValueOnce(new Error('insertion failed'));
     view.webContents.emit('dom-ready');
     await vi.waitFor(() => expect(controller.getState()).toEqual({
@@ -198,6 +235,97 @@ describe('WeChatViewController', () => {
       'Failed to apply the embedded WeChat document layout.',
       expect.any(Error),
     );
+  });
+
+  it('keeps an attested view ready during spinner, subframe, and same-document activity', async () => {
+    const { controller, view } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+    controller.setVisible(true);
+    view.webContents.emit('dom-ready');
+    await vi.waitFor(() => expect(controller.getState()).toEqual({
+      phase: 'ready',
+      visible: true,
+      canGoBack: false,
+    }));
+
+    view.webContents.emit('did-start-loading');
+    view.webContents.emit('did-start-navigation', {
+      isMainFrame: false,
+      isSameDocument: false,
+      url: 'https://wx.qq.com/frame',
+    });
+    view.webContents.emit('did-start-navigation', {
+      isMainFrame: true,
+      isSameDocument: true,
+      url: `${WECHAT_ENTRY_URL}#chat`,
+    });
+
+    expect(controller.getState()).toEqual({
+      phase: 'ready',
+      visible: true,
+      canGoBack: false,
+    });
+    expect(view.webContents.insertCSS).toHaveBeenCalledTimes(1);
+    expect(view.setVisible).toHaveBeenLastCalledWith(true);
+  });
+
+  it('does not remain loading after an aborted reload produces no replacement document', async () => {
+    const { controller, view } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+    view.webContents.emit('dom-ready');
+    await vi.waitFor(() => expect(controller.getState().phase).toBe('ready'));
+
+    vi.useFakeTimers();
+    try {
+      controller.reload();
+      view.webContents.emit('did-start-navigation', {
+        isMainFrame: true,
+        isSameDocument: false,
+        url: WECHAT_ENTRY_URL,
+      });
+      view.webContents.emit('did-fail-load', {}, -3, 'ERR_ABORTED', WECHAT_ENTRY_URL, true);
+
+      vi.advanceTimersByTime(WECHAT_DOCUMENT_READY_TIMEOUT_MS);
+
+      expect(controller.getState()).toEqual({
+        phase: 'failed',
+        visible: false,
+        canGoBack: false,
+        errorCode: 'NETWORK_ERROR',
+      });
+    } finally {
+      controller.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('times out a back navigation that never produces a document', async () => {
+    const { controller, view } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+    view.webContents.emit('dom-ready');
+    await vi.waitFor(() => expect(controller.getState().phase).toBe('ready'));
+    view.webContents.navigationHistory.entries = [
+      { url: WECHAT_ENTRY_URL },
+      { url: 'https://wx2.qq.com/chat' },
+    ];
+    view.webContents.navigationHistory.activeIndex = 1;
+
+    vi.useFakeTimers();
+    try {
+      controller.goBack();
+      vi.advanceTimersByTime(WECHAT_DOCUMENT_READY_TIMEOUT_MS);
+
+      expect(view.webContents.navigationHistory.goBack).toHaveBeenCalledOnce();
+      expect(controller.getState()).toEqual({
+        phase: 'failed',
+        visible: false,
+        canGoBack: true,
+        errorCode: 'NETWORK_ERROR',
+      });
+    } finally {
+      controller.dispose();
+      vi.useRealTimers();
+    }
   });
 
   it('cannot become visible from a stale layout completion after an unresponsive event', async () => {
