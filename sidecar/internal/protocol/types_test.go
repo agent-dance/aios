@@ -33,6 +33,55 @@ func TestChatRequestRequiresRevisionAndRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestNativeAppProtocolIsStrictAndInternallyConsistent(t *testing.T) {
+	install := NativeAppInstallRequest{RequestID: "native-request-1", AcceptedTerms: true}
+	if err := install.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	install.AcceptedTerms = false
+	if err := install.Validate(); err == nil {
+		t.Fatal("install accepted unconfirmed terms")
+	}
+	var decoded NativeAppInstallRequest
+	if err := DecodeStrictObject([]byte(`{"requestId":"native-request-1","acceptedTerms":true,"command":"calc.exe"}`), &decoded, "requestId", "acceptedTerms"); err == nil {
+		t.Fatal("native install accepted an arbitrary command field")
+	}
+	if err := DecodeStrictObject([]byte(`{"RequestID":"native-request-1","acceptedTerms":true}`), &decoded, "requestId", "acceptedTerms"); err == nil {
+		t.Fatal("native install accepted a case-insensitive property alias")
+	}
+	if err := DecodeStrictObject([]byte(`{"requestId":"native-request-1","requestId":"native-request-2","acceptedTerms":true}`), &decoded, "requestId", "acceptedTerms"); err == nil {
+		t.Fatal("native install accepted a duplicate property")
+	}
+
+	installed := NativeAppStatusResponse{
+		ProtocolVersion: Version, AppID: "wechat", Platform: "windows", State: "installed",
+		Installed: true, Launchable: true, PublisherVerified: true, Version: "4.1.12.26",
+	}
+	if err := installed.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	installed.PublisherVerified = false
+	if err := installed.Validate(); err == nil {
+		t.Fatal("installed state accepted without publisher verification")
+	}
+	if err := (NativeAppStatusResponse{ProtocolVersion: Version, AppID: "wechat", Platform: "unsupported", State: "unsupported", Version: "fake"}).Validate(); err == nil {
+		t.Fatal("unsupported status accepted a version")
+	}
+
+	operation := NativeAppOperationResponse{
+		ProtocolVersion: Version, RequestID: "native-request-1", AppID: "wechat", Operation: "install",
+		Code: "installed", Changed: true, Installed: true, Launchable: true, PublisherVerified: true,
+		Version: "4.1.12.26", ReceiptID: "native-00112233445566778899aabbccddeeff",
+	}
+	if err := operation.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	operation.Changed = false
+	if err := operation.Validate(); err == nil {
+		t.Fatal("installed operation accepted changed=false")
+	}
+}
+
 func TestChatContextValidatesBoundedStatusGamesAndEnabledDomainAgents(t *testing.T) {
 	enabledAgent := EnabledAgent{ID: "travel.planner", Name: "Travel", Description: "Plans trips", Instructions: "Use current public context only.", Capabilities: []string{"os.app.open"}, Contributions: []string{"domain-agent"}}
 	status := &SystemStatus{

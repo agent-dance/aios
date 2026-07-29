@@ -15,6 +15,8 @@ import (
 	"github.com/buthim/alsniper-os/sidecar/internal/server"
 )
 
+type runnerFactory func(config.Config) (agent.Runner, func() error, error)
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg, err := config.Load()
@@ -22,26 +24,23 @@ func main() {
 		logger.Error("invalid configuration", "error", err)
 		os.Exit(2)
 	}
-	runner, err := agent.NewCodexRunner(cfg)
-	if err != nil {
-		logger.Error("initialize Codex runtime", "error", err)
-		os.Exit(2)
-	}
-	closeRunner := func() {
-		if err := runner.Close(); err != nil {
-			logger.Error("release Codex profile lease", "error", err)
-		}
-	}
-	service, err := agent.NewService(runner, cfg.MaxConcurrentRuns)
+	service, closeRunner, degraded, err := buildAgentService(cfg, newCodexRunner)
 	if err != nil {
 		logger.Error("initialize Agent service", "error", err)
-		closeRunner()
 		os.Exit(2)
+	}
+	if degraded {
+		logger.Warn("Codex runtime unavailable; authenticated native application capabilities remain available")
+	}
+	closeAgent := func() {
+		if err := closeRunner(); err != nil {
+			logger.Error("release Codex profile lease", "error", err)
+		}
 	}
 	handler, err := server.New(cfg, service)
 	if err != nil {
 		logger.Error("initialize HTTP service", "error", err)
-		closeRunner()
+		closeAgent()
 		os.Exit(2)
 	}
 	httpServer := &http.Server{
@@ -49,7 +48,7 @@ func main() {
 		Handler:           handler.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      max(cfg.ChatTimeout, cfg.GameTimeout) + 10*time.Second,
+		WriteTimeout:      max(max(cfg.ChatTimeout, cfg.GameTimeout), server.NativeInstallTimeout) + 10*time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 * 1024,
 	}
@@ -72,8 +71,33 @@ func main() {
 	}
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 		logger.Error("HTTP server failed", "error", serveErr)
-		closeRunner()
+		closeAgent()
 		os.Exit(1)
 	}
-	closeRunner()
+	closeAgent()
+}
+
+func newCodexRunner(cfg config.Config) (agent.Runner, func() error, error) {
+	runner, err := agent.NewCodexRunner(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return runner, runner.Close, nil
+}
+
+func buildAgentService(cfg config.Config, factory runnerFactory) (*agent.Service, func() error, bool, error) {
+	runner, closeRunner, err := factory(cfg)
+	degraded := err != nil
+	if degraded {
+		runner = agent.NewUnavailableRunner()
+		closeRunner = func() error { return nil }
+	}
+	service, err := agent.NewService(runner, cfg.MaxConcurrentRuns)
+	if err != nil {
+		if closeRunner != nil {
+			_ = closeRunner()
+		}
+		return nil, nil, degraded, err
+	}
+	return service, closeRunner, degraded, nil
 }

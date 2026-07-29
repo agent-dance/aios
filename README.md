@@ -60,6 +60,7 @@ The generated game reuses the deterministic runtime, browser lifecycle and autom
 - Control Center for Wi-Fi, Bluetooth, system health, storage, energy, brightness and sound
 - Persistent Aurora/Midnight themes, accent colors and accessibility preferences
 - Finder, keyboard-friendly calculator, safe simulated terminal, Settings and a trust-aware App Store
+- Install-on-demand desktop shortcuts that appear automatically and open on double-click, including native WeChat installed through the fixed official WinGet package and trusted only after Tencent publisher verification
 - Cosmic Vanguard, a deterministic 3D space shooter with keyboard, pointer, pause, restart and fullscreen controls
 - Reusable game platform and atomic scaffold generator for future browser games
 - Local Codex desktop assistant with a procedural Three.js companion, text/hold-to-talk interaction, restricted A2UI, and receipt-backed OS controls

@@ -13,6 +13,13 @@ import {
   type GameDecisionRequest,
   type GameDecisionResponse,
   type HealthResponse,
+  type NativeApplicationId,
+  type NativeApplicationInstallRequest,
+  type NativeApplicationInstallResult,
+  type NativeApplicationLaunchRequest,
+  type NativeApplicationLaunchResult,
+  type NativeApplicationOperationResult,
+  type NativeApplicationStatus,
   type OsContextSnapshot,
   type SidecarErrorEnvelope,
   type UsageSummary,
@@ -73,6 +80,20 @@ export interface SidecarClient {
   decide(request: GameDecisionRequest, options?: RequestOptions): Promise<GameDecisionResponse>;
 }
 
+export interface NativeApplicationSidecarClient extends SidecarClient {
+  nativeApplicationStatus(appId: NativeApplicationId, options?: RequestOptions): Promise<NativeApplicationStatus>;
+  installNativeApplication(
+    appId: NativeApplicationId,
+    request: NativeApplicationInstallRequest,
+    options?: RequestOptions,
+  ): Promise<NativeApplicationInstallResult>;
+  launchNativeApplication(
+    appId: NativeApplicationId,
+    request: NativeApplicationLaunchRequest,
+    options?: RequestOptions,
+  ): Promise<NativeApplicationLaunchResult>;
+}
+
 export interface RequestOptions {
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
@@ -97,6 +118,9 @@ const HEX_SHA256 = /^[0-9a-f]{64}$/;
 const REQUEST_SIGNATURE_CONTEXT = 'AIOS1-REQUEST';
 const RESPONSE_SIGNATURE_CONTEXT = 'AIOS1-RESPONSE';
 const RESPONSE_BODY_LIMIT = 4 * 1024 * 1024;
+const DEFAULT_NATIVE_APPLICATION_TIMEOUT_MS = 10_000;
+const NATIVE_APPLICATION_LAUNCH_TIMEOUT_MS = 30_000;
+const NATIVE_APPLICATION_INSTALL_TIMEOUT_MS = 600_000;
 const DEBUG_STREAM_PATH = '/v1/chat/trace';
 const DEBUG_STREAM_CONTENT_TYPE = 'application/x-ndjson';
 const DEBUG_STREAM_FRAME_CONTEXT = 'AIOS1-STREAM-FRAME';
@@ -387,6 +411,160 @@ export const validateGameDecisionResponse = (value: unknown): GameDecisionRespon
   });
 };
 
+const assertNativeApplicationId = (value: unknown, path: string): NativeApplicationId =>
+  assertEnum(value, ['wechat'], path);
+
+const validateNativeApplicationVersion = (value: unknown, path: string): string => {
+  const version = assertString(value, path, { min: 1, max: 128 });
+  if (version.trim().length === 0) throw new ValidationError(path, 'must contain a non-whitespace version');
+  return version;
+};
+
+export const validateNativeApplicationInstallRequest = (value: unknown): NativeApplicationInstallRequest => {
+  const record = assertRecord(value, 'request');
+  assertExactKeys(record, ['requestId', 'acceptedTerms'], [], 'request');
+  if (record.acceptedTerms !== true) throw new ValidationError('request.acceptedTerms', 'must be explicitly accepted');
+  return Object.freeze({
+    requestId: assertString(record.requestId, 'request.requestId', { min: 1, max: 128, pattern: REQUEST_ID }),
+    acceptedTerms: true,
+  });
+};
+
+export const validateNativeApplicationLaunchRequest = (value: unknown): NativeApplicationLaunchRequest => {
+  const record = assertRecord(value, 'request');
+  assertExactKeys(record, ['requestId'], [], 'request');
+  return Object.freeze({
+    requestId: assertString(record.requestId, 'request.requestId', { min: 1, max: 128, pattern: REQUEST_ID }),
+  });
+};
+
+export const validateNativeApplicationStatus = (value: unknown): NativeApplicationStatus => {
+  const record = assertRecord(value, 'response');
+  assertExactKeys(
+    record,
+    ['protocolVersion', 'appId', 'platform', 'state', 'installed', 'launchable', 'publisherVerified'],
+    ['version'],
+    'response',
+  );
+  if (record.protocolVersion !== AIOS_AGENT_PROTOCOL_VERSION) {
+    throw new ValidationError('response.protocolVersion', 'protocol mismatch');
+  }
+  const platform = assertEnum(record.platform, ['windows', 'unsupported'], 'response.platform');
+  const state = assertEnum(record.state, ['not-installed', 'installed', 'invalid', 'unsupported'], 'response.state');
+  const installed = assertBoolean(record.installed, 'response.installed');
+  const launchable = assertBoolean(record.launchable, 'response.launchable');
+  const publisherVerified = assertBoolean(record.publisherVerified, 'response.publisherVerified');
+  const version = record.version === undefined
+    ? undefined
+    : validateNativeApplicationVersion(record.version, 'response.version');
+  const isInstalled = platform === 'windows' && state === 'installed';
+  const isUnavailable = (
+    (platform === 'windows' && (state === 'not-installed' || state === 'invalid')) ||
+    (platform === 'unsupported' && state === 'unsupported')
+  );
+  if (!isInstalled && !isUnavailable) throw new ValidationError('response.state', 'is inconsistent with the platform');
+  if (isInstalled) {
+    if (!installed || !launchable || !publisherVerified || version === undefined) {
+      throw new ValidationError('response', 'installed applications must be launchable, publisher-verified, and versioned');
+    }
+  } else if (installed || launchable || publisherVerified || version !== undefined) {
+    throw new ValidationError('response', 'unavailable applications cannot claim an installation, trust, launchability, or version');
+  }
+  const base = Object.freeze({
+    protocolVersion: AIOS_AGENT_PROTOCOL_VERSION,
+    appId: assertNativeApplicationId(record.appId, 'response.appId'),
+  });
+  if (isInstalled) return Object.freeze({
+    ...base,
+    platform,
+    state: 'installed',
+    installed: true,
+    launchable: true,
+    publisherVerified: true,
+    version: version!,
+  });
+  if (platform === 'windows') return Object.freeze({
+    ...base,
+    platform,
+    state: state as 'not-installed' | 'invalid',
+    installed: false,
+    launchable: false,
+    publisherVerified: false,
+  });
+  return Object.freeze({
+    ...base,
+    platform,
+    state: 'unsupported',
+    installed: false,
+    launchable: false,
+    publisherVerified: false,
+  });
+};
+
+const validateNativeApplicationOperationResult = (
+  value: unknown,
+  expectedOperation: NativeApplicationOperationResult['operation'],
+): NativeApplicationOperationResult => {
+  const record = assertRecord(value, 'response');
+  assertExactKeys(record, [
+    'protocolVersion',
+    'requestId',
+    'appId',
+    'operation',
+    'code',
+    'changed',
+    'installed',
+    'launchable',
+    'publisherVerified',
+    'version',
+    'receiptId',
+  ], [], 'response');
+  if (record.protocolVersion !== AIOS_AGENT_PROTOCOL_VERSION) {
+    throw new ValidationError('response.protocolVersion', 'protocol mismatch');
+  }
+  const operation = assertEnum(record.operation, ['install', 'launch'], 'response.operation');
+  if (operation !== expectedOperation) throw new ValidationError('response.operation', 'does not match the requested operation');
+  const code = assertEnum(record.code, ['installed', 'already-installed', 'launched'], 'response.code');
+  const changed = assertBoolean(record.changed, 'response.changed');
+  if (operation === 'install') {
+    if (code !== 'installed' && code !== 'already-installed') {
+      throw new ValidationError('response.code', 'is not valid for installation');
+    }
+    if (changed !== (code === 'installed')) throw new ValidationError('response.changed', 'does not match the installation result');
+  } else if (code !== 'launched' || changed) {
+    throw new ValidationError('response', 'launch results must use code launched and cannot change installation state');
+  }
+  if (
+    assertBoolean(record.installed, 'response.installed') !== true ||
+    assertBoolean(record.launchable, 'response.launchable') !== true ||
+    assertBoolean(record.publisherVerified, 'response.publisherVerified') !== true
+  ) {
+    throw new ValidationError('response', 'successful operations require a verified, installed, launchable application');
+  }
+  const base = Object.freeze({
+    protocolVersion: AIOS_AGENT_PROTOCOL_VERSION,
+    requestId: assertString(record.requestId, 'response.requestId', { min: 1, max: 128, pattern: REQUEST_ID }),
+    appId: assertNativeApplicationId(record.appId, 'response.appId'),
+    installed: true as const,
+    launchable: true as const,
+    publisherVerified: true as const,
+    version: validateNativeApplicationVersion(record.version, 'response.version'),
+    receiptId: assertString(record.receiptId, 'response.receiptId', { min: 1, max: 128, pattern: REQUEST_ID }),
+  });
+  if (operation === 'install') {
+    return code === 'installed'
+      ? Object.freeze({ ...base, operation, code, changed: true })
+      : Object.freeze({ ...base, operation, code: 'already-installed', changed: false });
+  }
+  return Object.freeze({ ...base, operation, code: 'launched', changed: false });
+};
+
+export const validateNativeApplicationInstallResult = (value: unknown): NativeApplicationInstallResult =>
+  validateNativeApplicationOperationResult(value, 'install') as NativeApplicationInstallResult;
+
+export const validateNativeApplicationLaunchResult = (value: unknown): NativeApplicationLaunchResult =>
+  validateNativeApplicationOperationResult(value, 'launch') as NativeApplicationLaunchResult;
+
 const validateDebugFramePayload = (value: unknown): AgentDebugFramePayload => {
   const record = assertRecord(value, 'debugFrame.payload');
   const kind = assertEnum(record.kind, ['trace', 'completed', 'failed'], 'debugFrame.payload.kind');
@@ -601,7 +779,7 @@ const parseJson = (response: Response, body: Uint8Array): unknown => {
   }
 };
 
-export const createSidecarClient = (config: SidecarClientConfig): SidecarClient => {
+export const createSidecarClient = (config: SidecarClientConfig): NativeApplicationSidecarClient => {
   const baseUrl = validateBaseUrl(config.baseUrl);
   const sidecarAuthority = canonicalSidecarAuthority(baseUrl);
   let token: string;
@@ -649,11 +827,20 @@ export const createSidecarClient = (config: SidecarClientConfig): SidecarClient 
     throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Unable to generate a unique sidecar request nonce.');
   };
 
-  const request = async <T>(path: string, init: RequestInit, validate: (value: unknown) => T, options: RequestOptions = {}): Promise<T> => {
+  const request = async <T>(
+    path: string,
+    init: RequestInit,
+    validate: (value: unknown) => T,
+    options: RequestOptions = {},
+    maximumTimeoutMs = 300_000,
+  ): Promise<T> => {
     if (getOrigin() !== origin) throw new SidecarClientError('SIDECAR_ORIGIN_MISMATCH', 'Browser origin does not match the sidecar capability binding.');
     const timeoutMs = options.timeoutMs ?? defaultTimeout;
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 300_000) {
-      throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Request timeout must be between 100 and 300000ms.');
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > maximumTimeoutMs) {
+      throw new SidecarClientError(
+        'SIDECAR_CONFIG_INVALID',
+        `Request timeout must be between 100 and ${maximumTimeoutMs}ms.`,
+      );
     }
     const linked = linkedSignal(options.signal, timeoutMs);
     try {
@@ -750,9 +937,21 @@ export const createSidecarClient = (config: SidecarClientConfig): SidecarClient 
     }
   };
 
-  const post = <T>(path: string, body: unknown, validate: (value: unknown) => T, options?: RequestOptions): Promise<T> => {
+  const post = <T>(
+    path: string,
+    body: unknown,
+    validate: (value: unknown) => T,
+    options?: RequestOptions,
+    maximumTimeoutMs?: number,
+  ): Promise<T> => {
     const json = JSON.stringify(assertJsonValue(body, 'request'));
-    return request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: json }, validate, options);
+    return request(
+      path,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: json },
+      validate,
+      options,
+      maximumTimeoutMs,
+    );
   };
 
   const chatWithDebug = async (chatRequest: ChatRequest, options: RequestOptions = {}): Promise<ChatResponse> => {
@@ -1014,6 +1213,70 @@ export const createSidecarClient = (config: SidecarClientConfig): SidecarClient 
       }
       const response = await post('/v1/game/decide', decisionRequest as unknown as JsonValue, validateGameDecisionResponse, options);
       if (response.requestId !== decisionRequest.requestId) throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Sidecar response request ID does not match.');
+      return response;
+    },
+    nativeApplicationStatus: async (appId: NativeApplicationId, options?: RequestOptions) => {
+      if (appId !== 'wechat') {
+        throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Unsupported native application.');
+      }
+      const response = await request(
+        '/v1/native-apps/wechat/status',
+        { method: 'GET' },
+        validateNativeApplicationStatus,
+        { ...options, timeoutMs: options?.timeoutMs ?? DEFAULT_NATIVE_APPLICATION_TIMEOUT_MS },
+        DEFAULT_NATIVE_APPLICATION_TIMEOUT_MS,
+      );
+      if (response.appId !== appId) {
+        throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Sidecar native application ID does not match.');
+      }
+      return response;
+    },
+    installNativeApplication: async (
+      appId: NativeApplicationId,
+      candidate: NativeApplicationInstallRequest,
+      options?: RequestOptions,
+    ) => {
+      if (appId !== 'wechat') {
+        throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Unsupported native application.');
+      }
+      let installRequest: NativeApplicationInstallRequest;
+      try { installRequest = validateNativeApplicationInstallRequest(candidate); } catch (error) {
+        throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Native application install request is outside the protocol schema.', { cause: error });
+      }
+      const response = await post(
+        '/v1/native-apps/wechat/install',
+        installRequest,
+        validateNativeApplicationInstallResult,
+        { ...options, timeoutMs: options?.timeoutMs ?? NATIVE_APPLICATION_INSTALL_TIMEOUT_MS },
+        NATIVE_APPLICATION_INSTALL_TIMEOUT_MS,
+      );
+      if (response.requestId !== installRequest.requestId || response.appId !== appId) {
+        throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Sidecar native application install receipt does not match the request.');
+      }
+      return response;
+    },
+    launchNativeApplication: async (
+      appId: NativeApplicationId,
+      candidate: NativeApplicationLaunchRequest,
+      options?: RequestOptions,
+    ) => {
+      if (appId !== 'wechat') {
+        throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Unsupported native application.');
+      }
+      let launchRequest: NativeApplicationLaunchRequest;
+      try { launchRequest = validateNativeApplicationLaunchRequest(candidate); } catch (error) {
+        throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Native application launch request is outside the protocol schema.', { cause: error });
+      }
+      const response = await post(
+        '/v1/native-apps/wechat/launch',
+        launchRequest,
+        validateNativeApplicationLaunchResult,
+        { ...options, timeoutMs: options?.timeoutMs ?? NATIVE_APPLICATION_LAUNCH_TIMEOUT_MS },
+        NATIVE_APPLICATION_LAUNCH_TIMEOUT_MS,
+      );
+      if (response.requestId !== launchRequest.requestId || response.appId !== appId) {
+        throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Sidecar native application launch receipt does not match the request.');
+      }
       return response;
     },
   });

@@ -156,6 +156,75 @@ export interface GameDecisionResponse {
   readonly usage?: UsageSummary;
 }
 
+export type NativeApplicationId = 'wechat';
+
+interface NativeApplicationStatusBase {
+  readonly protocolVersion: typeof AIOS_AGENT_PROTOCOL_VERSION;
+  readonly appId: NativeApplicationId;
+}
+
+export type NativeApplicationStatus = NativeApplicationStatusBase & (
+  | {
+    readonly platform: 'windows';
+    readonly state: 'installed';
+    readonly installed: true;
+    readonly launchable: true;
+    readonly publisherVerified: true;
+    readonly version: string;
+  }
+  | {
+    readonly platform: 'windows';
+    readonly state: 'not-installed' | 'invalid';
+    readonly installed: false;
+    readonly launchable: false;
+    readonly publisherVerified: false;
+    readonly version?: never;
+  }
+  | {
+    readonly platform: 'unsupported';
+    readonly state: 'unsupported';
+    readonly installed: false;
+    readonly launchable: false;
+    readonly publisherVerified: false;
+    readonly version?: never;
+  }
+);
+
+export interface NativeApplicationInstallRequest {
+  readonly requestId: string;
+  readonly acceptedTerms: true;
+}
+
+export interface NativeApplicationLaunchRequest {
+  readonly requestId: string;
+}
+
+interface NativeApplicationOperationResultBase {
+  readonly protocolVersion: typeof AIOS_AGENT_PROTOCOL_VERSION;
+  readonly requestId: string;
+  readonly appId: NativeApplicationId;
+  readonly installed: true;
+  readonly launchable: true;
+  readonly publisherVerified: true;
+  readonly version: string;
+  readonly receiptId: string;
+}
+
+export type NativeApplicationInstallResult = NativeApplicationOperationResultBase & {
+  readonly operation: 'install';
+} & (
+  | { readonly code: 'installed'; readonly changed: true }
+  | { readonly code: 'already-installed'; readonly changed: false }
+);
+
+export interface NativeApplicationLaunchResult extends NativeApplicationOperationResultBase {
+  readonly operation: 'launch';
+  readonly code: 'launched';
+  readonly changed: false;
+}
+
+export type NativeApplicationOperationResult = NativeApplicationInstallResult | NativeApplicationLaunchResult;
+
 export interface SidecarErrorEnvelope {
   readonly error: {
     readonly code: string;

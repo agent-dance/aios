@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -37,6 +38,10 @@ func TestAgentErrorClassificationIsStableSanitizedAndShared(t *testing.T) {
 		{
 			name: "unknown provider", err: errors.Join(agent.ErrAgent, errors.New("RAW_FAILURE_CANARY")),
 			status: http.StatusBadGateway, code: "AGENT_FAILED", message: "The local Agent run failed.", retryable: true,
+		},
+		{
+			name: "caller cancellation", err: context.Canceled,
+			status: 499, code: "REQUEST_CANCELLED", message: "The request was cancelled.", retryable: false,
 		},
 	}
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/buthim/alsniper-os/sidecar/internal/agent"
 	"github.com/buthim/alsniper-os/sidecar/internal/config"
+	"github.com/buthim/alsniper-os/sidecar/internal/nativeapp"
 	"github.com/buthim/alsniper-os/sidecar/internal/protocol"
 )
 
@@ -51,6 +53,70 @@ func handler(t *testing.T, r runner, cfg config.Config) http.Handler {
 		t.Fatal(err)
 	}
 	server, err := New(cfg, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server.Handler()
+}
+
+type nativePlatform struct {
+	discoveries    []nativeapp.Discovery
+	discoverErr    error
+	installErr     error
+	postInstallErr error
+	installModes   []nativeapp.InstallMode
+	launch         nativeapp.Discovery
+	launchErr      error
+	installCalls   int
+	launchCalls    int
+}
+
+func (p *nativePlatform) Discover(context.Context) (nativeapp.Discovery, error) {
+	if p.discoverErr != nil {
+		return nativeapp.Discovery{}, p.discoverErr
+	}
+	if len(p.discoveries) == 0 {
+		return nativeapp.Discovery{Platform: "windows", State: "not-installed"}, nil
+	}
+	value := p.discoveries[0]
+	if len(p.discoveries) > 1 {
+		p.discoveries = p.discoveries[1:]
+	}
+	return value, nil
+}
+
+func (p *nativePlatform) Install(_ context.Context, mode nativeapp.InstallMode) error {
+	p.installCalls++
+	p.installModes = append(p.installModes, mode)
+	if p.postInstallErr != nil {
+		p.discoverErr = p.postInstallErr
+	}
+	return p.installErr
+}
+
+func (p *nativePlatform) Launch(context.Context) (nativeapp.Discovery, error) {
+	p.launchCalls++
+	return p.launch, p.launchErr
+}
+
+func trustedNativeDiscovery() nativeapp.Discovery {
+	return nativeapp.Discovery{
+		Platform: "windows", State: "installed", Version: "4.1.12.26",
+		Installed: true, Launchable: true, PublisherVerified: true,
+	}
+}
+
+func handlerWithNative(t *testing.T, r runner, cfg config.Config, platform nativeapp.Platform) http.Handler {
+	t.Helper()
+	agentService, err := agent.NewService(r, cfg.MaxConcurrentRuns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeService, err := nativeapp.NewService(platform)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewWithNativeApps(cfg, agentService, nativeService)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,6 +358,184 @@ func TestAuthenticationRejectsReplayStaleAndTampering(t *testing.T) {
 		t.Fatalf("wrong authority: %d %s", rec.Code, rec.Body.String())
 	}
 	verifySignedResponse(t, rec, cfg, wrongAuthorityNonce)
+}
+
+func TestNativeWeChatStatusIsTypedSignedAndIndependentOfCodexReadiness(t *testing.T) {
+	cfg := testConfig(t)
+	platform := &nativePlatform{discoveries: []nativeapp.Discovery{trustedNativeDiscovery()}}
+	h := handlerWithNative(t, runner{ready: false}, cfg, platform)
+	recorder := httptest.NewRecorder()
+	h.ServeHTTP(recorder, request(http.MethodGet, "/v1/native-apps/wechat/status", "", cfg))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var response protocol.NativeAppStatusResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if err := response.Validate(); err != nil {
+		t.Fatalf("invalid response: %v (%+v)", err, response)
+	}
+	if response.State != "installed" || response.Version != "4.1.12.26" {
+		t.Fatalf("unexpected status: %+v", response)
+	}
+	if strings.Contains(recorder.Body.String(), `:\`) || strings.Contains(strings.ToLower(recorder.Body.String()), "executable") {
+		t.Fatalf("native path leaked: %s", recorder.Body.String())
+	}
+	verifySignedResponse(t, recorder, cfg, "00112233445566778899aabbccddeeff")
+}
+
+func TestNativeWeChatInstallAndLaunchStrictContracts(t *testing.T) {
+	cfg := testConfig(t)
+	installPlatform := &nativePlatform{discoveries: []nativeapp.Discovery{{Platform: "windows", State: "not-installed"}, trustedNativeDiscovery()}}
+	h := handlerWithNative(t, runner{ready: false}, cfg, installPlatform)
+	recorder := httptest.NewRecorder()
+	installBody := `{"requestId":"native-request-1","acceptedTerms":true}`
+	h.ServeHTTP(recorder, request(http.MethodPost, "/v1/native-apps/wechat/install", installBody, cfg))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("install: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var install protocol.NativeAppOperationResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &install); err != nil {
+		t.Fatal(err)
+	}
+	if err := install.Validate(); err != nil || install.Code != "installed" || !install.Changed || installPlatform.installCalls != 1 ||
+		len(installPlatform.installModes) != 1 || installPlatform.installModes[0] != nativeapp.InstallModeFresh {
+		t.Fatalf("invalid install response: err=%v response=%+v calls=%d modes=%v", err, install, installPlatform.installCalls, installPlatform.installModes)
+	}
+
+	launchPlatform := &nativePlatform{launch: trustedNativeDiscovery()}
+	h = handlerWithNative(t, runner{ready: false}, cfg, launchPlatform)
+	recorder = httptest.NewRecorder()
+	launchBody := `{"requestId":"native-request-2"}`
+	h.ServeHTTP(recorder, request(http.MethodPost, "/v1/native-apps/wechat/launch", launchBody, cfg))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("launch: %d %s", recorder.Code, recorder.Body.String())
+	}
+	var launch protocol.NativeAppOperationResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &launch); err != nil {
+		t.Fatal(err)
+	}
+	if err := launch.Validate(); err != nil || launch.Code != "launched" || launch.Changed || launchPlatform.launchCalls != 1 {
+		t.Fatalf("invalid launch response: err=%v response=%+v calls=%d", err, launch, launchPlatform.launchCalls)
+	}
+}
+
+func TestNativeWeChatInvalidInstallationUsesHostSelectedRepair(t *testing.T) {
+	cfg := testConfig(t)
+	invalid := nativeapp.Discovery{Platform: "windows", State: "invalid"}
+	repairPlatform := &nativePlatform{discoveries: []nativeapp.Discovery{invalid, trustedNativeDiscovery()}}
+	h := handlerWithNative(t, runner{ready: false}, cfg, repairPlatform)
+	recorder := httptest.NewRecorder()
+	body := `{"requestId":"native-repair-1","acceptedTerms":true}`
+	h.ServeHTTP(recorder, request(http.MethodPost, "/v1/native-apps/wechat/install", body, cfg))
+	if recorder.Code != http.StatusOK || len(repairPlatform.installModes) != 1 || repairPlatform.installModes[0] != nativeapp.InstallModeRepair {
+		t.Fatalf("repair response: %d %s modes=%v", recorder.Code, recorder.Body.String(), repairPlatform.installModes)
+	}
+	var response protocol.NativeAppOperationResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || response.Code != "installed" || !response.Changed {
+		t.Fatalf("repair response invalid: %+v err=%v", response, err)
+	}
+
+	tests := []struct {
+		name       string
+		platform   *nativePlatform
+		wantStatus int
+		wantCode   string
+	}{
+		{"still untrusted", &nativePlatform{discoveries: []nativeapp.Discovery{invalid, invalid}}, http.StatusUnprocessableEntity, "NATIVE_APP_UNTRUSTED"},
+		{"repair failed", &nativePlatform{discoveries: []nativeapp.Discovery{invalid, {Platform: "windows", State: "not-installed"}}, installErr: errors.New("repair failed")}, http.StatusBadGateway, "NATIVE_APP_INSTALL_FAILED"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := handlerWithNative(t, runner{ready: false}, cfg, test.platform)
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, request(http.MethodPost, "/v1/native-apps/wechat/install", body, cfg))
+			if recorder.Code != test.wantStatus || decodeError(t, recorder).Error.Code != test.wantCode {
+				t.Fatalf("repair failure: %d %s", recorder.Code, recorder.Body.String())
+			}
+			if len(test.platform.installModes) != 1 || test.platform.installModes[0] != nativeapp.InstallModeRepair {
+				t.Fatalf("repair did not use closed repair mode: %v", test.platform.installModes)
+			}
+		})
+	}
+}
+
+func TestNativeWeChatHandlersRejectInvalidInputBeforePlatform(t *testing.T) {
+	cfg := testConfig(t)
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		want   int
+	}{
+		{"status body", http.MethodGet, "/v1/native-apps/wechat/status", `{}`, http.StatusBadRequest},
+		{"install terms", http.MethodPost, "/v1/native-apps/wechat/install", `{"requestId":"native-request-1","acceptedTerms":false}`, http.StatusBadRequest},
+		{"install unknown", http.MethodPost, "/v1/native-apps/wechat/install", `{"requestId":"native-request-1","acceptedTerms":true,"command":"calc.exe"}`, http.StatusBadRequest},
+		{"install caller repair", http.MethodPost, "/v1/native-apps/wechat/install", `{"requestId":"native-request-1","acceptedTerms":true,"repair":true}`, http.StatusBadRequest},
+		{"install key casing", http.MethodPost, "/v1/native-apps/wechat/install", `{"RequestID":"native-request-1","acceptedTerms":true}`, http.StatusBadRequest},
+		{"install duplicate", http.MethodPost, "/v1/native-apps/wechat/install", `{"requestId":"native-request-1","requestId":"native-request-2","acceptedTerms":true}`, http.StatusBadRequest},
+		{"launch unknown", http.MethodPost, "/v1/native-apps/wechat/launch", `{"requestId":"native-request-2","path":"C:\\evil.exe"}`, http.StatusBadRequest},
+		{"launch invalid request id", http.MethodPost, "/v1/native-apps/wechat/launch", `{"requestId":"` + strings.Repeat("x", 129) + `"}`, http.StatusBadRequest},
+		{"install method", http.MethodPut, "/v1/native-apps/wechat/install", "", http.StatusMethodNotAllowed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			platform := &nativePlatform{}
+			h := handlerWithNative(t, runner{ready: false}, cfg, platform)
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, request(test.method, test.path, test.body, cfg))
+			envelope := decodeError(t, recorder)
+			if recorder.Code != test.want || envelope.Error.Code != map[bool]string{true: "METHOD_NOT_ALLOWED", false: "INVALID_REQUEST"}[test.want == http.StatusMethodNotAllowed] {
+				t.Fatalf("response: %d %s", recorder.Code, recorder.Body.String())
+			}
+			if envelope.Error.RequestID != recorder.Header().Get(headerRequestID) {
+				t.Fatalf("invalid request id was reflected: %+v", envelope)
+			}
+			if platform.installCalls != 0 || platform.launchCalls != 0 {
+				t.Fatal("invalid request reached native platform")
+			}
+		})
+	}
+}
+
+func TestNativeWeChatErrorsUseStableSignedHTTPEnvelopes(t *testing.T) {
+	cfg := testConfig(t)
+	tests := []struct {
+		name     string
+		platform *nativePlatform
+		path     string
+		body     string
+		status   int
+		code     string
+	}{
+		{"unsupported", &nativePlatform{launchErr: nativeapp.ErrUnsupported}, "/v1/native-apps/wechat/launch", `{"requestId":"request-1"}`, http.StatusNotImplemented, "NATIVE_APP_UNSUPPORTED"},
+		{"not installed", &nativePlatform{launchErr: nativeapp.ErrNotInstalled}, "/v1/native-apps/wechat/launch", `{"requestId":"request-1"}`, http.StatusConflict, "NATIVE_APP_NOT_INSTALLED"},
+		{"untrusted", &nativePlatform{launchErr: nativeapp.ErrInvalidInstallation}, "/v1/native-apps/wechat/launch", `{"requestId":"request-1"}`, http.StatusUnprocessableEntity, "NATIVE_APP_UNTRUSTED"},
+		{"launch failed", &nativePlatform{launchErr: errors.New("sensitive native failure")}, "/v1/native-apps/wechat/launch", `{"requestId":"request-1"}`, http.StatusBadGateway, "NATIVE_APP_LAUNCH_FAILED"},
+		{"timeout", &nativePlatform{launchErr: context.DeadlineExceeded}, "/v1/native-apps/wechat/launch", `{"requestId":"request-1"}`, http.StatusGatewayTimeout, "NATIVE_APP_TIMEOUT"},
+		{"post install timeout", &nativePlatform{discoveries: []nativeapp.Discovery{{Platform: "windows", State: "not-installed"}}, postInstallErr: context.DeadlineExceeded}, "/v1/native-apps/wechat/install", `{"requestId":"request-1","acceptedTerms":true}`, http.StatusGatewayTimeout, "NATIVE_APP_TIMEOUT"},
+		{"post install cancelled", &nativePlatform{discoveries: []nativeapp.Discovery{{Platform: "windows", State: "not-installed"}}, postInstallErr: context.Canceled}, "/v1/native-apps/wechat/install", `{"requestId":"request-1","acceptedTerms":true}`, 499, "REQUEST_CANCELLED"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := handlerWithNative(t, runner{ready: false}, cfg, test.platform)
+			recorder := httptest.NewRecorder()
+			h.ServeHTTP(recorder, request(http.MethodPost, test.path, test.body, cfg))
+			if recorder.Code != test.status {
+				t.Fatalf("status %d: %s", recorder.Code, recorder.Body.String())
+			}
+			envelope := decodeError(t, recorder)
+			if envelope.Error.Code != test.code || envelope.Error.RequestID != "request-1" || strings.Contains(envelope.Error.Message, "sensitive") {
+				t.Fatalf("unexpected error envelope: %+v", envelope)
+			}
+			if test.code == "REQUEST_CANCELLED" && envelope.Error.Retryable {
+				t.Fatalf("caller cancellation was marked retryable: %+v", envelope)
+			}
+			verifySignedResponse(t, recorder, cfg, "00112233445566778899aabbccddeeff")
+		})
+	}
 }
 
 func TestCanonicalHMACGoldenVectors(t *testing.T) {

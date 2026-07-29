@@ -6,6 +6,7 @@ import {
   Folder,
   Gamepad2,
   LockKeyhole,
+  MessagesSquare,
   Search,
   Settings,
   ShoppingBag,
@@ -15,9 +16,12 @@ import {
 } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import type { NativeApplicationPort, NativeApplicationStatus } from '../../native-apps';
 import { APP_REGISTRY } from '../../system/appRegistry';
 import { useSystemStore } from '../../system/useSystemStore';
 import type { AppId, SystemPreferences, Theme } from '../../system/types';
+import { WECHAT_OFFICIAL_DESTINATIONS } from '../wechat';
+import { commitWeChatProjection, installWeChatTransaction, WECHAT_TERMS_NOTICE } from './weChatInstallation';
 import './AppStoreApp.css';
 
 type StoreCategory = 'all' | 'system' | 'productivity' | 'creative' | 'games' | 'agents';
@@ -43,6 +47,8 @@ export interface AgentLibraryPort {
 
 export interface AppStoreAppProps {
   agentLibrary?: AgentLibraryPort;
+  nativeApplications?: NativeApplicationPort;
+  onOpenApp?: (appId: AppId) => void;
 }
 
 interface StorePermission {
@@ -254,6 +260,28 @@ const LISTINGS: StoreListing[] = [
     updateDate: '2026-07-26',
     appId: 'doudizhu',
   },
+  {
+    id: 'wechat',
+    name: '微信',
+    category: 'productivity',
+    publisher: 'AlSniper OS',
+    tagline: 'Install and launch publisher-verified WeChat through the trusted native host.',
+    description:
+      'AlSniper OS asks its trusted native host to install WeChat, then creates the desktop integration only after the host confirms installed, launchable, and publisher-verified state. Tencent owns the WeChat client, license, accounts, and services.',
+    featuredNote: 'After a verified native installation completes, the green 微信 icon appears on the desktop and launches the real client.',
+    rating: 'Host verified',
+    installs: 'Available',
+    verified: true,
+    capabilities: ['Verified native install', 'Launch real WeChat', 'Tencent and Microsoft official fallbacks'],
+    permissions: [
+      { name: 'Install the native application', scope: 'Explicit Tencent license consent', reason: 'Run the trusted host installer and verify the installed publisher signature before adding a desktop icon.' },
+      { name: 'Launch the native application', scope: 'Exact wechat application identifier', reason: 'Ask the trusted host to start the verified WeChat executable without accepting paths or arguments.' },
+      { name: 'Open official external pages', scope: 'Exact HTTPS allowlist', reason: 'Reach Tencent downloads, Web WeChat, or the Microsoft Store official listing.' },
+    ],
+    execution: 'AlSniper OS trusted native host; the client, license, login, account policy, and messages remain owned by Tencent',
+    updateDate: '2026-07-28',
+    appId: 'wechat',
+  },
 ];
 
 const FALLBACK_LISTING = LISTINGS.find((listing) => listing.id === 'doudizhu')!;
@@ -266,6 +294,7 @@ const LISTING_ICONS: Record<string, ReactNode> = {
   'pulse-canvas': <BadgeCheck size={18} />,
   'cosmic-vanguard': <Gamepad2 size={18} />,
   doudizhu: <Spade size={18} />,
+  wechat: <MessagesSquare size={18} color="#07c160" />,
 };
 
 function agentListing(entry: AgentLibraryEntry): StoreListing {
@@ -292,7 +321,16 @@ function agentListing(entry: AgentLibraryEntry): StoreListing {
   };
 }
 
-export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
+function isTrustedWeChatStatus(status: NativeApplicationStatus | null): boolean {
+  return Boolean(
+    status?.state === 'installed' &&
+    status.installed &&
+    status.launchable &&
+    status.publisherVerified,
+  );
+}
+
+export function AppStoreApp({ agentLibrary, nativeApplications, onOpenApp }: AppStoreAppProps = {}) {
   const preferences = useSystemStore((state) => state.preferences);
   const openApp = useSystemStore((state) => state.openApp);
   const windows = useSystemStore((state) => state.windows);
@@ -306,7 +344,15 @@ export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
   const [selectedId, setSelectedId] = useState<string>(FALLBACK_LISTING.id);
   const [agentOperation, setAgentOperation] = useState<{ readonly listingId: string; readonly label: string } | null>(null);
   const [agentOperationError, setAgentOperationError] = useState<{ readonly listingId: string; readonly message: string } | null>(null);
+  const [wechatTermsAccepted, setWechatTermsAccepted] = useState(false);
+  const [wechatInstallationPending, setWechatInstallationPending] = useState(false);
+  const [wechatInstallationMessage, setWechatInstallationMessage] = useState<{ readonly ok: boolean; readonly message: string } | null>(null);
+  const [nativeWeChatStatus, setNativeWeChatStatus] = useState<NativeApplicationStatus | null>(null);
+  const [nativeWeChatStatusError, setNativeWeChatStatusError] = useState<string | null>(null);
   const agentOperationRef = useRef<string | null>(null);
+  const wechatInstallationRef = useRef(false);
+  const nativeWeChatStatusRequestRef = useRef(0);
+  const requestOpenApp = onOpenApp ?? openApp;
   const allListings = useMemo(
     () => [...LISTINGS, ...(agentLibrary?.entries.map(agentListing) ?? [])],
     [agentLibrary?.entries],
@@ -330,6 +376,31 @@ export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
     }
   }, [filtered, selectedId]);
 
+  useEffect(() => {
+    const requestId = ++nativeWeChatStatusRequestRef.current;
+    if (!nativeApplications) {
+      setNativeWeChatStatus(null);
+      setNativeWeChatStatusError(null);
+      return;
+    }
+
+    const controller = new AbortController();
+    setNativeWeChatStatusError(null);
+    void nativeApplications.getStatus('wechat', { signal: controller.signal }).then(
+      (status) => {
+        if (!controller.signal.aborted && nativeWeChatStatusRequestRef.current === requestId) {
+          setNativeWeChatStatus(status);
+        }
+      },
+      () => {
+        if (controller.signal.aborted || nativeWeChatStatusRequestRef.current !== requestId) return;
+        setNativeWeChatStatus(null);
+        setNativeWeChatStatusError('无法查询微信原生安装状态。');
+      },
+    );
+    return () => controller.abort();
+  }, [nativeApplications]);
+
   const selected = filtered.find((listing) => listing.id === selectedId) ?? allListings.find((listing) => listing.id === selectedId) ?? FALLBACK_LISTING;
   const accent = ACCENT_COLORS[preferences.accent];
 
@@ -345,12 +416,22 @@ export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
     : listing.agentId
       ? agentLibrary?.entries.find((entry) => entry.id === listing.agentId)?.enabled === true
       : false;
-  const canOpen = Boolean(selected.appId && selectedInstallation?.enabled);
+  const trustedNativeWeChat = isTrustedWeChatStatus(nativeWeChatStatus);
+  const canOpen = Boolean(
+    selected.appId &&
+    selectedInstallation?.enabled &&
+    (selected.appId !== 'wechat' || trustedNativeWeChat),
+  );
   const selectedInstalled = isInstalled(selected);
   const selectedEnabled = isEnabled(selected);
   const primarySupported = Boolean(selected.appId || (selected.agentId && agentLibrary));
-  const selectedOperationPending = agentOperation?.listingId === selected.id;
-  const primaryDisabled = selectedOperationPending || !primarySupported || Boolean(selected.agentId && selectedAgent?.installed && selectedAgent.enabled);
+  const selectedOperationPending = agentOperation?.listingId === selected.id || (selected.id === 'wechat' && wechatInstallationPending);
+  const wechatRequiresNativeInstall = selected.id === 'wechat' && !selectedInstallation;
+  const wechatNeedsRepair = selected.id === 'wechat' && Boolean(selectedInstallation) && !trustedNativeWeChat;
+  const primaryDisabled = selectedOperationPending || !primarySupported ||
+    Boolean(selected.agentId && selectedAgent?.installed && selectedAgent.enabled) ||
+    Boolean((wechatRequiresNativeInstall || wechatNeedsRepair) && (!nativeApplications || !wechatTermsAccepted));
+  const selectedOperationLabel = wechatInstallationPending ? 'Installing and verifying…' : agentOperation?.label;
   const isRunning = selected.appId ? Boolean(windows[selected.appId]?.isOpen && !windows[selected.appId]?.isMinimized) : false;
 
   const runAgentOperation = async (listing: StoreListing, label: string, operation: () => void | Promise<unknown>) => {
@@ -374,9 +455,56 @@ export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
   const handlePrimaryAction = async (listing: StoreListing) => {
     if (listing.appId) {
       const installation = appInstallations[listing.appId];
-      if (!installation) installApp(listing.appId);
+      if (listing.appId === 'wechat' && (!installation || !trustedNativeWeChat)) {
+        if (wechatInstallationRef.current) return;
+        wechatInstallationRef.current = true;
+        setWechatInstallationPending(true);
+        setWechatInstallationMessage(null);
+        try {
+          const outcome = await installWeChatTransaction({
+            nativeApplications,
+            acceptedTerms: wechatTermsAccepted,
+            commitLocalInstallation: () => {
+              const currentInstallation = useSystemStore.getState().appInstallations.wechat;
+              return commitWeChatProjection(
+                currentInstallation,
+                () => installApp('wechat'),
+                () => enableApp('wechat'),
+              );
+            },
+          });
+          if (!outcome.ok) {
+            setWechatInstallationMessage({ ok: false, message: outcome.message });
+            return;
+          }
+
+          setWechatTermsAccepted(false);
+          setWechatInstallationMessage({
+            ok: true,
+            message: installation
+              ? '微信已由原生 host 重新安装并验证，AlSniper OS 桌面集成已修复且启用。'
+              : '微信已由原生 host 安装并验证，桌面图标已创建。双击图标即可启动真实微信客户端。',
+          });
+          const requestId = ++nativeWeChatStatusRequestRef.current;
+          try {
+            const status = await nativeApplications!.getStatus('wechat');
+            if (nativeWeChatStatusRequestRef.current === requestId) {
+              setNativeWeChatStatus(status);
+              setNativeWeChatStatusError(null);
+            }
+          } catch {
+            if (nativeWeChatStatusRequestRef.current === requestId) {
+              setNativeWeChatStatusError('安装已完成，但重新查询原生状态失败。');
+            }
+          }
+        } finally {
+          wechatInstallationRef.current = false;
+          setWechatInstallationPending(false);
+        }
+      }
+      else if (!installation) installApp(listing.appId);
       else if (!installation.enabled) enableApp(listing.appId);
-      else openApp(listing.appId);
+      else requestOpenApp(listing.appId);
       return;
     }
     if (listing.agentId && agentLibrary) {
@@ -392,7 +520,15 @@ export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
   };
 
   const handleUninstall = async (listing: StoreListing) => {
-    if (listing.appId) uninstallApp(listing.appId);
+    if (listing.appId) {
+      uninstallApp(listing.appId);
+      if (listing.appId === 'wechat') {
+        setWechatInstallationMessage({
+          ok: true,
+          message: '已移除 AlSniper OS 的微信桌面集成；此操作不会卸载由腾讯提供的微信客户端。',
+        });
+      }
+    }
     else if (listing.agentId && agentLibrary) await runAgentOperation(listing, 'Uninstall', () => agentLibrary.uninstall(listing.agentId!));
   };
 
@@ -585,7 +721,23 @@ export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
               const enabled = isEnabled(listing);
               const actionable = Boolean(listing.appId || (listing.agentId && agentLibrary));
               const active = selected.id === listing.id;
-              const statusLabel = installed ? (enabled ? 'Enabled' : 'Disabled') : actionable ? 'Available' : 'Catalog only';
+              const statusLabel = listing.id === 'wechat'
+                ? installed
+                  ? !nativeApplications
+                    ? 'Host unavailable'
+                    : nativeWeChatStatusError
+                      ? 'Status unavailable'
+                      : nativeWeChatStatus === null
+                        ? 'Verifying…'
+                        : trustedNativeWeChat
+                          ? enabled ? 'Verified' : 'Disabled'
+                          : 'Needs repair'
+                  : !nativeApplications
+                    ? 'Host required'
+                    : nativeWeChatStatusError
+                      ? 'Host unavailable'
+                      : 'Available'
+                : installed ? (enabled ? 'Enabled' : 'Disabled') : actionable ? 'Available' : 'Catalog only';
 
               return (
                 <button
@@ -653,7 +805,7 @@ export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
                       {listing.verified ? (
                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, color: MUTED[preferences.theme] }}>
                           <BadgeCheck size={13} />
-                          Verified
+                          {listing.id === 'wechat' ? 'AlSniper OS listing' : 'Verified'}
                         </span>
                       ) : null}
                     </div>
@@ -734,6 +886,99 @@ export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
             </div>
 
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              {selected.id === 'wechat' && (!selectedInstalled || wechatNeedsRepair) ? (
+                nativeApplications ? (
+                  <div
+                    style={{
+                      display: 'grid',
+                      flexBasis: '100%',
+                      gap: 10,
+                      padding: 14,
+                      borderRadius: 16,
+                      border: `1px solid ${BORDER[preferences.theme]}`,
+                      color: TEXT_COLOR[preferences.theme],
+                      fontSize: 13.5,
+                      lineHeight: 1.55,
+                    }}
+                  >
+                    <label style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
+                      <input
+                        type="checkbox"
+                        checked={wechatTermsAccepted}
+                        disabled={wechatInstallationPending}
+                        onChange={(event) => {
+                          setWechatTermsAccepted(event.target.checked);
+                          setWechatInstallationMessage(null);
+                        }}
+                      />
+                      <span>
+                        {WECHAT_TERMS_NOTICE} 只有勾选后才会请求原生 host
+                        {wechatNeedsRepair ? '重新安装、验证并修复本地集成。' : '安装。'}
+                      </span>
+                    </label>
+                    <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', paddingLeft: 24 }}>
+                      <a
+                        href={WECHAT_OFFICIAL_DESTINATIONS.license.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ color: TEXT_COLOR[preferences.theme], fontWeight: 700 }}
+                      >
+                        阅读腾讯官方许可协议
+                      </a>
+                      <a
+                        href={WECHAT_OFFICIAL_DESTINATIONS.privacy.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        style={{ color: TEXT_COLOR[preferences.theme], fontWeight: 700 }}
+                      >
+                        阅读腾讯官方隐私指引
+                      </a>
+                    </div>
+                  </div>
+                ) : !selectedInstalled ? (
+                  <div role="alert" style={{ flexBasis: '100%', color: '#ef4444', fontSize: 13.5, lineHeight: 1.6 }}>
+                    当前浏览器未连接 AlSniper OS 原生 host，不能真实安装微信，也不会创建桌面图标。
+                    请改用腾讯官网或 Microsoft Store 官方入口。
+                  </div>
+                ) : null
+              ) : null}
+              {selected.id === 'wechat' && !selectedInstalled && nativeWeChatStatusError ? (
+                <div role="alert" style={{ flexBasis: '100%', color: '#ef4444', fontSize: 13.5, lineHeight: 1.6 }}>
+                  已配置原生应用通道，但无法通过 AlSniper OS sidecar 查询微信状态。
+                  可在同意协议后重试安装；若仍失败，请使用下方官方入口。
+                </div>
+              ) : null}
+              {selected.id === 'wechat' && selectedInstalled && !trustedNativeWeChat ? (
+                <div role="alert" style={{ flexBasis: '100%', color: '#ef4444', fontSize: 13.5, lineHeight: 1.6 }}>
+                  {!nativeApplications
+                    ? '原生 host 当前不可用，无法将本地桌面记录作为真实微信安装证据。本地记录已保留，请恢复 host 后重试。'
+                    : nativeWeChatStatusError
+                      ? `无法验证原生微信状态：${nativeWeChatStatusError}。本地记录已保留。`
+                      : nativeWeChatStatus === null
+                        ? '正在通过原生 host 验证微信安装状态…'
+                        : '原生 host 未确认微信同时满足已安装、可启动与发布者签名已验证。本地记录已保留，但不会显示为可信安装。'}
+                </div>
+              ) : null}
+              {selected.id === 'wechat' && (!nativeApplications || nativeWeChatStatusError || wechatNeedsRepair) ? (
+                <div style={{ display: 'flex', flexBasis: '100%', gap: 10, flexWrap: 'wrap' }}>
+                  <a
+                    href={WECHAT_OFFICIAL_DESTINATIONS.windows.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ color: TEXT_COLOR[preferences.theme], fontWeight: 700 }}
+                  >
+                    腾讯官方 Windows 下载
+                  </a>
+                  <a
+                    href={WECHAT_OFFICIAL_DESTINATIONS.microsoftStore.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{ color: TEXT_COLOR[preferences.theme], fontWeight: 700 }}
+                  >
+                    Microsoft Store 官方入口
+                  </a>
+                </div>
+              ) : null}
               <button
                 type="button"
                 onClick={() => { void handlePrimaryAction(selected); }}
@@ -754,9 +999,17 @@ export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
               >
                 {selectedOperationPending ? <Clock3 size={16} /> : canOpen ? <ArrowRight size={16} /> : <Download size={16} />}
                 {selectedOperationPending
-                  ? agentOperation.label
+                  ? selectedOperationLabel
                   : canOpen
                   ? 'Open'
+                  : wechatRequiresNativeInstall && !nativeApplications
+                    ? 'Native host required'
+                  : wechatRequiresNativeInstall && !wechatTermsAccepted
+                    ? 'Accept terms to install'
+                  : wechatNeedsRepair && !nativeApplications
+                    ? 'Native host required'
+                  : wechatNeedsRepair
+                    ? wechatTermsAccepted ? 'Repair & verify' : 'Accept terms to repair'
                   : selectedInstalled && !selectedEnabled
                     ? 'Enable'
                     : selected.agentId && selectedEnabled
@@ -792,7 +1045,7 @@ export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
                     background: 'transparent', color: MUTED[preferences.theme], fontWeight: 700, cursor: 'pointer',
                   }}
                 >
-                  Uninstall
+                  {selected.appId === 'wechat' ? 'Remove from AlSniper OS' : 'Uninstall'}
                 </button>
               ) : null}
               {isRunning ? (
@@ -819,7 +1072,17 @@ export function AppStoreApp({ agentLibrary }: AppStoreAppProps = {}) {
               </div>
             ) : selectedOperationPending ? (
               <div role="status" aria-live="polite" style={{ color: MUTED[preferences.theme], fontSize: 13.5 }}>
-                {agentOperation.label} in progress…
+                {selectedOperationLabel} in progress…
+              </div>
+            ) : null}
+
+            {selected.id === 'wechat' && wechatInstallationMessage ? (
+              <div
+                role={wechatInstallationMessage.ok ? 'status' : 'alert'}
+                aria-live="polite"
+                style={{ color: wechatInstallationMessage.ok ? TEXT_COLOR[preferences.theme] : '#ef4444', fontSize: 13.5, lineHeight: 1.55 }}
+              >
+                {wechatInstallationMessage.message}
               </div>
             ) : null}
 

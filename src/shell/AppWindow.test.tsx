@@ -12,6 +12,7 @@ const app: AppDefinition = {
   defaultSize: { width: 720, height: 520 },
   defaultPosition: { x: 80, y: 90 },
   version: '1.0.0',
+  defaultInstallation: 'preinstalled',
   protectedSystemApp: true,
 };
 

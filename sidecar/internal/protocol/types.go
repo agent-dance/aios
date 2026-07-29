@@ -67,6 +67,101 @@ type HealthCheck struct {
 	Message string `json:"message"`
 }
 
+type NativeAppStatusResponse struct {
+	ProtocolVersion   string `json:"protocolVersion"`
+	AppID             string `json:"appId"`
+	Platform          string `json:"platform"`
+	State             string `json:"state"`
+	Installed         bool   `json:"installed"`
+	Launchable        bool   `json:"launchable"`
+	PublisherVerified bool   `json:"publisherVerified"`
+	Version           string `json:"version,omitempty"`
+}
+
+type NativeAppInstallRequest struct {
+	RequestID     string `json:"requestId"`
+	AcceptedTerms bool   `json:"acceptedTerms"`
+}
+
+type NativeAppLaunchRequest struct {
+	RequestID string `json:"requestId"`
+}
+
+type NativeAppOperationResponse struct {
+	ProtocolVersion   string `json:"protocolVersion"`
+	RequestID         string `json:"requestId"`
+	AppID             string `json:"appId"`
+	Operation         string `json:"operation"`
+	Code              string `json:"code"`
+	Changed           bool   `json:"changed"`
+	Installed         bool   `json:"installed"`
+	Launchable        bool   `json:"launchable"`
+	PublisherVerified bool   `json:"publisherVerified"`
+	Version           string `json:"version"`
+	ReceiptID         string `json:"receiptId"`
+}
+
+func (r NativeAppInstallRequest) Validate() error {
+	if err := validateID("requestId", r.RequestID); err != nil {
+		return err
+	}
+	if !r.AcceptedTerms {
+		return errors.New("acceptedTerms must be true")
+	}
+	return nil
+}
+
+func (r NativeAppLaunchRequest) Validate() error {
+	return validateID("requestId", r.RequestID)
+}
+
+func (r NativeAppStatusResponse) Validate() error {
+	if r.ProtocolVersion != Version || r.AppID != "wechat" {
+		return errors.New("invalid native app status identity")
+	}
+	switch {
+	case r.Platform == "windows" && r.State == "installed":
+		if !r.Installed || !r.Launchable || !r.PublisherVerified {
+			return errors.New("installed native app status is inconsistent")
+		}
+		return bounded("version", r.Version, 1, 128)
+	case r.Platform == "windows" && (r.State == "not-installed" || r.State == "invalid"):
+	case r.Platform == "unsupported" && r.State == "unsupported":
+	default:
+		return errors.New("invalid native app platform or state")
+	}
+	if r.Installed || r.Launchable || r.PublisherVerified || r.Version != "" {
+		return errors.New("unavailable native app status is inconsistent")
+	}
+	return nil
+}
+
+func (r NativeAppOperationResponse) Validate() error {
+	if r.ProtocolVersion != Version || r.AppID != "wechat" {
+		return errors.New("invalid native app operation identity")
+	}
+	if err := validateID("requestId", r.RequestID); err != nil {
+		return err
+	}
+	if err := validateID("receiptId", r.ReceiptID); err != nil {
+		return err
+	}
+	if !r.Installed || !r.Launchable || !r.PublisherVerified {
+		return errors.New("native app operation result is inconsistent")
+	}
+	if err := bounded("version", r.Version, 1, 128); err != nil {
+		return err
+	}
+	switch {
+	case r.Operation == "install" && r.Code == "installed" && r.Changed:
+	case r.Operation == "install" && r.Code == "already-installed" && !r.Changed:
+	case r.Operation == "launch" && r.Code == "launched" && !r.Changed:
+	default:
+		return errors.New("invalid native app operation result")
+	}
+	return nil
+}
+
 type ChatRequest struct {
 	RequestID string             `json:"requestId"`
 	ThreadID  string             `json:"threadId"`
@@ -317,6 +412,54 @@ func DecodeStrict(data []byte, dst any) error {
 		return err
 	}
 	return nil
+}
+
+func DecodeStrictObject(data []byte, dst any, allowedKeys ...string) error {
+	allowed := make(map[string]struct{}, len(allowedKeys))
+	for _, key := range allowedKeys {
+		if _, duplicate := allowed[key]; duplicate || key == "" {
+			return errors.New("allowed JSON property list is invalid")
+		}
+		allowed[key] = struct{}{}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return errors.New("JSON value must be an object")
+	}
+	seen := make(map[string]struct{}, len(allowedKeys))
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return errors.New("JSON object property name is invalid")
+		}
+		if _, ok := allowed[key]; !ok {
+			return fmt.Errorf("unknown JSON property %q", key)
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return fmt.Errorf("duplicate JSON property %q", key)
+		}
+		seen[key] = struct{}{}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return err
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return errors.New("JSON object is not closed")
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values are not allowed")
+		}
+		return err
+	}
+	return json.Unmarshal(data, dst)
 }
 
 func (r ChatRequest) Validate() error {

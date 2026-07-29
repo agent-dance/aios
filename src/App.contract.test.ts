@@ -20,3 +20,14 @@ describe('OS game runtime composition', () => {
     expect(MAIN_SOURCE).toContain("openApp('space-game')");
   });
 });
+
+describe('native WeChat composition', () => {
+  it('injects the native application port into install and launch surfaces', () => {
+    expect(APP_SOURCE).toContain('nativeApplications={agentRuntime.nativeApplications}');
+    expect(APP_SOURCE).toContain('createApplicationLaunchRouter({');
+    expect(APP_SOURCE).toContain('isLocallyLaunchable: isAppLaunchable');
+    expect(APP_SOURCE).toContain('openFallback: openApp');
+    expect(APP_SOURCE).toContain('onOpenApp={handleOpenApp}');
+    expect(APP_SOURCE).toContain('void appLaunchRouter(appId);');
+  });
+});

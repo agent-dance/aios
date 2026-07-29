@@ -32,6 +32,8 @@ export function DesktopIcon({ app, icon, selected = false, onSelect, onOpen, cla
     <button
       type="button"
       aria-label={`Open ${app.name}`}
+      data-app-id={app.id}
+      data-desktop-icon="true"
       className={className}
       onClick={onSelect}
       onDoubleClick={onOpen}

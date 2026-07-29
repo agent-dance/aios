@@ -28,7 +28,7 @@ func classifyAgentError(err error) agentErrorResponse {
 	case errors.Is(err, context.DeadlineExceeded):
 		return agentErrorResponse{http.StatusGatewayTimeout, protocol.AgentDebugFailureBody{Code: "AGENT_TIMEOUT", Message: "The Agent did not finish before the deadline.", Retryable: true}}
 	case errors.Is(err, context.Canceled):
-		return agentErrorResponse{499, protocol.AgentDebugFailureBody{Code: "REQUEST_CANCELLED", Message: "The request was cancelled.", Retryable: true}}
+		return agentErrorResponse{499, protocol.AgentDebugFailureBody{Code: "REQUEST_CANCELLED", Message: "The request was cancelled.", Retryable: false}}
 	case errors.Is(err, agent.ErrAuthentication):
 		return agentErrorResponse{http.StatusServiceUnavailable, protocol.AgentDebugFailureBody{
 			Code: "AGENT_AUTH_REQUIRED", Message: "Codex authentication was rejected. Run codex login, then retry; the runtime reconnects automatically.", Retryable: false,

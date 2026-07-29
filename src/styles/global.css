@@ -51,6 +51,21 @@ button, [role='button'] { -webkit-tap-highlight-color: transparent; }
 .alsniper-os, .desktop-shell { width: 100%; height: 100%; }
 .desktop-shell { isolation: isolate; }
 
+.alsniper-desktop-icons--adaptive {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 88px;
+  grid-template-rows: repeat(auto-fill, minmax(104px, 1fr));
+  align-content: start;
+  justify-content: start;
+  gap: 4px 8px;
+  scrollbar-width: thin;
+}
+
+.alsniper-desktop-icons--adaptive > .alsniper-desktop-icon {
+  align-self: start;
+}
+
 .brand-lockup {
   display: inline-flex;
   align-items: center;
@@ -161,7 +176,16 @@ button, [role='button'] { -webkit-tap-highlight-color: transparent; }
   .menu-clock-label { display: none; }
   .brand-lockup > span:last-child { display: none; }
   .desktop-watermark { display: none; }
-  .alsniper-desktop-icon { transform: scale(.88); transform-origin: top left; }
+  .alsniper-desktop-icons--adaptive {
+    grid-auto-columns: 80px;
+    grid-template-rows: repeat(auto-fill, minmax(96px, 1fr));
+    gap: 2px 4px;
+  }
+  .alsniper-desktop-icons--adaptive > .alsniper-desktop-icon {
+    width: 80px !important;
+    transform: scale(.88);
+    transform-origin: top center;
+  }
 }
 
 @media (max-width: 900px) {
@@ -182,7 +206,6 @@ button, [role='button'] { -webkit-tap-highlight-color: transparent; }
 }
 
 @media (max-height: 780px) {
-  .alsniper-desktop-icon { display: none !important; }
   .calculator-main { padding: 14px !important; gap: 12px !important; }
   .calculator-display > div { padding: 12px !important; }
   .calculator-display > div p:last-child { margin-top: 6px !important; font-size: 36px !important; }

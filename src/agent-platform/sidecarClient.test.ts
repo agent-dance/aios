@@ -13,6 +13,11 @@ import {
   createSidecarClient,
   SidecarClientError,
   validateGameDecisionRequest,
+  validateNativeApplicationInstallRequest,
+  validateNativeApplicationInstallResult,
+  validateNativeApplicationLaunchRequest,
+  validateNativeApplicationLaunchResult,
+  validateNativeApplicationStatus,
 } from './sidecarClient';
 
 const SECRET = 'x'.repeat(32);
@@ -563,5 +568,214 @@ describe('sidecar client', () => {
       context: { osRevision: 0, systemStatus: { ...validStatus, ...statusPatch } },
     } as ChatRequest)).rejects.toMatchObject({ code: 'SIDECAR_CONFIG_INVALID' });
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('uses the authenticated transport and exact wire contracts for native application operations', async () => {
+    const operationBodies: unknown[] = [];
+    const requestedUrls: string[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = String(input);
+      requestedUrls.push(url);
+      const headers = new Headers(init?.headers);
+      const path = new URL(url).pathname;
+      const method = init?.method ?? 'GET';
+      const body = init?.body === undefined ? '' : String(init.body);
+      expect(headers.get('x-aios-signature')).toBe(await signature(canonicalSidecarRequest(
+        method,
+        'http://127.0.0.1:43127',
+        path,
+        'http://localhost:5173',
+        AIOS_AGENT_PROTOCOL_VERSION,
+        headers.get('x-aios-timestamp') ?? '',
+        headers.get('x-aios-nonce') ?? '',
+        await digest(body),
+      )));
+      if (path.endsWith('/status')) {
+        expect(method).toBe('GET');
+        expect(body).toBe('');
+        return signedResponse(init, {
+          protocolVersion: '1.0.0',
+          appId: 'wechat',
+          platform: 'windows',
+          state: 'not-installed',
+          installed: false,
+          launchable: false,
+          publisherVerified: false,
+        });
+      }
+      expect(method).toBe('POST');
+      expect(headers.get('content-type')).toBe('application/json');
+      operationBodies.push(JSON.parse(body) as unknown);
+      if (path.endsWith('/install')) return signedResponse(init, {
+        protocolVersion: '1.0.0',
+        requestId: 'native-install-1',
+        appId: 'wechat',
+        operation: 'install',
+        code: 'installed',
+        changed: true,
+        installed: true,
+        launchable: true,
+        publisherVerified: true,
+        version: '3.9.12.51',
+        receiptId: 'receipt-install-1',
+      });
+      return signedResponse(init, {
+        protocolVersion: '1.0.0',
+        requestId: 'native-launch-1',
+        appId: 'wechat',
+        operation: 'launch',
+        code: 'launched',
+        changed: false,
+        installed: true,
+        launchable: true,
+        publisherVerified: true,
+        version: '3.9.12.51',
+        receiptId: 'receipt-launch-1',
+      });
+    };
+    const client = createSidecarClient(config(fetcher));
+
+    await expect(client.nativeApplicationStatus('wechat')).resolves.toMatchObject({ state: 'not-installed' });
+    await expect(client.installNativeApplication('wechat', {
+      requestId: 'native-install-1', acceptedTerms: true,
+    })).resolves.toMatchObject({ operation: 'install', code: 'installed', changed: true });
+    await expect(client.launchNativeApplication('wechat', {
+      requestId: 'native-launch-1',
+    })).resolves.toMatchObject({ operation: 'launch', code: 'launched', changed: false });
+    expect(operationBodies).toEqual([
+      { requestId: 'native-install-1', acceptedTerms: true },
+      { requestId: 'native-launch-1' },
+    ]);
+    expect(requestedUrls).toEqual([
+      'http://127.0.0.1:43127/v1/native-apps/wechat/status',
+      'http://127.0.0.1:43127/v1/native-apps/wechat/install',
+      'http://127.0.0.1:43127/v1/native-apps/wechat/launch',
+    ]);
+  });
+
+  it('enforces exact keys and cross-field invariants for native application responses', () => {
+    const unavailable = {
+      protocolVersion: '1.0.0', appId: 'wechat', platform: 'windows', state: 'not-installed',
+      installed: false, launchable: false, publisherVerified: false,
+    };
+    expect(validateNativeApplicationStatus(unavailable)).toEqual(unavailable);
+    expect(validateNativeApplicationStatus({
+      ...unavailable,
+      state: 'invalid',
+    })).toMatchObject({ platform: 'windows', state: 'invalid', installed: false });
+    expect(validateNativeApplicationStatus({
+      ...unavailable,
+      platform: 'unsupported',
+      state: 'unsupported',
+    })).toMatchObject({ platform: 'unsupported', state: 'unsupported', installed: false });
+    expect(validateNativeApplicationStatus({
+      ...unavailable,
+      state: 'installed',
+      installed: true,
+      launchable: true,
+      publisherVerified: true,
+      version: '3.9.12.51',
+    })).toMatchObject({ state: 'installed', version: '3.9.12.51' });
+    expect(() => validateNativeApplicationStatus({
+      ...unavailable,
+      state: 'installed', installed: true, launchable: true, publisherVerified: true, version: 'x'.repeat(129),
+    })).toThrow();
+    expect(() => validateNativeApplicationStatus({
+      ...unavailable,
+      state: 'installed', installed: true, launchable: true, publisherVerified: true, version: '   ',
+    })).toThrow();
+    expect(() => validateNativeApplicationStatus({ ...unavailable, version: 'forged' })).toThrow();
+    expect(() => validateNativeApplicationStatus({ ...unavailable, launchable: true })).toThrow();
+    expect(() => validateNativeApplicationStatus({ ...unavailable, diagnostic: 'secret' })).toThrow();
+    expect(() => validateNativeApplicationStatus({ ...unavailable, platform: 'unsupported' })).toThrow();
+    expect(() => validateNativeApplicationStatus({ ...unavailable, protocolVersion: '2.0.0' })).toThrow();
+    expect(() => validateNativeApplicationStatus({ ...unavailable, appId: 'other' })).toThrow();
+    for (const requiredKey of [
+      'protocolVersion', 'appId', 'platform', 'state', 'installed', 'launchable', 'publisherVerified',
+    ]) {
+      const missing = { ...unavailable } as Record<string, unknown>;
+      delete missing[requiredKey];
+      expect(() => validateNativeApplicationStatus(missing), `missing status key ${requiredKey}`).toThrow();
+    }
+
+    const receipt = {
+      protocolVersion: '1.0.0', requestId: 'native-install-1', appId: 'wechat', operation: 'install',
+      code: 'already-installed', changed: false, installed: true, launchable: true, publisherVerified: true,
+      version: '3.9.12.51', receiptId: 'receipt-install-1',
+    };
+    expect(validateNativeApplicationInstallResult(receipt)).toEqual(receipt);
+    expect(() => validateNativeApplicationInstallResult({ ...receipt, changed: true })).toThrow();
+    expect(() => validateNativeApplicationInstallResult({ ...receipt, code: 'launched' })).toThrow();
+    expect(() => validateNativeApplicationInstallResult({ ...receipt, operation: 'launch' })).toThrow();
+    expect(() => validateNativeApplicationInstallResult({ ...receipt, publisherVerified: false })).toThrow();
+    expect(() => validateNativeApplicationInstallResult({ ...receipt, extra: true })).toThrow();
+    expect(() => validateNativeApplicationInstallResult({ ...receipt, requestId: 'invalid request' })).toThrow();
+    expect(() => validateNativeApplicationInstallResult({ ...receipt, receiptId: '' })).toThrow();
+    expect(() => validateNativeApplicationInstallResult({ ...receipt, version: '' })).toThrow();
+    expect(() => validateNativeApplicationInstallResult({ ...receipt, version: '   ' })).toThrow();
+    for (const requiredKey of [
+      'protocolVersion', 'requestId', 'appId', 'operation', 'code', 'changed', 'installed', 'launchable',
+      'publisherVerified', 'version', 'receiptId',
+    ]) {
+      const missing = { ...receipt } as Record<string, unknown>;
+      delete missing[requiredKey];
+      expect(() => validateNativeApplicationInstallResult(missing), `missing operation key ${requiredKey}`).toThrow();
+    }
+
+    const launchReceipt = {
+      ...receipt,
+      requestId: 'native-launch-1',
+      operation: 'launch',
+      code: 'launched',
+      receiptId: 'receipt-launch-1',
+    };
+    expect(validateNativeApplicationLaunchResult(launchReceipt)).toEqual(launchReceipt);
+    expect(() => validateNativeApplicationLaunchResult({ ...launchReceipt, operation: 'install' })).toThrow();
+    expect(() => validateNativeApplicationLaunchResult({ ...launchReceipt, changed: true })).toThrow();
+  });
+
+  it('rejects invalid native commands, mismatched receipts, and operation-specific timeout escalation', async () => {
+    expect(() => validateNativeApplicationInstallRequest({ requestId: 'native-install-1', acceptedTerms: false })).toThrow();
+    expect(() => validateNativeApplicationInstallRequest({
+      requestId: 'native-install-1', acceptedTerms: true, extra: true,
+    })).toThrow();
+    expect(() => validateNativeApplicationInstallRequest({ acceptedTerms: true })).toThrow();
+    expect(() => validateNativeApplicationInstallRequest({ requestId: 'invalid request', acceptedTerms: true })).toThrow();
+    expect(() => validateNativeApplicationLaunchRequest({ requestId: 'native-launch-1', extra: true })).toThrow();
+    expect(() => validateNativeApplicationLaunchRequest({})).toThrow();
+    expect(() => validateNativeApplicationLaunchRequest({ requestId: 'invalid request' })).toThrow();
+
+    const mismatch = createSidecarClient(config(respond({
+      protocolVersion: '1.0.0', requestId: 'other-request', appId: 'wechat', operation: 'install',
+      code: 'already-installed', changed: false, installed: true, launchable: true, publisherVerified: true,
+      version: '3.9.12.51', receiptId: 'receipt-install-1',
+    })));
+    await expect(mismatch.installNativeApplication('wechat', {
+      requestId: 'native-install-1', acceptedTerms: true,
+    })).rejects.toMatchObject({ code: 'SIDECAR_INVALID_RESPONSE' });
+
+    const invalidFetcher = vi.fn<typeof fetch>();
+    const client = createSidecarClient(config(invalidFetcher));
+    await expect(client.installNativeApplication('wechat', {
+      requestId: 'native-install-1', acceptedTerms: false,
+    } as never)).rejects.toMatchObject({ code: 'SIDECAR_CONFIG_INVALID' });
+    await expect(client.launchNativeApplication('wechat', {
+      requestId: 'native-launch-1', extra: true,
+    } as never)).rejects.toMatchObject({ code: 'SIDECAR_CONFIG_INVALID' });
+    await expect(client.launchNativeApplication('wechat', {
+      requestId: 'invalid request',
+    } as never)).rejects.toMatchObject({ code: 'SIDECAR_CONFIG_INVALID' });
+    await expect(client.nativeApplicationStatus('other' as never))
+      .rejects.toMatchObject({ code: 'SIDECAR_CONFIG_INVALID' });
+    expect(invalidFetcher).not.toHaveBeenCalled();
+    await expect(client.nativeApplicationStatus('wechat', { timeoutMs: 10_001 }))
+      .rejects.toMatchObject({ code: 'SIDECAR_CONFIG_INVALID' });
+    await expect(client.launchNativeApplication('wechat', { requestId: 'native-launch-1' }, { timeoutMs: 30_001 }))
+      .rejects.toMatchObject({ code: 'SIDECAR_CONFIG_INVALID' });
+    await expect(client.installNativeApplication(
+      'wechat',
+      { requestId: 'native-install-1', acceptedTerms: true },
+      { timeoutMs: 600_001 },
+    )).rejects.toMatchObject({ code: 'SIDECAR_CONFIG_INVALID' });
   });
 });

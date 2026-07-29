@@ -1,12 +1,13 @@
 import type { ReactNode, RefObject } from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { APP_REGISTRY, DOCK_APPS } from '../system/appRegistry';
-import type { AppId, SystemStatusModel, WindowState } from '../system/types';
+import type { AppId, AppInstallation, SystemStatusModel, WindowState } from '../system/types';
 import { useSystemStore } from '../system/useSystemStore';
 import { AppWindow } from './AppWindow';
 import { ClockPanel } from './ClockPanel';
 import { ControlCenter } from './ControlCenter';
 import { DesktopIcon } from './DesktopIcon';
+import { getDefaultDesktopIcons } from './desktopProjection';
 import { Dock } from './Dock';
 import { MenuBar } from './MenuBar';
 import type {
@@ -25,6 +26,15 @@ export interface DesktopShellProps extends ShellSurfaceProps {
   assistant?: ReactNode;
   brand?: ReactNode;
   desktopIcons?: DesktopIconDefinition[];
+  onOpenApp?: (appId: AppId) => void;
+}
+
+export interface DesktopIconsProps {
+  appInstallations: Partial<Record<AppId, AppInstallation>>;
+  desktopIcons?: DesktopIconDefinition[];
+  selectedAppId: AppId | null;
+  onSelect: (appId: AppId | null) => void;
+  onOpen: (appId: AppId) => void;
 }
 
 const MENU_BAR_HEIGHT = 68;
@@ -38,6 +48,62 @@ const DEFAULT_FOCUS: FocusSession = {
   durationMinutes: 50,
   startedAt: null,
 };
+
+export function DesktopIcons({
+  appInstallations,
+  desktopIcons,
+  selectedAppId,
+  onSelect,
+  onOpen,
+}: DesktopIconsProps) {
+  const customDesktopLayout = desktopIcons !== undefined;
+  const visibleDesktopIcons = useMemo<DesktopIconDefinition[]>(
+    () => (desktopIcons ?? getDefaultDesktopIcons(appInstallations))
+      .filter((icon) => appInstallations[icon.appId]?.enabled === true),
+    [appInstallations, desktopIcons],
+  );
+
+  return (
+    <div
+      role="presentation"
+      data-desktop-icons="true"
+      data-layout={customDesktopLayout ? 'custom' : 'adaptive'}
+      className={customDesktopLayout ? 'alsniper-desktop-icons--custom' : 'alsniper-desktop-icons--adaptive'}
+      onPointerDown={() => onSelect(null)}
+      style={customDesktopLayout
+        ? { position: 'absolute', inset: 0, zIndex: 1 }
+        : {
+            position: 'absolute',
+            top: MENU_BAR_HEIGHT + 8,
+            right: 16,
+            bottom: DOCK_HEIGHT,
+            left: 16,
+            zIndex: 1,
+            overflow: 'auto',
+          }}
+    >
+      {visibleDesktopIcons.map((icon) => {
+        const app = APP_REGISTRY[icon.appId];
+        const position = icon.position ?? { x: 28, y: 92 };
+        return (
+          <DesktopIcon
+            key={icon.appId}
+            app={app}
+            icon={icon}
+            selected={selectedAppId === icon.appId}
+            onSelect={() => onSelect(icon.appId)}
+            onOpen={() => {
+              onSelect(icon.appId);
+              onOpen(icon.appId);
+            }}
+            style={customDesktopLayout ? { position: 'absolute', left: position.x, top: position.y } : undefined}
+            className="alsniper-desktop-icon"
+          />
+        );
+      })}
+    </div>
+  );
+}
 
 interface ClockSurfacesProps {
   brand?: ReactNode;
@@ -118,7 +184,7 @@ function ClockSurfaces({
   );
 }
 
-export function DesktopShell({ appContents = {}, children, assistant, brand, desktopIcons, className, style }: DesktopShellProps) {
+export function DesktopShell({ appContents = {}, children, assistant, brand, desktopIcons, onOpenApp, className, style }: DesktopShellProps) {
   const shellRef = useRef<HTMLDivElement | null>(null);
   const controlCenterRef = useRef<HTMLDivElement | null>(null);
   const controlCenterButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -143,6 +209,7 @@ export function DesktopShell({ appContents = {}, children, assistant, brand, des
   const setClockOpen = useSystemStore((state) => state.setClockOpen);
   const updatePreferences = useSystemStore((state) => state.updatePreferences);
   const updateSystemStatus = useSystemStore((state) => state.updateSystemStatus);
+  const requestOpenApp = onOpenApp ?? openApp;
 
   const [selectedDesktopAppId, setSelectedDesktopAppId] = useState<AppId | null>(null);
   const [viewport, setViewport] = useState<ShellViewport>({
@@ -212,19 +279,6 @@ export function DesktopShell({ appContents = {}, children, assistant, brand, des
   );
 
   const effectiveActiveAppId = activeAppId ?? visibleWindowStates.at(-1)?.appId ?? null;
-
-  const visibleDesktopIcons = useMemo<DesktopIconDefinition[]>(
-    () =>
-      (desktopIcons ??
-      DOCK_APPS.map((appId, index) => ({
-        appId,
-        position: {
-          x: 28 + Math.floor(index / 5) * 104,
-          y: 92 + (index % 5) * 116,
-        },
-      }))).filter((icon) => appInstallations[icon.appId]?.enabled === true),
-    [appInstallations, desktopIcons],
-  );
 
   const activeAppName = effectiveActiveAppId ? APP_REGISTRY[effectiveActiveAppId].name : undefined;
 
@@ -317,31 +371,13 @@ export function DesktopShell({ appContents = {}, children, assistant, brand, des
         clockPanelRef={clockPanelRef}
       />
 
-      <div
-        role="presentation"
-        onPointerDown={() => setSelectedDesktopAppId(null)}
-        style={{ position: 'absolute', inset: 0, zIndex: 1 }}
-      >
-        {visibleDesktopIcons.map((icon) => {
-          const app = APP_REGISTRY[icon.appId];
-          const position = icon.position ?? { x: 28, y: 92 };
-          return (
-            <DesktopIcon
-              key={icon.appId}
-              app={app}
-              icon={icon}
-              selected={selectedDesktopAppId === icon.appId}
-              onSelect={() => setSelectedDesktopAppId(icon.appId)}
-              onOpen={() => {
-                setSelectedDesktopAppId(icon.appId);
-                openApp(icon.appId);
-              }}
-              style={{ position: 'absolute', left: position.x, top: position.y }}
-              className="alsniper-desktop-icon"
-            />
-          );
-        })}
-      </div>
+      <DesktopIcons
+        appInstallations={appInstallations}
+        desktopIcons={desktopIcons}
+        selectedAppId={selectedDesktopAppId}
+        onSelect={setSelectedDesktopAppId}
+        onOpen={requestOpenApp}
+      />
 
       {mountedWindowStates.map((windowState) => {
         const app = APP_REGISTRY[windowState.appId];
@@ -384,7 +420,7 @@ export function DesktopShell({ appContents = {}, children, assistant, brand, des
         activeAppId={effectiveActiveAppId}
         openAppIds={openAppIds}
         magnification={preferences.dockMagnification}
-        onOpenApp={(appId) => openApp(appId)}
+        onOpenApp={requestOpenApp}
       />
     </div>
   );

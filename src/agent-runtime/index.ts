@@ -1,1 +1,6 @@
-export { AgentRuntimeProvider, useAgentRuntime, type AgentSurfaceEnvelope } from './AgentRuntimeProvider';
+export {
+  AgentRuntimeProvider,
+  useAgentRuntime,
+  type AgentRuntimeValue,
+  type AgentSurfaceEnvelope,
+} from './AgentRuntimeProvider';

@@ -13,11 +13,13 @@ import type { AssistantDebugEvent } from '../assistant';
 import { validateAgentManifest } from '../agent-platform';
 import { DEFAULT_SYSTEM_STATUS } from '../system/useSystemStore';
 import { useSystemStore } from '../system/useSystemStore';
+import type { NativeApplicationPort } from '../native-apps';
 import {
   assembleRuntime,
   createAgentLibraryPort,
   describeAgentDataBoundary,
   describeProviderAuthentication,
+  nativeApplicationConnection,
   type AgentRuntimeHostPort,
 } from './AgentRuntimeProvider';
 
@@ -53,6 +55,27 @@ describe('provider authentication status', () => {
       { code: 'auth_link', status: 'pass', message: 'Linked.' },
       { code: 'auth_provider', status: 'warn', message: 'Pending.' },
     ]))).toContain('pending');
+  });
+});
+
+describe('native application runtime connection', () => {
+  const nativeApplications: NativeApplicationPort = Object.freeze({
+    getStatus: async () => { throw new Error('not used'); },
+    install: async () => { throw new Error('not used'); },
+    launch: async () => { throw new Error('not used'); },
+  });
+
+  it('exposes one stable native application port independently of Codex readiness', () => {
+    expect(nativeApplicationConnection(nativeApplications, undefined)).toEqual({
+      nativeApplications,
+      connected: false,
+    });
+    expect(nativeApplicationConnection(nativeApplications, authenticationHealth([
+      { code: 'auth_link', status: 'fail', message: 'Not signed in.' },
+    ]))).toEqual({ nativeApplications, connected: false });
+    expect(nativeApplicationConnection(nativeApplications, authenticationHealth([
+      { code: 'auth_link', status: 'pass', message: 'Linked.' },
+    ]))).toEqual({ nativeApplications, connected: true });
   });
 });
 
@@ -376,6 +399,30 @@ describe('Agent runtime composition', () => {
     }));
     expect(response.receipts?.[0]?.status).toBe('rejected');
     expect(useSystemStore.getState().appInstallations.doudizhu).toBeUndefined();
+  });
+
+  it('prevents Agent intents from forging a native application installation in browser state', async () => {
+    useSystemStore.getState().uninstallApp('wechat');
+    const confirmCapability = vi.fn(() => true);
+    const runtime = assembleRuntime(clientFor((request) => ({
+      requestId: request.requestId,
+      runId: 'run-native-install',
+      message: '准备安装微信。',
+      mood: 'focused',
+      intents: [{ id: 'install-wechat', type: 'install_app', listingId: 'wechat' }],
+    })), emptyRegistry, () => undefined, host(confirmCapability));
+
+    const response = await runtime.assistantClient.run({
+      threadId: 'thread-native-install',
+      message: '安装微信',
+      source: 'text',
+      context: { activeAppId: null, activeGame: false },
+      signal: new AbortController().signal,
+    });
+
+    expect(confirmCapability).toHaveBeenCalledWith(expect.objectContaining({ target: 'wechat' }));
+    expect(response.receipts?.[0]).toMatchObject({ status: 'failed' });
+    expect(useSystemStore.getState().appInstallations.wechat).toBeUndefined();
   });
 
   it('projects system status, running games, and validated enabled domain Agent instructions', async () => {

@@ -1,8 +1,9 @@
 import type { ComponentType } from 'react';
 
-export type AppId = 'finder' | 'calculator' | 'settings' | 'terminal' | 'store' | 'space-game' | 'doudizhu';
+export type AppId = 'finder' | 'calculator' | 'settings' | 'terminal' | 'store' | 'space-game' | 'doudizhu' | 'wechat';
 export type Theme = 'aurora' | 'midnight';
 export type EnergyMode = 'Eco' | 'Balanced' | 'Performance';
+export type DefaultAppInstallation = 'preinstalled' | 'on-demand';
 
 export interface AppDefinition {
   id: AppId;
@@ -13,6 +14,7 @@ export interface AppDefinition {
   defaultSize: { width: number; height: number };
   defaultPosition: { x: number; y: number };
   version: string;
+  defaultInstallation: DefaultAppInstallation;
   protectedSystemApp: boolean;
 }
 export interface WindowState {
