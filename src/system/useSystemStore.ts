@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import type { PersistStorage, StorageValue } from 'zustand/middleware';
 import { APP_IDS, APP_REGISTRY, PREINSTALLED_APP_IDS, isAppId, isProtectedSystemApp } from './appRegistry';
 import type {
   AppId,
@@ -12,7 +13,8 @@ import type {
   WindowState,
 } from './types';
 
-const PERSISTENCE_VERSION = 6;
+const PERSISTENCE_VERSION = 7;
+const FIRST_PERSISTENCE_VERSION_WITH_WORKSPACE = 7;
 const FIRST_PERSISTENCE_VERSION_WITH_KNOWN_APP_IDS = 4;
 const LATEST_PERSISTENCE_VERSION_WITHOUT_KNOWN_APP_IDS = 3;
 const KNOWN_APP_IDS_BY_PERSISTENCE_VERSION: Readonly<Record<number, readonly string[]>> = Object.freeze({
@@ -21,12 +23,14 @@ const KNOWN_APP_IDS_BY_PERSISTENCE_VERSION: Readonly<Record<number, readonly str
   4: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu', 'wechat']),
   5: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu', 'wechat']),
   6: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu', 'wechat']),
+  7: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu', 'wechat']),
 });
 const RETAINABLE_INSTALLATION_IDS_BY_PERSISTENCE_VERSION: Readonly<Record<number, readonly string[]>> = Object.freeze({
   2: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu']),
   3: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu']),
   4: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu']),
   5: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu']),
+  6: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu', 'wechat']),
 });
 const LEGACY_RETAINABLE_INSTALLATION_IDS = RETAINABLE_INSTALLATION_IDS_BY_PERSISTENCE_VERSION[5];
 export const MAX_WINDOW_Z = 89;
@@ -95,6 +99,9 @@ export interface SystemStore {
 }
 
 export interface PersistedSystemState {
+  windows: Partial<Record<AppId, WindowState>>;
+  activeAppId: AppId | null;
+  topZ: number;
   preferences: SystemPreferences;
   appInstallations: Partial<Record<AppId, AppInstallation>>;
   knownAppIds: AppId[];
@@ -102,6 +109,58 @@ export interface PersistedSystemState {
   systemStatus: SystemStatusModel;
   systemStatusRevision: number;
 }
+
+let persistenceWritesBlocked = false;
+
+function browserLocalStorage(): Storage | null {
+  return typeof window === 'undefined' ? null : window.localStorage;
+}
+
+const guardedSystemStorage: PersistStorage<PersistedSystemState> = {
+  getItem: (name) => {
+    persistenceWritesBlocked = false;
+    try {
+      const storage = browserLocalStorage();
+      if (storage === null) return null;
+      const rawValue = storage.getItem(name);
+      if (rawValue === null) return null;
+      const parsed = JSON.parse(rawValue) as unknown;
+      if (!isRecord(parsed) || !isRecord(ownProperty(parsed, 'state'))) {
+        throw new TypeError('Persisted system state envelope is malformed.');
+      }
+      const version = ownProperty(parsed, 'version');
+      if (version !== undefined && (!Number.isSafeInteger(version) || (version as number) < 0)) {
+        throw new TypeError('Persisted system state version is malformed.');
+      }
+      return {
+        state: ownProperty(parsed, 'state') as PersistedSystemState,
+        ...(version === undefined ? {} : { version: version as number }),
+      } satisfies StorageValue<PersistedSystemState>;
+    } catch (error) {
+      persistenceWritesBlocked = true;
+      console.error('AlSniper OS preserved an unavailable or unreadable system state instead of overwriting it.', error);
+      return null;
+    }
+  },
+  setItem: (name, value) => {
+    if (persistenceWritesBlocked) return;
+    try {
+      browserLocalStorage()?.setItem(name, JSON.stringify(value));
+    } catch (error) {
+      persistenceWritesBlocked = true;
+      console.error('AlSniper OS switched system state persistence to read-only after a write failure.', error);
+    }
+  },
+  removeItem: (name) => {
+    if (persistenceWritesBlocked) return;
+    try {
+      browserLocalStorage()?.removeItem(name);
+    } catch (error) {
+      persistenceWritesBlocked = true;
+      console.error('AlSniper OS preserved system state after a storage removal failure.', error);
+    }
+  },
+};
 
 const initialWindow = (id: AppId, zIndex: number): WindowState => {
   const app = APP_REGISTRY[id];
@@ -115,6 +174,159 @@ const initialWindow = (id: AppId, zIndex: number): WindowState => {
     size: { ...app.defaultSize },
   };
 };
+
+interface PersistedWorkspace {
+  windows: Partial<Record<AppId, WindowState>>;
+  activeAppId: AppId | null;
+  topZ: number;
+}
+
+const MIN_PERSISTED_WINDOW_WIDTH = 320;
+const MIN_PERSISTED_WINDOW_HEIGHT = 240;
+const MAX_PERSISTED_WINDOW_DIMENSION = 32_768;
+const MAX_PERSISTED_WINDOW_COORDINATE = 32_768;
+
+function cloneDefaultWorkspace(): PersistedWorkspace {
+  return {
+    windows: { finder: initialWindow('finder', 1) },
+    activeAppId: 'finder',
+    topZ: 1,
+  };
+}
+
+function ownProperty(source: Record<string, unknown>, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(source, key) ? source[key] : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function boundedNumber(value: unknown, fallback: number, minimum: number, maximum: number): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(maximum, Math.max(minimum, value))
+    : fallback;
+}
+
+function sanitizePoint(
+  value: unknown,
+  fallback: Readonly<{ x: number; y: number }>,
+): { x: number; y: number } {
+  const source = isRecord(value) ? value : {};
+  return {
+    x: boundedNumber(
+      ownProperty(source, 'x'),
+      fallback.x,
+      -MAX_PERSISTED_WINDOW_COORDINATE,
+      MAX_PERSISTED_WINDOW_COORDINATE,
+    ),
+    y: boundedNumber(
+      ownProperty(source, 'y'),
+      fallback.y,
+      -MAX_PERSISTED_WINDOW_COORDINATE,
+      MAX_PERSISTED_WINDOW_COORDINATE,
+    ),
+  };
+}
+
+function sanitizeSize(
+  value: unknown,
+  fallback: Readonly<{ width: number; height: number }>,
+): { width: number; height: number } {
+  const source = isRecord(value) ? value : {};
+  return {
+    width: boundedNumber(
+      ownProperty(source, 'width'),
+      fallback.width,
+      MIN_PERSISTED_WINDOW_WIDTH,
+      MAX_PERSISTED_WINDOW_DIMENSION,
+    ),
+    height: boundedNumber(
+      ownProperty(source, 'height'),
+      fallback.height,
+      MIN_PERSISTED_WINDOW_HEIGHT,
+      MAX_PERSISTED_WINDOW_DIMENSION,
+    ),
+  };
+}
+
+function sanitizeWorkspace(
+  windowsValue: unknown,
+  activeAppIdValue: unknown,
+  installations: Readonly<Partial<Record<AppId, AppInstallation>>>,
+): PersistedWorkspace {
+  const source = isRecord(windowsValue) ? windowsValue : {};
+  const candidates: WindowState[] = [];
+
+  for (const appId of APP_IDS) {
+    const installation = installations[appId];
+    if (installation === undefined) continue;
+    const value = ownProperty(source, appId);
+    if (!isRecord(value) || ownProperty(value, 'appId') !== appId) continue;
+
+    const app = APP_REGISTRY[appId];
+    const position = sanitizePoint(ownProperty(value, 'position'), app.defaultPosition);
+    const size = sanitizeSize(ownProperty(value, 'size'), app.defaultSize);
+    const isOpen = installation.enabled && ownProperty(value, 'isOpen') === true;
+    const isMinimized = isOpen && ownProperty(value, 'isMinimized') === true;
+    const isMaximized = ownProperty(value, 'isMaximized') === true;
+    const persistedZ = ownProperty(value, 'zIndex');
+    const zIndex = typeof persistedZ === 'number' && Number.isSafeInteger(persistedZ) && persistedZ > 0
+      ? Math.min(persistedZ, MAX_WINDOW_Z)
+      : MAX_WINDOW_Z;
+    const restoreValue = ownProperty(value, 'restore');
+    const restore = isMaximized && isRecord(restoreValue)
+      ? {
+          position: sanitizePoint(ownProperty(restoreValue, 'position'), position),
+          size: sanitizeSize(ownProperty(restoreValue, 'size'), size),
+        }
+      : undefined;
+
+    candidates.push({
+      appId,
+      isOpen,
+      isMinimized,
+      isMaximized,
+      zIndex,
+      position,
+      size,
+      ...(restore === undefined ? {} : { restore }),
+    });
+  }
+
+  candidates.sort((left, right) => (
+    left.zIndex - right.zIndex || APP_IDS.indexOf(left.appId) - APP_IDS.indexOf(right.appId)
+  ));
+  if (Object.keys(source).length > 0 && candidates.length === 0) {
+    return cloneDefaultWorkspace();
+  }
+  const requestedActiveIndex = isAppId(activeAppIdValue)
+    ? candidates.findIndex((window) => (
+        window.appId === activeAppIdValue && window.isOpen && !window.isMinimized
+      ))
+    : -1;
+  if (requestedActiveIndex >= 0 && requestedActiveIndex < candidates.length - 1) {
+    const [requestedActiveWindow] = candidates.splice(requestedActiveIndex, 1);
+    if (requestedActiveWindow !== undefined) {
+      candidates.push(requestedActiveWindow);
+    }
+  }
+  const windows: Partial<Record<AppId, WindowState>> = {};
+  candidates.forEach((window, index) => {
+    windows[window.appId] = { ...window, zIndex: index + 1 };
+  });
+
+  const requestedActiveAppId = requestedActiveIndex >= 0 && isAppId(activeAppIdValue)
+    ? activeAppIdValue
+    : null;
+  const activeAppId = activeAppIdValue === null
+    ? null
+    : requestedActiveAppId ?? [...candidates]
+      .reverse()
+      .find((window) => window.isOpen && !window.isMinimized)?.appId
+      ?? null;
+  return { windows, activeAppId, topZ: candidates.length };
+}
 
 function createDefaultInstallations(): Partial<Record<AppId, AppInstallation>> {
   return Object.fromEntries(
@@ -282,13 +494,24 @@ export function restorePersistedSystemState(value: unknown, persistedVersion?: n
     knownAppIds,
     persistedVersion,
   );
+  const appInstallations = sanitizeInstallations(
+    persistedInstallations,
+    previouslyKnownAppIds,
+    persistedInstallationAllowlist,
+  );
+  const hasWorkspace = (
+    persistedVersion === undefined
+      ? Object.prototype.hasOwnProperty.call(persisted, 'windows')
+      : persistedVersion >= FIRST_PERSISTENCE_VERSION_WITH_WORKSPACE
+  );
+  const persistedWindows = ownValue('windows');
+  const workspace = hasWorkspace && isRecord(persistedWindows)
+    ? sanitizeWorkspace(persistedWindows, ownValue('activeAppId'), appInstallations)
+    : cloneDefaultWorkspace();
   return {
+    ...workspace,
     preferences: sanitizePreferences(ownValue('preferences')),
-    appInstallations: sanitizeInstallations(
-      persistedInstallations,
-      previouslyKnownAppIds,
-      persistedInstallationAllowlist,
-    ),
+    appInstallations,
     knownAppIds: [...APP_IDS],
     appInstallationRevision: normalizedRevision(ownValue('appInstallationRevision')),
     systemStatus: sanitizeSystemStatus(ownValue('systemStatus')),
@@ -521,7 +744,11 @@ export const useSystemStore = create<SystemStore>()(
     {
       name: 'alsniper-os-preferences',
       version: PERSISTENCE_VERSION,
+      storage: guardedSystemStorage,
       partialize: (state): PersistedSystemState => ({
+        windows: state.windows,
+        activeAppId: state.activeAppId,
+        topZ: state.topZ,
         preferences: state.preferences,
         appInstallations: state.appInstallations,
         knownAppIds: state.knownAppIds,
@@ -529,7 +756,13 @@ export const useSystemStore = create<SystemStore>()(
         systemStatus: state.systemStatus,
         systemStatusRevision: state.systemStatusRevision,
       }),
-      migrate: (persistedState, persistedVersion) => restorePersistedSystemState(persistedState, persistedVersion),
+      migrate: (persistedState, persistedVersion) => {
+        if (persistedVersion > PERSISTENCE_VERSION) {
+          persistenceWritesBlocked = true;
+          throw new Error('Refusing to downgrade a newer AlSniper OS persisted state.');
+        }
+        return restorePersistedSystemState(persistedState, persistedVersion);
+      },
       merge: (persistedState, currentState) => {
         const persisted = restorePersistedSystemState(persistedState);
         return {

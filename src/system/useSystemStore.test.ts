@@ -223,6 +223,168 @@ describe('system window manager', () => {
     expect(state.systemStatusRevision).toBe(0);
   });
 
+  it('restores the v7 desktop workspace with bounded geometry and coherent focus', () => {
+    const state = restorePersistedSystemState({
+      appInstallations: installedApps(),
+      knownAppIds: APP_IDS,
+      windows: {
+        finder: {
+          appId: 'finder',
+          isOpen: true,
+          isMinimized: false,
+          isMaximized: false,
+          zIndex: 500,
+          position: { x: Number.POSITIVE_INFINITY, y: -90_000 },
+          size: { width: 50, height: 90_000 },
+        },
+        wechat: {
+          appId: 'wechat',
+          isOpen: true,
+          isMinimized: false,
+          isMaximized: true,
+          zIndex: 7,
+          position: { x: 140, y: 60 },
+          size: { width: 1080, height: 720 },
+          restore: { position: { x: 155, y: 75 }, size: { width: 1180, height: 760 } },
+        },
+      },
+      activeAppId: 'malware',
+      topZ: 90_000,
+    }, 7);
+
+    expect(state.windows.finder).toMatchObject({
+      position: { x: APP_REGISTRY.finder.defaultPosition.x, y: -32_768 },
+      size: { width: 320, height: 32_768 },
+      zIndex: 2,
+    });
+    expect(state.windows.wechat).toMatchObject({
+      isOpen: true,
+      isMaximized: true,
+      zIndex: 1,
+      restore: { position: { x: 155, y: 75 }, size: { width: 1180, height: 760 } },
+    });
+    expect(state.activeAppId).toBe('finder');
+    expect(state.topZ).toBe(2);
+    expect((state.windows as Record<string, unknown>).malware).toBeUndefined();
+  });
+
+  it('retains disabled app geometry without restoring an unlaunchable window', () => {
+    const installations = installedApps();
+    installations.terminal = { ...installations.terminal, enabled: false };
+    const state = restorePersistedSystemState({
+      appInstallations: installations,
+      knownAppIds: APP_IDS,
+      windows: {
+        terminal: {
+          appId: 'terminal',
+          isOpen: true,
+          isMinimized: false,
+          isMaximized: true,
+          zIndex: 4,
+          position: { x: 444, y: 222 },
+          size: { width: 888, height: 555 },
+          restore: { position: { x: 400, y: 200 }, size: { width: 800, height: 500 } },
+        },
+      },
+      activeAppId: 'terminal',
+      topZ: 4,
+    }, 7);
+
+    expect(state.windows.terminal).toMatchObject({
+      isOpen: false,
+      isMaximized: true,
+      position: { x: 444, y: 222 },
+      size: { width: 888, height: 555 },
+      restore: { position: { x: 400, y: 200 }, size: { width: 800, height: 500 } },
+    });
+    expect(state.activeAppId).toBeNull();
+  });
+
+  it('distinguishes an intentionally empty workspace from a malformed one', () => {
+    const persisted = {
+      appInstallations: installedApps(),
+      knownAppIds: APP_IDS,
+      activeAppId: null,
+      topZ: 0,
+    };
+    expect(restorePersistedSystemState({ ...persisted, windows: {} }, 7)).toMatchObject({
+      windows: {},
+      activeAppId: null,
+      topZ: 0,
+    });
+    expect(restorePersistedSystemState({ ...persisted, windows: 'corrupt' }, 7)).toMatchObject({
+      windows: { finder: { appId: 'finder', isOpen: true } },
+      activeAppId: 'finder',
+      topZ: 1,
+    });
+  });
+
+  it('rehydrates a current v7 workspace through the actual Zustand persistence middleware', async () => {
+    const writes: StorageValue<PersistedSystemState>[] = [];
+    const storage: PersistStorage<PersistedSystemState> = {
+      getItem: () => ({
+        version: 7,
+        state: {
+          windows: {
+            finder: {
+              appId: 'finder',
+              isOpen: true,
+              isMinimized: false,
+              isMaximized: false,
+              zIndex: 1,
+              position: { x: 88, y: 96 },
+              size: { width: 980, height: 610 },
+            },
+            wechat: {
+              appId: 'wechat',
+              isOpen: true,
+              isMinimized: false,
+              isMaximized: true,
+              zIndex: 2,
+              position: { x: 140, y: 60 },
+              size: { width: 1080, height: 720 },
+              restore: { position: { x: 166, y: 74 }, size: { width: 1040, height: 690 } },
+            },
+          },
+          activeAppId: 'wechat',
+          topZ: 2,
+          preferences: { ...DEFAULT_PREFERENCES, theme: 'midnight' },
+          appInstallations: installedApps(),
+          knownAppIds: [...APP_IDS],
+          appInstallationRevision: 8,
+          systemStatus: { ...DEFAULT_SYSTEM_STATUS, volume: 63 },
+          systemStatusRevision: 4,
+        },
+      }),
+      setItem: (_name, value) => { writes.push(value); },
+      removeItem: () => undefined,
+    };
+    const previousStorage = useSystemStore.persist.getOptions().storage;
+
+    try {
+      useSystemStore.persist.setOptions({ storage });
+      await useSystemStore.persist.rehydrate();
+      expect(useSystemStore.getState()).toMatchObject({
+        activeAppId: 'wechat',
+        topZ: 2,
+        preferences: { theme: 'midnight' },
+        systemStatus: { volume: 63 },
+        windows: {
+          finder: { position: { x: 88, y: 96 }, size: { width: 980, height: 610 }, zIndex: 1 },
+          wechat: {
+            isOpen: true,
+            isMaximized: true,
+            zIndex: 2,
+            restore: { position: { x: 166, y: 74 }, size: { width: 1040, height: 690 } },
+          },
+        },
+      });
+      expect(writes).toHaveLength(0);
+    } finally {
+      useSystemStore.persist.setOptions({ storage: previousStorage });
+    }
+  });
+
   it('migrates the legacy preference-only projection with bundled apps intact', () => {
     const migrated = restorePersistedSystemState({
       preferences: { ...DEFAULT_PREFERENCES, theme: 'midnight', accent: 'cyan' },
@@ -233,7 +395,7 @@ describe('system window manager', () => {
     expect(migrated.systemStatus).toEqual(DEFAULT_SYSTEM_STATUS);
   });
 
-  it('hydrates and rewrites a v0 preference-only envelope as v6', async () => {
+  it('hydrates and rewrites a v0 preference-only envelope as v7', async () => {
     const writes: StorageValue<PersistedSystemState>[] = [];
     const legacyState = {
       preferences: { ...DEFAULT_PREFERENCES, theme: 'midnight' as const },
@@ -262,7 +424,7 @@ describe('system window manager', () => {
     expect(useSystemStore.getState().appInstallations.wechat).toBeUndefined();
     expect(useSystemStore.getState().knownAppIds).toEqual(APP_IDS);
     expect(writes.at(-1)).toMatchObject({
-      version: 6,
+      version: 7,
       state: { knownAppIds: APP_IDS },
     });
   });
@@ -296,11 +458,105 @@ describe('system window manager', () => {
 
       hydrated.updatePreferences({ accent: 'cyan' });
       expect(writes.at(-1)).toMatchObject({
-        version: 6,
+        version: 7,
         state: { knownAppIds: APP_IDS },
       });
     } finally {
       useSystemStore.persist.setOptions({ storage: previousStorage });
+    }
+  });
+
+  it('preserves future and unreadable envelopes instead of overwriting them after a mutation', async () => {
+    const key = 'alsniper-os-preferences';
+    const futureEnvelope = JSON.stringify({
+      version: 99,
+      state: { futureOnlyField: 'must-survive-downgrade' },
+    });
+    window.localStorage.setItem(key, futureEnvelope);
+
+    try {
+      await useSystemStore.persist.rehydrate();
+      useSystemStore.getState().updatePreferences({ accent: 'amber' });
+      expect(window.localStorage.getItem(key)).toBe(futureEnvelope);
+
+      const malformedEnvelope = '{"version":7,"state":';
+      window.localStorage.setItem(key, malformedEnvelope);
+      const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+      await useSystemStore.persist.rehydrate();
+      useSystemStore.getState().updatePreferences({ accent: 'cyan' });
+      expect(window.localStorage.getItem(key)).toBe(malformedEnvelope);
+      expect(consoleError).toHaveBeenCalledWith(
+        'AlSniper OS preserved an unavailable or unreadable system state instead of overwriting it.',
+        expect.any(SyntaxError),
+      );
+      consoleError.mockRestore();
+    } finally {
+      window.localStorage.removeItem(key);
+      await useSystemStore.persist.rehydrate();
+    }
+  });
+
+  it('locks persistence when browser storage cannot be read and never overwrites the unavailable value', async () => {
+    const originalWindow = window;
+    const readFailure = new DOMException('storage unavailable', 'SecurityError');
+    let readsFail = true;
+    const storage = {
+      getItem: vi.fn(() => {
+        if (readsFail) throw readFailure;
+        return JSON.stringify({ version: 99, state: { futureOnlyField: 'preserve' } });
+      }),
+      setItem: vi.fn(),
+      removeItem: vi.fn(),
+      clear: vi.fn(),
+      key: vi.fn(() => null),
+      length: 1,
+    } satisfies Storage;
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: { localStorage: storage } });
+
+    try {
+      await useSystemStore.persist.rehydrate();
+      useSystemStore.getState().updatePreferences({ accent: 'amber' });
+      expect(storage.setItem).not.toHaveBeenCalled();
+      expect(consoleError).toHaveBeenCalledWith(
+        'AlSniper OS preserved an unavailable or unreadable system state instead of overwriting it.',
+        readFailure,
+      );
+    } finally {
+      readsFail = false;
+      Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+      consoleError.mockRestore();
+      await useSystemStore.persist.rehydrate();
+    }
+  });
+
+  it('contains a browser storage write failure and switches the session to read-only persistence', async () => {
+    const originalWindow = window;
+    const writeFailure = new DOMException('quota exceeded', 'QuotaExceededError');
+    const storage = {
+      getItem: vi.fn(() => null),
+      setItem: vi.fn(() => { throw writeFailure; }),
+      removeItem: vi.fn(),
+      clear: vi.fn(),
+      key: vi.fn(() => null),
+      length: 0,
+    } satisfies Storage;
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: { localStorage: storage } });
+
+    try {
+      await useSystemStore.persist.rehydrate();
+      expect(() => useSystemStore.getState().updatePreferences({ accent: 'amber' })).not.toThrow();
+      useSystemStore.getState().updatePreferences({ accent: 'cyan' });
+      expect(storage.setItem).toHaveBeenCalledOnce();
+      expect(consoleError).toHaveBeenCalledWith(
+        'AlSniper OS switched system state persistence to read-only after a write failure.',
+        writeFailure,
+      );
+    } finally {
+      Object.defineProperty(globalThis, 'window', { configurable: true, value: originalWindow });
+      consoleError.mockRestore();
+      await useSystemStore.persist.rehydrate();
     }
   });
 
@@ -360,7 +616,7 @@ describe('system window manager', () => {
     expect(state.appInstallations.wechat?.enabled).toBe(expectedWechatEnabled);
     expect(state.knownAppIds).toEqual(APP_IDS);
     expect(writes.at(-1)).toMatchObject({
-      version: 6,
+      version: 7,
       state: { knownAppIds: APP_IDS },
     });
   });
@@ -396,7 +652,7 @@ describe('system window manager', () => {
 
     expect(useSystemStore.getState().appInstallations.wechat).toBeUndefined();
     expect(writes.at(-1)).toMatchObject({
-      version: 6,
+      version: 7,
       state: { knownAppIds: APP_IDS },
     });
     expect(writes.at(-1)?.state).not.toHaveProperty('nativeInstallationProvenanceVersion');
@@ -430,11 +686,11 @@ describe('system window manager', () => {
     }
 
     expect(useSystemStore.getState().appInstallations.wechat).toBeUndefined();
-    expect(writes.at(-1)).toMatchObject({ version: 6, state: { knownAppIds: APP_IDS } });
+    expect(writes.at(-1)).toMatchObject({ version: 7, state: { knownAppIds: APP_IDS } });
     expect(writes.at(-1)?.state).not.toHaveProperty('nativeInstallationProvenanceVersion');
   });
 
-  it('preserves an explicitly installed web WeChat application in v6', async () => {
+  it('preserves an explicitly installed web WeChat application while migrating v6', async () => {
     const writes: StorageValue<PersistedSystemState>[] = [];
     const storage: PersistStorage<PersistedSystemState> = {
       getItem: () => ({
@@ -465,7 +721,18 @@ describe('system window manager', () => {
       version: APP_REGISTRY.wechat.version,
       enabled: true,
     });
-    expect(writes).toHaveLength(0);
+    expect(writes.at(-1)).toMatchObject({
+      version: 7,
+      state: {
+        appInstallations: {
+          wechat: { appId: 'wechat', enabled: true },
+        },
+        windows: {
+          finder: { appId: 'finder', isOpen: true },
+        },
+        activeAppId: 'finder',
+      },
+    });
   });
 
   it('discards launcher-only on-demand apps while migrating unversioned state', () => {

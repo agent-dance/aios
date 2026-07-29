@@ -417,8 +417,8 @@ describe('WeChatViewController', () => {
     expect(states.at(-1)).toEqual(controller.getState());
   });
 
-  it('maps certificate failures and renderer crashes without exposing raw details', () => {
-    const { controller, view } = createHarness();
+  it('maps certificate failures, checkpoints renderer crashes, and hides raw details', async () => {
+    const { controller, view, checkpointStorage } = createHarness();
     controller.mount({ x: 0, y: 0, width: 800, height: 600 });
     controller.setVisible(true);
     view.webContents.emit('dom-ready');
@@ -433,6 +433,7 @@ describe('WeChatViewController', () => {
 
     view.webContents.emit('render-process-gone', {}, { reason: 'crashed' });
     expect(controller.getState().errorCode).toBe('RENDERER_CRASHED');
+    await vi.waitFor(() => expect(checkpointStorage).toHaveBeenCalledOnce());
   });
 
   it('only goes back to a previously validated WeChat entry', () => {

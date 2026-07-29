@@ -438,6 +438,9 @@ export class WeChatViewController {
       if (generation === this.#generation && this.#view?.webContents === contents) {
         this.#invalidateRemoteDocument();
         this.#transition('failed', 'RENDERER_CRASHED');
+        void this.#checkpointStorage().catch((error: unknown) => {
+          this.#logger.error('Failed to checkpoint embedded WeChat storage after a renderer crash.', error);
+        });
       }
     });
 

@@ -12,6 +12,7 @@
     "desktop:compile": "tsc -p electron/tsconfig.json",
     "desktop:dev": "npm run desktop:compile && concurrently --kill-others --success first --names web,desktop \"vite --host 127.0.0.1 --port 5173 --strictPort\" \"wait-on http-get://127.0.0.1:5173/ && electron dist-electron/main.js --dev-url=http://127.0.0.1:5173/\"",
     "desktop:package": "npm run build && node electron/package.mjs",
+    "desktop:persistence-smoke": "npm run desktop:compile && node electron/run-persistence-smoke.mjs",
     "desktop:smoke": "npm run desktop:compile && electron dist-electron/smoke.js",
     "desktop:start": "npm run build && electron dist-electron/main.js",
     "build": "tsc -b && vite build && npm run desktop:compile",

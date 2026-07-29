@@ -117,6 +117,7 @@ async function createStagingDirectory(appVersion) {
   const includeCompiledAsset = (source) => (
     !source.endsWith('.map')
     && !source.endsWith(`${sep}smoke.js`)
+    && !source.endsWith(`${sep}persistenceSmoke.js`)
   );
 
   await Promise.all([
