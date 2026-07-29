@@ -4,10 +4,40 @@ AlSniper OS is a polished browser-native desktop environment inspired by the spa
 
 ## Run locally
 
+The desktop host is the supported runtime for embedded applications such as WeChat:
+
+```powershell
+npm install
+npm run desktop:dev
+```
+
+Install 微信 from App Store, then double-click its desktop icon. The official
+`https://wx.qq.com/` client is rendered inside the AlSniper OS window through an
+isolated Electron `WebContentsView`; it does not open an external tab or launch
+the Windows WeChat executable. Tencent still controls QR login, account
+eligibility, regional availability, and the web client's feature set.
+
+Build and start the production desktop host, or create a Windows package:
+
+```powershell
+npm run desktop:start
+npm run desktop:package
+```
+
+The packaged application is written beneath `release/`. The remote WeChat page
+has no Node.js or preload access, uses a dedicated persistent session, and is
+restricted by exact navigation, network, permission, popup, and download
+policies. See [the desktop host runbook](./electron/README.md).
+
+Browser-only development remains available for ordinary web UI work:
+
 ```bash
 npm install
 npm run dev
 ```
+
+Browser mode cannot host `WebContentsView`; the WeChat app reports that the
+desktop runtime is required and never falls back to an external URL.
 
 ### Run with the local Codex Agent
 
@@ -60,7 +90,7 @@ The generated game reuses the deterministic runtime, browser lifecycle and autom
 - Control Center for Wi-Fi, Bluetooth, system health, storage, energy, brightness and sound
 - Persistent Aurora/Midnight themes, accent colors and accessibility preferences
 - Finder, keyboard-friendly calculator, safe simulated terminal, Settings and a trust-aware App Store
-- Install-on-demand desktop shortcuts that appear automatically and open on double-click, including native WeChat installed through the fixed official WinGet package and trusted only after Tencent publisher verification
+- Install-on-demand desktop shortcuts that appear automatically and open on double-click, including the official WeChat Web client embedded inside the Electron desktop host
 - Cosmic Vanguard, a deterministic 3D space shooter with keyboard, pointer, pause, restart and fullscreen controls
 - Reusable game platform and atomic scaffold generator for future browser games
 - Local Codex desktop assistant with a procedural Three.js companion, text/hold-to-talk interaction, restricted A2UI, and receipt-backed OS controls

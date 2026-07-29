@@ -1,15 +1,11 @@
-import { lazy, Suspense, useCallback, useMemo, useState } from 'react';
+import { lazy, Suspense, useCallback, useState } from 'react';
 import { useAgentRuntime } from './agent-runtime';
 import { CalculatorApp } from './apps/calculator';
 import { FinderApp } from './apps/finder';
 import { SettingsApp } from './apps/settings';
 import { AppStoreApp } from './apps/store';
 import { TerminalApp } from './apps/terminal';
-import {
-  createApplicationLaunchRouter,
-  WeChatApp,
-  type WeChatNativeLaunchFeedback,
-} from './apps/wechat';
+import { isWeChatSurfaceActive, WeChatApp } from './apps/wechat';
 import { DesktopShell, type AppContentMap } from './shell';
 import { useSystemStore } from './system/useSystemStore';
 
@@ -38,19 +34,12 @@ export default function App() {
   const controlCenterOpen = useSystemStore((state) => state.controlCenterOpen);
   const clockOpen = useSystemStore((state) => state.clockOpen);
   const openApp = useSystemStore((state) => state.openApp);
-  const isAppLaunchable = useSystemStore((state) => state.isAppLaunchable);
+  const [assistantOpen, setAssistantOpen] = useState(false);
   const agentRuntime = useAgentRuntime();
-  const [wechatLaunchFeedback, setWechatLaunchFeedback] = useState<WeChatNativeLaunchFeedback | null>(null);
   const activeGame = activeAppId === 'space-game' || activeAppId === 'doudizhu';
-  const appLaunchRouter = useMemo(() => createApplicationLaunchRouter({
-    nativeApplications: agentRuntime.nativeApplications,
-    isLocallyLaunchable: isAppLaunchable,
-    openFallback: openApp,
-    onWeChatLaunchFeedback: setWechatLaunchFeedback,
-  }), [agentRuntime.nativeApplications, isAppLaunchable, openApp]);
   const handleOpenApp = useCallback((appId: Parameters<typeof openApp>[0]) => {
-    void appLaunchRouter(appId);
-  }, [appLaunchRouter]);
+    openApp(appId);
+  }, [openApp]);
 
   const appContents: AppContentMap = {
     finder: ({ isActive }) => <FinderApp isActive={isActive} />,
@@ -60,15 +49,17 @@ export default function App() {
     store: (
       <AppStoreApp
         agentLibrary={agentRuntime.agentLibrary}
-        nativeApplications={agentRuntime.nativeApplications}
         onOpenApp={handleOpenApp}
       />
     ),
-    wechat: (
+    wechat: ({ isActive, window }) => (
       <WeChatApp
-        nativeApplications={agentRuntime.nativeApplications}
-        nativeLaunchFeedback={wechatLaunchFeedback}
-        onNativeLaunchFeedback={setWechatLaunchFeedback}
+        isActive={isWeChatSurfaceActive(isActive, {
+          controlCenterOpen,
+          clockOpen,
+          assistantOpen,
+        })}
+        isMinimized={!window.isOpen || window.isMinimized}
       />
     ),
     'space-game': ({ isActive, window }) => (
@@ -113,6 +104,7 @@ export default function App() {
               reduceMotion={preferences.reduceMotion}
               renderSurface={agentRuntime.renderSurface}
               onSurfaceAction={agentRuntime.onSurfaceAction}
+              onOpenChange={setAssistantOpen}
             />
           </Suspense>
         }

@@ -46,7 +46,6 @@ describe('system window manager', () => {
       preferences: { ...DEFAULT_PREFERENCES },
       appInstallations: installedApps(),
       knownAppIds: [...APP_IDS],
-      nativeInstallationProvenanceVersion: 1,
       appInstallationRevision: 0,
       systemStatus: { ...DEFAULT_SYSTEM_STATUS },
       systemStatusRevision: 0,
@@ -234,14 +233,13 @@ describe('system window manager', () => {
     expect(migrated.systemStatus).toEqual(DEFAULT_SYSTEM_STATUS);
   });
 
-  it('hydrates and rewrites a v0 preference-only envelope as v5', async () => {
+  it('hydrates and rewrites a v0 preference-only envelope as v6', async () => {
     const writes: StorageValue<PersistedSystemState>[] = [];
     const legacyState = {
       preferences: { ...DEFAULT_PREFERENCES, theme: 'midnight' as const },
       appInstallations: {
         wechat: { appId: 'wechat', version: 'forged', enabled: true },
       },
-      nativeInstallationProvenanceVersion: 1,
     } as unknown as PersistedSystemState;
     const storage: PersistStorage<PersistedSystemState> = {
       getItem: () => ({ state: legacyState, version: 0 }),
@@ -264,11 +262,8 @@ describe('system window manager', () => {
     expect(useSystemStore.getState().appInstallations.wechat).toBeUndefined();
     expect(useSystemStore.getState().knownAppIds).toEqual(APP_IDS);
     expect(writes.at(-1)).toMatchObject({
-      version: 5,
-      state: {
-        knownAppIds: APP_IDS,
-        nativeInstallationProvenanceVersion: 1,
-      },
+      version: 6,
+      state: { knownAppIds: APP_IDS },
     });
   });
 
@@ -278,7 +273,6 @@ describe('system window manager', () => {
       getItem: () => ({
         state: {
           preferences: { ...DEFAULT_PREFERENCES, theme: 'midnight' },
-          knownAppIds: APP_IDS,
           appInstallations: installedApps(),
         } as unknown as PersistedSystemState,
       }),
@@ -302,11 +296,8 @@ describe('system window manager', () => {
 
       hydrated.updatePreferences({ accent: 'cyan' });
       expect(writes.at(-1)).toMatchObject({
-        version: 5,
-        state: {
-          knownAppIds: APP_IDS,
-          nativeInstallationProvenanceVersion: 1,
-        },
+        version: 6,
+        state: { knownAppIds: APP_IDS },
       });
     } finally {
       useSystemStore.persist.setOptions({ storage: previousStorage });
@@ -317,7 +308,6 @@ describe('system window manager', () => {
     {
       sourceVersion: 2,
       legacyState: {
-        nativeInstallationProvenanceVersion: 1,
         appInstallations: {
           finder: { appId: 'finder', version: 'legacy', enabled: true },
           settings: { appId: 'settings', version: 'legacy', enabled: true },
@@ -331,7 +321,6 @@ describe('system window manager', () => {
       sourceVersion: 3,
       legacyState: {
         knownAppIds: [],
-        nativeInstallationProvenanceVersion: 1,
         appInstallations: {
           finder: { appId: 'finder', version: 'legacy', enabled: true },
           settings: { appId: 'settings', version: 'legacy', enabled: true },
@@ -371,15 +360,12 @@ describe('system window manager', () => {
     expect(state.appInstallations.wechat?.enabled).toBe(expectedWechatEnabled);
     expect(state.knownAppIds).toEqual(APP_IDS);
     expect(writes.at(-1)).toMatchObject({
-      version: 5,
-      state: {
-        knownAppIds: APP_IDS,
-        nativeInstallationProvenanceVersion: 1,
-      },
+      version: 6,
+      state: { knownAppIds: APP_IDS },
     });
   });
 
-  it('hydrates a v4 explicitly installed WeChat and upgrades its native provenance', async () => {
+  it('clears a v4 native WeChat installation while upgrading to the web model', async () => {
     const writes: StorageValue<PersistedSystemState>[] = [];
     const storage: PersistStorage<PersistedSystemState> = {
       getItem: () => ({
@@ -408,26 +394,16 @@ describe('system window manager', () => {
       useSystemStore.persist.setOptions({ storage: previousStorage });
     }
 
-    expect(useSystemStore.getState().appInstallations.wechat).toEqual({
-      appId: 'wechat',
-      version: APP_REGISTRY.wechat.version,
-      enabled: true,
-    });
-    expect(useSystemStore.getState().nativeInstallationProvenanceVersion).toBe(1);
+    expect(useSystemStore.getState().appInstallations.wechat).toBeUndefined();
     expect(writes.at(-1)).toMatchObject({
-      version: 5,
-      state: { nativeInstallationProvenanceVersion: 1 },
+      version: 6,
+      state: { knownAppIds: APP_IDS },
     });
+    expect(writes.at(-1)?.state).not.toHaveProperty('nativeInstallationProvenanceVersion');
   });
 
-  it.each([
-    { provenanceVersion: 1, expectedInstalled: true },
-    { provenanceVersion: undefined, expectedInstalled: false },
-    { provenanceVersion: 2, expectedInstalled: false },
-  ])('accepts a v5 WeChat installation only with current native provenance $provenanceVersion', async ({
-    provenanceVersion,
-    expectedInstalled,
-  }) => {
+  it('clears a v5 WeChat installation and removes its native provenance field', async () => {
+    const writes: StorageValue<PersistedSystemState>[] = [];
     const storage: PersistStorage<PersistedSystemState> = {
       getItem: () => ({
         version: 5,
@@ -436,10 +412,12 @@ describe('system window manager', () => {
             wechat: { appId: 'wechat', version: 'current', enabled: true },
           },
           knownAppIds: APP_IDS,
-          nativeInstallationProvenanceVersion: provenanceVersion,
+          nativeInstallationProvenanceVersion: 1,
         } as unknown as PersistedSystemState,
       }),
-      setItem: () => undefined,
+      setItem: (_name, value) => {
+        writes.push(value);
+      },
       removeItem: () => undefined,
     };
     const previousStorage = useSystemStore.persist.getOptions().storage;
@@ -451,7 +429,43 @@ describe('system window manager', () => {
       useSystemStore.persist.setOptions({ storage: previousStorage });
     }
 
-    expect(Boolean(useSystemStore.getState().appInstallations.wechat)).toBe(expectedInstalled);
+    expect(useSystemStore.getState().appInstallations.wechat).toBeUndefined();
+    expect(writes.at(-1)).toMatchObject({ version: 6, state: { knownAppIds: APP_IDS } });
+    expect(writes.at(-1)?.state).not.toHaveProperty('nativeInstallationProvenanceVersion');
+  });
+
+  it('preserves an explicitly installed web WeChat application in v6', async () => {
+    const writes: StorageValue<PersistedSystemState>[] = [];
+    const storage: PersistStorage<PersistedSystemState> = {
+      getItem: () => ({
+        version: 6,
+        state: {
+          appInstallations: {
+            wechat: { appId: 'wechat', version: 'web', enabled: true },
+          },
+          knownAppIds: APP_IDS,
+        } as unknown as PersistedSystemState,
+      }),
+      setItem: (_name, value) => {
+        writes.push(value);
+      },
+      removeItem: () => undefined,
+    };
+    const previousStorage = useSystemStore.persist.getOptions().storage;
+
+    try {
+      useSystemStore.persist.setOptions({ storage });
+      await useSystemStore.persist.rehydrate();
+    } finally {
+      useSystemStore.persist.setOptions({ storage: previousStorage });
+    }
+
+    expect(useSystemStore.getState().appInstallations.wechat).toEqual({
+      appId: 'wechat',
+      version: APP_REGISTRY.wechat.version,
+      enabled: true,
+    });
+    expect(writes).toHaveLength(0);
   });
 
   it('discards launcher-only on-demand apps while migrating unversioned state', () => {

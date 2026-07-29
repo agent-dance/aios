@@ -21,13 +21,17 @@ describe('OS game runtime composition', () => {
   });
 });
 
-describe('native WeChat composition', () => {
-  it('injects the native application port into install and launch surfaces', () => {
-    expect(APP_SOURCE).toContain('nativeApplications={agentRuntime.nativeApplications}');
-    expect(APP_SOURCE).toContain('createApplicationLaunchRouter({');
-    expect(APP_SOURCE).toContain('isLocallyLaunchable: isAppLaunchable');
-    expect(APP_SOURCE).toContain('openFallback: openApp');
+describe('embedded WeChat composition', () => {
+  it('opens the internal app surface and hides the native view behind OS overlays', () => {
+    expect(APP_SOURCE).not.toContain('createApplicationLaunchRouter');
+    expect(APP_SOURCE).not.toContain('nativeApplications={agentRuntime.nativeApplications}');
     expect(APP_SOURCE).toContain('onOpenApp={handleOpenApp}');
-    expect(APP_SOURCE).toContain('void appLaunchRouter(appId);');
+    expect(APP_SOURCE).toContain('wechat: ({ isActive, window }) =>');
+    expect(APP_SOURCE).toContain('const [assistantOpen, setAssistantOpen] = useState(false);');
+    expect(APP_SOURCE).toContain('isActive={isWeChatSurfaceActive(isActive, {');
+    expect(APP_SOURCE).toContain('assistantOpen,');
+    expect(APP_SOURCE).toContain('onOpenChange={setAssistantOpen}');
+    expect(APP_SOURCE).toContain('isMinimized={!window.isOpen || window.isMinimized}');
+    expect(APP_SOURCE).toContain('openApp(appId);');
   });
 });

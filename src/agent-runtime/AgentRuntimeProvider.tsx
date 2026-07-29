@@ -46,7 +46,6 @@ import {
   type OsContextSnapshot,
 } from '../agent-platform/protocol';
 import { createSidecarClient, type SidecarClient } from '../agent-platform/sidecarClient';
-import { createNativeApplicationPort, type NativeApplicationPort } from '../native-apps';
 import { APP_REGISTRY, isAppId } from '../system/appRegistry';
 import type { SystemPreferences } from '../system/types';
 import { useSystemStore } from '../system/useSystemStore';
@@ -90,7 +89,6 @@ export interface AgentRuntimeValue {
   readonly doudizhuControllerFactory?: DoudizhuAgentControllerFactory;
   readonly spaceGameController?: SpaceGameAgentController;
   readonly agentLibrary?: AgentLibraryPort;
-  readonly nativeApplications?: NativeApplicationPort;
   readonly aiStatus: AiPrivacyStatus;
   readonly connected: boolean;
 }
@@ -136,14 +134,6 @@ const initialValue: AgentRuntimeValue = Object.freeze({
 });
 
 const AgentRuntimeContext = createContext<AgentRuntimeValue>(initialValue);
-
-export const nativeApplicationConnection = (
-  nativeApplications: NativeApplicationPort,
-  health: HealthResponse | undefined,
-): Pick<AgentRuntimeValue, 'connected' | 'nativeApplications'> => Object.freeze({
-  nativeApplications,
-  connected: health?.status === 'ready',
-});
 
 let consumedSidecarConfig: InjectedSidecarConfig | undefined;
 
@@ -419,7 +409,7 @@ export const assembleRuntime = (
         install: (listingId) => {
           if (!isAppId(listingId)) throw new Error('Only signed built-in app listings can be installed in this release.');
           if (APP_REGISTRY[listingId].defaultInstallation === 'on-demand') {
-            throw new Error('Native applications must be installed from App Store after explicit terms acceptance and sidecar verification.');
+            throw new Error('On-demand applications must be installed by the user from App Store.');
           }
           const result = useSystemStore.getState().installApp(listingId);
           if (!result.ok) throw new Error(`App installation failed: ${result.code}`);
@@ -758,35 +748,12 @@ export function AgentRuntimeProvider({ children }: { readonly children: ReactNod
     const config = resolveConfig();
     if (!config) return;
     void (async () => {
-      let client: ReturnType<typeof createSidecarClient>;
       try {
-        client = createSidecarClient({
+        const client = createSidecarClient({
           baseUrl: config.baseUrl,
           token: config.token,
           origin: config.origin ?? window.location.origin,
         });
-      } catch {
-        if (disposed) return;
-        setValue({
-          ...initialValue,
-          aiStatus: { ...initialValue.aiStatus, runtime: 'offline', voiceInput: voiceAvailability() },
-        });
-        return;
-      }
-      const nativeApplications = createNativeApplicationPort(client);
-      if (disposed) return;
-      setValue({
-        ...initialValue,
-        nativeApplications,
-        aiStatus: {
-          ...initialValue.aiStatus,
-          runtime: 'offline',
-          authenticationLabel: 'Checking Codex availability',
-          voiceInput: voiceAvailability(),
-          dataBoundary: 'Native application operations use the authenticated loopback sidecar.',
-        },
-      });
-      try {
         const registry = await createBrowserAgentRegistry({
           onPersistenceModeChange: (mode) => {
             if (!disposed) setAgentPersistenceMode(mode);
@@ -801,7 +768,7 @@ export function AgentRuntimeProvider({ children }: { readonly children: ReactNod
         const agentLibrary = createAgentLibraryPort(registry, refreshAgents);
         const publishConnection = (health: HealthResponse | undefined): void => {
           if (disposed) return;
-          const connection = nativeApplicationConnection(nativeApplications, health);
+          const connected = health?.status === 'ready';
           const authenticationLabel = describeProviderAuthentication(health);
           setValue({
             assistantClient: runtime.assistantClient,
@@ -810,27 +777,24 @@ export function AgentRuntimeProvider({ children }: { readonly children: ReactNod
             doudizhuControllerFactory: runtime.doudizhuControllerFactory,
             spaceGameController: runtime.spaceGameController,
             agentLibrary,
-            nativeApplications: connection.nativeApplications,
             aiStatus: {
-              runtime: connection.connected ? 'connected' : 'offline',
+              runtime: connected ? 'connected' : 'offline',
               providerLabel: 'Codex via agent-adaptor',
               authenticationLabel,
               voiceInput: voiceAvailability(),
               installedAgentCount: registry.list().length,
               dataBoundary: 'Credentials and model processes remain in the loopback Go sidecar; OS effects require Broker receipts.',
             },
-            connected: connection.connected,
+            connected,
           });
         };
         healthMonitor = startSidecarHealthMonitor(client, publishConnection);
       } catch {
         if (disposed) return;
-        setValue((current) => ({
-          ...current,
-          nativeApplications,
-          connected: false,
-          aiStatus: { ...current.aiStatus, runtime: 'offline', voiceInput: voiceAvailability() },
-        }));
+        setValue({
+          ...initialValue,
+          aiStatus: { ...initialValue.aiStatus, runtime: 'offline', voiceInput: voiceAvailability() },
+        });
       }
     })();
     return () => {

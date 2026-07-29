@@ -1,22 +1,22 @@
 export { WeChatApp } from './WeChatApp';
 export type { WeChatAppProps } from './WeChatApp';
-export { launchNativeWeChat } from './nativeLaunch';
-export type { WeChatNativeLaunchFeedback } from './nativeLaunch';
-export { createApplicationLaunchRouter, routeApplicationLaunch } from './launchRouting';
-export type { ApplicationLaunchDependencies, ApplicationLaunchRouter } from './launchRouting';
 export {
-  isAllowlistedWeChatUrl,
-  isAllowlistedWeChatProtocol,
-  openOfficialWeChatDestination,
-  requestDesktopWeChatLaunch,
-  WECHAT_DESKTOP_PROTOCOL,
-  WECHAT_OFFICIAL_DESTINATIONS,
-} from './officialNavigation';
+  describeWeChatViewError,
+  isWeChatSurfaceActive,
+  isWeChatViewState,
+  resolveWeChatEmbeddedViewBridge,
+  shouldShowWeChatNativeView,
+  toWeChatViewBounds,
+  WECHAT_VIEW_ERROR_CODES,
+  WECHAT_VIEW_PHASES,
+} from './bridge';
 export type {
-  ExternalWindowOpener,
-  DesktopProtocolLauncher,
-  WeChatDesktopLaunchResult,
-  WeChatDestinationId,
-  WeChatNavigationResult,
-  WeChatOfficialDestination,
-} from './officialNavigation';
+  WeChatEmbeddedViewBridge,
+  WeChatShellOcclusionState,
+  WeChatViewBounds,
+  WeChatViewErrorCode,
+  WeChatViewPhase,
+  WeChatViewState,
+  WeChatViewStateListener,
+  WeChatViewVisibilityContext,
+} from './bridge';

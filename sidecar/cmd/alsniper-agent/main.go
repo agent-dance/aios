@@ -30,7 +30,7 @@ func main() {
 		os.Exit(2)
 	}
 	if degraded {
-		logger.Warn("Codex runtime unavailable; authenticated native application capabilities remain available")
+		logger.Warn("Codex runtime unavailable; authenticated Agent capabilities are degraded")
 	}
 	closeAgent := func() {
 		if err := closeRunner(); err != nil {
@@ -48,7 +48,7 @@ func main() {
 		Handler:           handler.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      max(max(cfg.ChatTimeout, cfg.GameTimeout), server.NativeInstallTimeout) + 10*time.Second,
+		WriteTimeout:      max(cfg.ChatTimeout, cfg.GameTimeout) + 10*time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 * 1024,
 	}

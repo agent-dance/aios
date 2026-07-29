@@ -23,7 +23,6 @@ import (
 
 	"github.com/buthim/alsniper-os/sidecar/internal/agent"
 	"github.com/buthim/alsniper-os/sidecar/internal/config"
-	"github.com/buthim/alsniper-os/sidecar/internal/nativeapp"
 	"github.com/buthim/alsniper-os/sidecar/internal/protocol"
 )
 
@@ -40,9 +39,6 @@ const (
 	authenticationWindow     = 30 * time.Second
 	replayCacheCapacity      = 4096
 	authConcurrencyLimit     = 16
-	NativeInstallTimeout     = 9*time.Minute + 30*time.Second
-	NativeLaunchTimeout      = 25 * time.Second
-	NativeStatusTimeout      = 5 * time.Second
 )
 
 var (
@@ -76,35 +72,23 @@ func (c *replayCache) add(nonce string, expiresAt, now int64) (replayed, full bo
 }
 
 type Server struct {
-	cfg        config.Config
-	service    *agent.Service
-	nativeApps *nativeapp.Service
-	handler    http.Handler
-	nonces     *replayCache
-	authSlots  chan struct{}
-	now        func() time.Time
+	cfg       config.Config
+	service   *agent.Service
+	handler   http.Handler
+	nonces    *replayCache
+	authSlots chan struct{}
+	now       func() time.Time
 }
 
 func New(cfg config.Config, service *agent.Service) (*Server, error) {
-	nativeApps, err := nativeapp.NewService(nativeapp.NewPlatform())
-	if err != nil {
-		return nil, err
-	}
-	return NewWithNativeApps(cfg, service, nativeApps)
-}
-
-func NewWithNativeApps(cfg config.Config, service *agent.Service, nativeApps *nativeapp.Service) (*Server, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	if service == nil {
 		return nil, errors.New("agent service is required")
 	}
-	if nativeApps == nil {
-		return nil, errors.New("native app service is required")
-	}
 	server := &Server{
-		cfg: cfg, service: service, nativeApps: nativeApps, nonces: newReplayCache(),
+		cfg: cfg, service: service, nonces: newReplayCache(),
 		authSlots: make(chan struct{}, authConcurrencyLimit), now: time.Now,
 	}
 	mux := http.NewServeMux()
@@ -112,82 +96,12 @@ func NewWithNativeApps(cfg config.Config, service *agent.Service, nativeApps *na
 	mux.HandleFunc("/v1/chat", server.chat)
 	mux.HandleFunc(agentDebugTracePath, server.chatTrace)
 	mux.HandleFunc("/v1/game/decide", server.decide)
-	mux.HandleFunc("/v1/native-apps/wechat/status", server.wechatStatus)
-	mux.HandleFunc("/v1/native-apps/wechat/install", server.wechatInstall)
-	mux.HandleFunc("/v1/native-apps/wechat/launch", server.wechatLaunch)
 	mux.HandleFunc("/", server.notFound)
 	server.handler = server.security(mux)
 	return server, nil
 }
 
 func (s *Server) Handler() http.Handler { return s.handler }
-
-func (s *Server) wechatStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, r, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Only GET is supported.", false, "")
-		return
-	}
-	if err := requireEmptyBody(r); err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "The request body must be empty.", false, "")
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), NativeStatusTimeout)
-	defer cancel()
-	response, err := s.nativeApps.Status(ctx)
-	if err != nil {
-		s.writeNativeAppError(w, r, err, "")
-		return
-	}
-	s.writeJSON(w, r, http.StatusOK, response)
-}
-
-func (s *Server) wechatInstall(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		s.writeError(w, r, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Only POST is supported.", false, "")
-		return
-	}
-	var request protocol.NativeAppInstallRequest
-	if err := s.decodeStrictObject(r, &request, "requestId", "acceptedTerms"); err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "The request body is invalid.", false, "")
-		return
-	}
-	if err := request.Validate(); err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), false, "")
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), NativeInstallTimeout)
-	defer cancel()
-	response, err := s.nativeApps.Install(ctx, request)
-	if err != nil {
-		s.writeNativeAppError(w, r, err, request.RequestID)
-		return
-	}
-	s.writeJSON(w, r, http.StatusOK, response)
-}
-
-func (s *Server) wechatLaunch(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		s.writeError(w, r, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "Only POST is supported.", false, "")
-		return
-	}
-	var request protocol.NativeAppLaunchRequest
-	if err := s.decodeStrictObject(r, &request, "requestId"); err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", "The request body is invalid.", false, "")
-		return
-	}
-	if err := request.Validate(); err != nil {
-		s.writeError(w, r, http.StatusBadRequest, "INVALID_REQUEST", err.Error(), false, "")
-		return
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), NativeLaunchTimeout)
-	defer cancel()
-	response, err := s.nativeApps.Launch(ctx, request)
-	if err != nil {
-		s.writeNativeAppError(w, r, err, request.RequestID)
-		return
-	}
-	s.writeJSON(w, r, http.StatusOK, response)
-}
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -428,57 +342,6 @@ func (s *Server) decode(r *http.Request, dst any) error {
 		return errors.New("request body is empty")
 	}
 	return protocol.DecodeStrict(data, dst)
-}
-
-func (s *Server) decodeStrictObject(r *http.Request, dst any, allowedKeys ...string) error {
-	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		return errors.New("content type must be application/json")
-	}
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		return err
-	}
-	if len(data) == 0 {
-		return errors.New("request body is empty")
-	}
-	return protocol.DecodeStrictObject(data, dst, allowedKeys...)
-}
-
-func requireEmptyBody(r *http.Request) error {
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		return err
-	}
-	if len(data) != 0 {
-		return errors.New("request body is not empty")
-	}
-	return nil
-}
-
-func (s *Server) writeNativeAppError(w http.ResponseWriter, r *http.Request, err error, requestID string) {
-	status, code, message, retryable := http.StatusInternalServerError, "NATIVE_APP_INTERNAL_ERROR", "The native application operation failed.", true
-	switch {
-	case errors.Is(err, context.Canceled):
-		status, code, message, retryable = 499, "REQUEST_CANCELLED", "The request was cancelled.", false
-	case errors.Is(err, context.DeadlineExceeded):
-		status, code, message = http.StatusGatewayTimeout, "NATIVE_APP_TIMEOUT", "The native application operation timed out."
-	case errors.Is(err, nativeapp.ErrUnsupported):
-		status, code, message, retryable = http.StatusNotImplemented, "NATIVE_APP_UNSUPPORTED", "Native WeChat is unsupported on this platform.", false
-	case errors.Is(err, nativeapp.ErrBusy):
-		status, code, message = http.StatusConflict, "NATIVE_APP_BUSY", "Another native application operation is already running."
-	case errors.Is(err, nativeapp.ErrNotInstalled):
-		status, code, message, retryable = http.StatusConflict, "NATIVE_APP_NOT_INSTALLED", "WeChat is not installed.", false
-	case errors.Is(err, nativeapp.ErrInvalidInstallation):
-		status, code, message, retryable = http.StatusUnprocessableEntity, "NATIVE_APP_UNTRUSTED", "The installed WeChat application could not be trusted.", false
-	case errors.Is(err, nativeapp.ErrStatusFailed):
-		status, code, message = http.StatusBadGateway, "NATIVE_APP_STATUS_FAILED", "WeChat status could not be determined."
-	case errors.Is(err, nativeapp.ErrInstallFailed):
-		status, code, message = http.StatusBadGateway, "NATIVE_APP_INSTALL_FAILED", "WeChat installation did not complete successfully."
-	case errors.Is(err, nativeapp.ErrLaunchFailed):
-		status, code, message = http.StatusBadGateway, "NATIVE_APP_LAUNCH_FAILED", "WeChat could not be launched."
-	}
-	s.writeError(w, r, status, code, message, retryable, requestID)
 }
 
 func (s *Server) writeAgentError(w http.ResponseWriter, r *http.Request, err error, requestID string) {

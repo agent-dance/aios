@@ -3,15 +3,21 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "main": "dist-electron/main.js",
   "scripts": {
     "agent:run": "go -C sidecar run ./cmd/alsniper-agent",
     "agent:test": "go -C sidecar test ./...",
     "agent:vet": "go -C sidecar vet ./...",
     "dev": "vite --host 0.0.0.0",
-    "build": "tsc -b && vite build",
+    "desktop:compile": "tsc -p electron/tsconfig.json",
+    "desktop:dev": "npm run desktop:compile && concurrently --kill-others --success first --names web,desktop \"vite --host 127.0.0.1 --port 5173 --strictPort\" \"wait-on http-get://127.0.0.1:5173/ && electron dist-electron/main.js --dev-url=http://127.0.0.1:5173/\"",
+    "desktop:package": "npm run build && node electron/package.mjs",
+    "desktop:smoke": "npm run desktop:compile && electron dist-electron/smoke.js",
+    "desktop:start": "npm run build && electron dist-electron/main.js",
+    "build": "tsc -b && vite build && npm run desktop:compile",
     "game:create": "node tools/game-scaffold/create-game.mjs",
     "preview": "vite preview --host 0.0.0.0",
-    "typecheck": "tsc -b --pretty false",
+    "typecheck": "tsc -b --pretty false && tsc -p electron/tsconfig.json --noEmit --pretty false",
     "test": "node --test tools/game-scaffold/*.test.mjs && vitest run --exclude \"tools/game-scaffold/*.test.mjs\"",
     "verify": "npm run typecheck && npm test && npm run build && npm run agent:test && npm run agent:vet"
   },
@@ -27,13 +33,18 @@
     "zustand": "5.0.14"
   },
   "devDependencies": {
+    "@electron/packager": "20.0.4",
+    "@types/node": "26.1.2",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",
     "@types/three": "0.185.0",
     "@vitejs/plugin-react": "6.0.1",
+    "concurrently": "10.0.4",
+    "electron": "43.2.0",
     "typescript": "7.0.2",
     "vite": "8.1.5",
-    "vitest": "4.1.0"
+    "vitest": "4.1.0",
+    "wait-on": "9.1.0"
   },
   "overrides": {
     "dompurify": "3.4.12"

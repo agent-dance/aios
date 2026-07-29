@@ -12,34 +12,33 @@ describe('Agent Store asynchronous operation boundary', () => {
     expect(SOURCE).not.toMatch(/void\s+agentLibrary\.(install|enable|disable|uninstall)/);
   });
 
-  it('requires explicit Tencent terms acceptance and a verified native install transaction', () => {
+  it('installs WeChat as a local embedded-web desktop integration', () => {
     expect(SOURCE).toContain("id: 'wechat'");
     expect(SOURCE).toContain("appId: 'wechat'");
     expect(SOURCE).toContain("publisher: 'AlSniper OS'");
-    expect(SOURCE).toContain('installWeChatTransaction({');
-    expect(SOURCE).toContain('acceptedTerms: wechatTermsAccepted');
-    expect(SOURCE).toContain('commitLocalInstallation: () => {');
-    expect(SOURCE).toContain('return commitWeChatProjection(');
-    expect(SOURCE).toContain('type="checkbox"');
-    expect(SOURCE).toContain('WECHAT_OFFICIAL_DESTINATIONS.license.url');
-    expect(SOURCE).toContain('WECHAT_OFFICIAL_DESTINATIONS.privacy.url');
-    expect(SOURCE).toContain('阅读腾讯官方许可协议');
-    expect(SOURCE).toContain('阅读腾讯官方隐私指引');
-    expect(SOURCE).toContain('不能真实安装微信，也不会创建桌面图标');
-    expect(SOURCE).toContain('Microsoft Store 官方入口');
+    expect(SOURCE).toContain('runLocalApplicationPrimaryAction(listing.appId, installation, {');
+    expect(SOURCE).toContain('install: installApp');
+    expect(SOURCE).toContain('enable: enableApp');
+    expect(SOURCE).toContain('open: requestOpenApp');
+    expect(SOURCE).toContain('https://wx.qq.com');
+    expect(SOURCE).toContain('隔离的桌面 WebContentsView');
+    expect(SOURCE).toContain('账号登录资格和服务可用性由腾讯控制');
+    expect(SOURCE).toContain('本集成仅支持 AlSniper OS 桌面版');
     expect(SOURCE).toContain('AlSniper OS listing');
-    expect(SOURCE).toContain('requestOpenApp(listing.appId)');
-    expect(SOURCE).toContain('Remove from AlSniper OS');
     expect(SOURCE).toContain('color="#07c160"');
   });
 
-  it('does not trust persisted WeChat projection without native status verification', () => {
-    expect(SOURCE).toContain("nativeApplications.getStatus('wechat'");
-    expect(SOURCE).toContain("status?.state === 'installed'");
-    expect(SOURCE).toContain('status.publisherVerified');
-    expect(SOURCE).toContain("const wechatNeedsRepair = selected.id === 'wechat' && Boolean(selectedInstallation) && !trustedNativeWeChat;");
-    expect(SOURCE).toContain("? wechatTermsAccepted ? 'Repair & verify' : 'Accept terms to repair'");
-    expect(SOURCE).toContain('无法通过 AlSniper OS sidecar 查询微信状态');
-    expect(SOURCE).toContain('!nativeApplications || nativeWeChatStatusError || wechatNeedsRepair');
+  it('does not retain native-install, terms, sidecar-status, or repair behavior', () => {
+    expect(SOURCE).not.toContain('installWeChatTransaction');
+    expect(SOURCE).not.toContain('commitWeChatProjection');
+    expect(SOURCE).not.toContain('nativeApplications.getStatus');
+    expect(SOURCE).not.toContain('nativeApplications.install');
+    expect(SOURCE).not.toContain('NativeApplicationPort');
+    expect(SOURCE).not.toContain('nativeApplications?:');
+    expect(SOURCE).not.toContain('wechatTermsAccepted');
+    expect(SOURCE).not.toContain('trustedNativeWeChat');
+    expect(SOURCE).not.toContain('wechatNeedsRepair');
+    expect(SOURCE).not.toContain('Repair & verify');
+    expect(SOURCE).not.toContain('sidecar');
   });
 });

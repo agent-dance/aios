@@ -12,22 +12,23 @@ import type {
   WindowState,
 } from './types';
 
-const PERSISTENCE_VERSION = 5;
+const PERSISTENCE_VERSION = 6;
 const FIRST_PERSISTENCE_VERSION_WITH_KNOWN_APP_IDS = 4;
-const NATIVE_INSTALLATION_PROVENANCE_VERSION = 1;
-const LATEST_PERSISTENCE_VERSION_WITHOUT_PROVENANCE = 3;
+const LATEST_PERSISTENCE_VERSION_WITHOUT_KNOWN_APP_IDS = 3;
 const KNOWN_APP_IDS_BY_PERSISTENCE_VERSION: Readonly<Record<number, readonly string[]>> = Object.freeze({
   2: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu']),
   3: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu', 'wechat']),
   4: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu', 'wechat']),
   5: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu', 'wechat']),
+  6: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu', 'wechat']),
 });
 const RETAINABLE_INSTALLATION_IDS_BY_PERSISTENCE_VERSION: Readonly<Record<number, readonly string[]>> = Object.freeze({
   2: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu']),
   3: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu']),
-  4: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu', 'wechat']),
+  4: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu']),
+  5: Object.freeze(['finder', 'calculator', 'settings', 'terminal', 'store', 'space-game', 'doudizhu']),
 });
-const LEGACY_RETAINABLE_INSTALLATION_IDS = RETAINABLE_INSTALLATION_IDS_BY_PERSISTENCE_VERSION[3];
+const LEGACY_RETAINABLE_INSTALLATION_IDS = RETAINABLE_INSTALLATION_IDS_BY_PERSISTENCE_VERSION[5];
 export const MAX_WINDOW_Z = 89;
 const SYSTEM_STATUS_KEYS = new Set<keyof SystemStatusModel>([
   'wifiEnabled',
@@ -72,7 +73,6 @@ export interface SystemStore {
   preferences: SystemPreferences;
   appInstallations: Partial<Record<AppId, AppInstallation>>;
   knownAppIds: AppId[];
-  nativeInstallationProvenanceVersion: 1;
   appInstallationRevision: number;
   systemStatus: SystemStatusModel;
   systemStatusRevision: number;
@@ -98,7 +98,6 @@ export interface PersistedSystemState {
   preferences: SystemPreferences;
   appInstallations: Partial<Record<AppId, AppInstallation>>;
   knownAppIds: AppId[];
-  nativeInstallationProvenanceVersion: 1;
   appInstallationRevision: number;
   systemStatus: SystemStatusModel;
   systemStatusRevision: number;
@@ -185,7 +184,6 @@ function sanitizeKnownAppIds(value: unknown): AppId[] {
 function resolvePreviouslyKnownAppIds(
   knownAppIds: unknown,
   appInstallations: unknown,
-  nativeInstallationProvenanceVersion: unknown,
   persistedVersion?: number,
 ): ReadonlySet<AppId> {
   if (persistedVersion !== undefined && persistedVersion < 2) {
@@ -194,10 +192,7 @@ function resolvePreviouslyKnownAppIds(
   if (
     Array.isArray(knownAppIds) &&
     (
-      (
-        persistedVersion === undefined &&
-        nativeInstallationProvenanceVersion === NATIVE_INSTALLATION_PROVENANCE_VERSION
-      ) ||
+      persistedVersion === undefined ||
       (
         persistedVersion !== undefined &&
         persistedVersion >= FIRST_PERSISTENCE_VERSION_WITH_KNOWN_APP_IDS
@@ -209,21 +204,21 @@ function resolvePreviouslyKnownAppIds(
 
   if (appInstallations === undefined) return new Set();
 
-  const legacyVersion = persistedVersion ?? LATEST_PERSISTENCE_VERSION_WITHOUT_PROVENANCE;
+  const legacyVersion = persistedVersion ?? LATEST_PERSISTENCE_VERSION_WITHOUT_KNOWN_APP_IDS;
   const historicalSnapshot = KNOWN_APP_IDS_BY_PERSISTENCE_VERSION[legacyVersion] ??
     KNOWN_APP_IDS_BY_PERSISTENCE_VERSION[PERSISTENCE_VERSION];
   return new Set(sanitizeKnownAppIds(historicalSnapshot));
 }
 
 function resolvePersistedInstallationAllowlist(
-  nativeInstallationProvenanceVersion: unknown,
+  knownAppIds: unknown,
   persistedVersion?: number,
 ): ReadonlySet<AppId> | undefined {
   if (persistedVersion !== undefined) {
     if (persistedVersion >= PERSISTENCE_VERSION) return undefined;
     return new Set(sanitizeKnownAppIds(RETAINABLE_INSTALLATION_IDS_BY_PERSISTENCE_VERSION[persistedVersion]));
   }
-  if (nativeInstallationProvenanceVersion === NATIVE_INSTALLATION_PROVENANCE_VERSION) return undefined;
+  if (Array.isArray(knownAppIds)) return undefined;
   return new Set(sanitizeKnownAppIds(LEGACY_RETAINABLE_INSTALLATION_IDS));
 }
 
@@ -277,15 +272,14 @@ export function restorePersistedSystemState(value: unknown, persistedVersion?: n
     Object.prototype.hasOwnProperty.call(persisted, key) ? persisted[key] : undefined
   );
   const persistedInstallations = ownValue('appInstallations');
-  const nativeInstallationProvenanceVersion = ownValue('nativeInstallationProvenanceVersion');
+  const knownAppIds = ownValue('knownAppIds');
   const previouslyKnownAppIds = resolvePreviouslyKnownAppIds(
-    ownValue('knownAppIds'),
+    knownAppIds,
     persistedInstallations,
-    nativeInstallationProvenanceVersion,
     persistedVersion,
   );
   const persistedInstallationAllowlist = resolvePersistedInstallationAllowlist(
-    nativeInstallationProvenanceVersion,
+    knownAppIds,
     persistedVersion,
   );
   return {
@@ -296,7 +290,6 @@ export function restorePersistedSystemState(value: unknown, persistedVersion?: n
       persistedInstallationAllowlist,
     ),
     knownAppIds: [...APP_IDS],
-    nativeInstallationProvenanceVersion: NATIVE_INSTALLATION_PROVENANCE_VERSION,
     appInstallationRevision: normalizedRevision(ownValue('appInstallationRevision')),
     systemStatus: sanitizeSystemStatus(ownValue('systemStatus')),
     systemStatusRevision: normalizedRevision(ownValue('systemStatusRevision')),
@@ -352,7 +345,6 @@ export const useSystemStore = create<SystemStore>()(
       preferences: { ...DEFAULT_PREFERENCES },
       appInstallations: createDefaultInstallations(),
       knownAppIds: [...APP_IDS],
-      nativeInstallationProvenanceVersion: NATIVE_INSTALLATION_PROVENANCE_VERSION,
       appInstallationRevision: 0,
       systemStatus: { ...DEFAULT_SYSTEM_STATUS },
       systemStatusRevision: 0,
@@ -533,7 +525,6 @@ export const useSystemStore = create<SystemStore>()(
         preferences: state.preferences,
         appInstallations: state.appInstallations,
         knownAppIds: state.knownAppIds,
-        nativeInstallationProvenanceVersion: state.nativeInstallationProvenanceVersion,
         appInstallationRevision: state.appInstallationRevision,
         systemStatus: state.systemStatus,
         systemStatusRevision: state.systemStatusRevision,

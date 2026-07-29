@@ -1,0 +1,203 @@
+import { EventEmitter } from 'node:events';
+import type { BrowserWindow, WebContents, WebContentsView } from 'electron';
+import { describe, expect, it, vi } from 'vitest';
+import { WeChatViewController } from './WeChatViewController.js';
+import { WECHAT_ENTRY_URL } from '../shared/navigationPolicy.js';
+
+class FakeWebContents extends EventEmitter {
+  readonly loadURL = vi.fn(async (url: string) => {
+    this.currentUrl = url;
+  });
+  readonly reload = vi.fn();
+  readonly focus = vi.fn();
+  readonly stop = vi.fn();
+  readonly close = vi.fn(() => {
+    this.destroyed = true;
+  });
+  readonly navigationHistory = {
+    entries: [] as Array<{ url: string }>,
+    activeIndex: -1,
+    getAllEntries: () => this.navigationHistory.entries,
+    getActiveIndex: () => this.navigationHistory.activeIndex,
+    goBack: vi.fn(),
+  };
+
+  currentUrl = '';
+  destroyed = false;
+  loading = false;
+  windowOpenHandler: ((details: { url: string }) => { action: 'deny' }) | null = null;
+
+  setWindowOpenHandler(handler: (details: { url: string }) => { action: 'deny' }): void {
+    this.windowOpenHandler = handler;
+  }
+
+  getURL(): string {
+    return this.currentUrl;
+  }
+
+  isDestroyed(): boolean {
+    return this.destroyed;
+  }
+
+  isLoading(): boolean {
+    return this.loading;
+  }
+}
+
+class FakeView {
+  readonly webContents = new FakeWebContents();
+  readonly setBounds = vi.fn();
+  readonly setVisible = vi.fn();
+}
+
+function createHarness(contentSize = { width: 1000, height: 700 }) {
+  const view = new FakeView();
+  const addChildView = vi.fn();
+  const removeChildView = vi.fn();
+  const states: unknown[] = [];
+  const hostWindow = {
+    contentView: { addChildView, removeChildView },
+    getContentBounds: () => ({ x: 50, y: 80, ...contentSize }),
+    isVisible: () => true,
+    isFocused: () => true,
+    isMinimized: () => false,
+    show: vi.fn(),
+    focus: vi.fn(),
+  } as unknown as BrowserWindow;
+
+  const controller = new WeChatViewController({
+    hostWindow,
+    createView: () => view as unknown as WebContentsView,
+    publishState: (state) => states.push(state),
+    logger: { error: vi.fn(), warn: vi.fn() },
+  });
+
+  return { controller, view, addChildView, removeChildView, states };
+}
+
+describe('WeChatViewController', () => {
+  it('mounts the fixed entry hidden and clips bounds to the host content area', () => {
+    const { controller, view, addChildView } = createHarness();
+
+    const state = controller.mount({ x: 900, y: 650, width: 500, height: 500 });
+
+    expect(addChildView).toHaveBeenCalledWith(view);
+    expect(view.setBounds).toHaveBeenCalledWith({ x: 900, y: 650, width: 100, height: 50 });
+    expect(view.setVisible).toHaveBeenCalledWith(false);
+    expect(view.webContents.loadURL).toHaveBeenCalledWith(WECHAT_ENTRY_URL);
+    expect(state).toEqual({ phase: 'loading', visible: false, canGoBack: false });
+  });
+
+  it('does not let mount or IPC select a URL and only shows when ready after an explicit visibility command', () => {
+    const { controller, view } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+
+    expect(controller.setVisible(true)).toEqual({ phase: 'loading', visible: false, canGoBack: false });
+    view.webContents.emit('dom-ready');
+    expect(controller.getState()).toEqual({ phase: 'ready', visible: true, canGoBack: false });
+    expect(view.setVisible).toHaveBeenLastCalledWith(true);
+
+    controller.mount({ x: 20, y: 30, width: 700, height: 500 });
+    expect(view.webContents.loadURL).toHaveBeenCalledTimes(1);
+  });
+
+  it('becomes ready at an allowlisted DOM without waiting for a never-ending load event', () => {
+    const { controller, view } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+
+    view.webContents.emit('dom-ready');
+
+    expect(controller.getState()).toEqual({ phase: 'ready', visible: false, canGoBack: false });
+  });
+
+  it('blocks popup and navigation escape attempts', () => {
+    const { controller, view } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+
+    expect(view.webContents.windowOpenHandler?.({ url: 'https://wx.qq.com/' })).toEqual({ action: 'deny' });
+    expect(view.webContents.windowOpenHandler?.({ url: 'https://evil.example/' })).toEqual({ action: 'deny' });
+
+    const event = {
+      url: 'https://wx.qq.com.evil.example/',
+      isMainFrame: true,
+      preventDefault: vi.fn(),
+    };
+    view.webContents.emit('will-frame-navigate', event);
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+  });
+
+  it('hides the native view and publishes a closed error on load failure', () => {
+    const { controller, view, states } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+    controller.setVisible(true);
+    view.webContents.emit('dom-ready');
+
+    view.webContents.emit('did-fail-load', {}, -105, 'NAME_NOT_RESOLVED', WECHAT_ENTRY_URL, true);
+
+    expect(view.setVisible).toHaveBeenLastCalledWith(false);
+    expect(controller.getState()).toEqual({
+      phase: 'failed',
+      visible: false,
+      canGoBack: false,
+      errorCode: 'NETWORK_ERROR',
+    });
+    expect(states.at(-1)).toEqual(controller.getState());
+  });
+
+  it('maps certificate failures and renderer crashes without exposing raw details', () => {
+    const { controller, view } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+    controller.setVisible(true);
+    view.webContents.emit('dom-ready');
+
+    controller.handleCertificateError(view.webContents as unknown as WebContents);
+    expect(controller.getState()).toEqual({
+      phase: 'failed',
+      visible: false,
+      canGoBack: false,
+      errorCode: 'CERTIFICATE_ERROR',
+    });
+
+    view.webContents.emit('render-process-gone', {}, { reason: 'crashed' });
+    expect(controller.getState().errorCode).toBe('RENDERER_CRASHED');
+  });
+
+  it('only goes back to a previously validated WeChat entry', () => {
+    const { controller, view } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+    view.webContents.navigationHistory.entries = [
+      { url: 'https://wx.qq.com/' },
+      { url: 'https://wx2.qq.com/chat' },
+    ];
+    view.webContents.navigationHistory.activeIndex = 1;
+
+    expect(controller.getState().canGoBack).toBe(true);
+    controller.goBack();
+    expect(view.webContents.navigationHistory.goBack).toHaveBeenCalledOnce();
+
+    view.webContents.navigationHistory.entries[0] = { url: 'https://evil.example/' };
+    expect(controller.getState().canGoBack).toBe(false);
+    controller.goBack();
+    expect(view.webContents.navigationHistory.goBack).toHaveBeenCalledOnce();
+  });
+
+  it('hides on host visibility loss, reconciles requested visibility, and explicitly releases ownership', () => {
+    const { controller, view, removeChildView } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+    controller.setVisible(true);
+    view.webContents.emit('dom-ready');
+
+    controller.handleHostVisibilityLoss();
+    expect(controller.getState().visible).toBe(false);
+    expect(view.setVisible).toHaveBeenLastCalledWith(false);
+
+    controller.reconcileHostVisibility();
+    expect(controller.getState().visible).toBe(true);
+    expect(view.setVisible).toHaveBeenLastCalledWith(true);
+
+    controller.unmount();
+    expect(removeChildView).toHaveBeenCalledWith(view);
+    expect(view.webContents.close).toHaveBeenCalledOnce();
+    expect(controller.getState()).toEqual({ phase: 'idle', visible: false, canGoBack: false });
+  });
+});

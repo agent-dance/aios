@@ -1,246 +1,148 @@
 import {
-  Download,
-  ExternalLink,
-  Globe2,
-  Laptop,
-  ShoppingBag,
-  QrCode,
+  ArrowLeft,
+  LoaderCircle,
+  LockKeyhole,
+  MonitorUp,
+  RefreshCw,
   ShieldCheck,
-  Smartphone,
+  TriangleAlert,
 } from 'lucide-react';
-import { useRef, useState } from 'react';
-import type { NativeApplicationPort } from '../../native-apps';
-import { useSystemStore } from '../../system/useSystemStore';
-import { launchNativeWeChat, type WeChatNativeLaunchFeedback } from './nativeLaunch';
-import {
-  openOfficialWeChatDestination,
-  requestDesktopWeChatLaunch,
-  WECHAT_OFFICIAL_DESTINATIONS,
-  type ExternalWindowOpener,
-  type DesktopProtocolLauncher,
-  type WeChatDesktopLaunchResult,
-  type WeChatDestinationId,
-  type WeChatNavigationResult,
-} from './officialNavigation';
+import type { WeChatEmbeddedViewBridge, WeChatViewPhase } from './bridge';
+import { describeWeChatViewError } from './bridge';
+import { useEmbeddedWeChatView } from './useEmbeddedWeChatView';
 import './WeChatApp.css';
 
 export interface WeChatAppProps {
-  nativeApplications?: NativeApplicationPort;
-  nativeLaunchFeedback?: WeChatNativeLaunchFeedback | null;
-  onNativeLaunchFeedback?: (feedback: WeChatNativeLaunchFeedback) => void;
-  openExternalWindow?: ExternalWindowOpener;
-  launchDesktopProtocol?: DesktopProtocolLauncher;
+  readonly bridge?: WeChatEmbeddedViewBridge | null;
+  readonly isActive?: boolean;
+  readonly isMinimized?: boolean;
 }
 
-interface DestinationCard {
-  readonly id: WeChatDestinationId;
-  readonly title: string;
-  readonly description: string;
-  readonly action: string;
-  readonly officialBadge: string;
-  readonly icon: typeof Globe2;
-}
-
-const DESTINATION_CARDS: readonly DestinationCard[] = [
-  {
-    id: 'web',
-    title: '微信网页版',
-    description: '在腾讯官方网页中登录微信。通常需要使用手机微信扫码确认。',
-    action: '打开网页版',
-    officialBadge: '腾讯官方入口',
-    icon: Globe2,
-  },
-  {
-    id: 'microsoftStore',
-    title: 'Microsoft Store',
-    description: '打开微软官方商店中的微信页面，安装由腾讯提供的 Windows 客户端。',
-    action: '在商店中查看',
-    officialBadge: 'Microsoft 官方入口',
-    icon: ShoppingBag,
-  },
-  {
-    id: 'windows',
-    title: 'Windows 微信',
-    description: '前往腾讯官方 Windows 下载页，获取并安装桌面客户端。',
-    action: '前往官方下载',
-    officialBadge: '腾讯官方入口',
-    icon: Laptop,
-  },
-  {
-    id: 'mac',
-    title: 'macOS 微信',
-    description: '前往腾讯官方 macOS 下载页，获取适用于 Mac 的客户端。',
-    action: '前往官方下载',
-    officialBadge: '腾讯官方入口',
-    icon: Download,
-  },
-];
+const PHASE_LABELS: Readonly<Record<WeChatViewPhase, string>> = {
+  idle: '正在初始化',
+  loading: '正在连接微信',
+  ready: '微信已就绪',
+  failed: '加载失败',
+};
 
 function WeChatMark() {
   return (
     <span className="wechat-mark" aria-hidden="true">
-      <span className="wechat-mark__bubble wechat-mark__bubble--large">
-        <i />
-        <i />
-      </span>
-      <span className="wechat-mark__bubble wechat-mark__bubble--small">
-        <i />
-        <i />
-      </span>
+      <span className="wechat-mark__bubble wechat-mark__bubble--large"><i /><i /></span>
+      <span className="wechat-mark__bubble wechat-mark__bubble--small"><i /><i /></span>
     </span>
   );
 }
 
 export function WeChatApp({
-  nativeApplications,
-  nativeLaunchFeedback,
-  onNativeLaunchFeedback,
-  openExternalWindow,
-  launchDesktopProtocol,
+  bridge,
+  isActive = true,
+  isMinimized = false,
 }: WeChatAppProps = {}) {
-  const theme = useSystemStore((state) => state.preferences.theme);
-  const [navigationResult, setNavigationResult] = useState<WeChatNavigationResult | WeChatDesktopLaunchResult | null>(null);
-  const [localNativeFeedback, setLocalNativeFeedback] = useState<WeChatNativeLaunchFeedback | null>(null);
-  const [nativeLaunchPending, setNativeLaunchPending] = useState(false);
-  const nativeLaunchPendingRef = useRef(false);
-  const visibleFeedback = navigationResult ?? localNativeFeedback ?? nativeLaunchFeedback;
-
-  const openDestination = (destinationId: WeChatDestinationId) => {
-    setNavigationResult(openOfficialWeChatDestination(destinationId, openExternalWindow));
-  };
-
-  const launchDesktopClient = async () => {
-    if (!nativeApplications) {
-      setLocalNativeFeedback(null);
-      setNavigationResult(requestDesktopWeChatLaunch(launchDesktopProtocol));
-      return;
-    }
-
-    if (nativeLaunchPendingRef.current) return;
-    nativeLaunchPendingRef.current = true;
-    setNativeLaunchPending(true);
-    setNavigationResult(null);
-    try {
-      const feedback = await launchNativeWeChat(nativeApplications);
-      setLocalNativeFeedback(feedback);
-      onNativeLaunchFeedback?.(feedback);
-    } finally {
-      nativeLaunchPendingRef.current = false;
-      setNativeLaunchPending(false);
-    }
-  };
+  const view = useEmbeddedWeChatView({ bridge, isActive, isMinimized });
+  const loading = view.hostState.phase === 'idle' || view.hostState.phase === 'loading';
+  const failed = view.hostState.phase === 'failed' || view.errorMessage !== null;
+  const statusLabel = view.bridgeAvailable
+    ? view.errorMessage === null ? PHASE_LABELS[view.hostState.phase] : '宿主通信失败'
+    : '需要桌面版';
 
   return (
-    <div className="wechat-app" data-theme={theme}>
-      <header className="wechat-app__header">
+    <div className="wechat-app" data-phase={view.hostState.phase}>
+      <header className="wechat-app__toolbar">
         <div className="wechat-app__identity">
           <WeChatMark />
           <div>
-            <span className="wechat-app__eyebrow">官方服务启动中心</span>
             <h1>微信</h1>
-            <p>从 AlSniper OS 安全前往腾讯官方微信服务。</p>
+            <p>AlSniper OS 安全嵌入视图</p>
           </div>
         </div>
-        <span className="wechat-app__verified">
-          <ShieldCheck size={17} aria-hidden="true" />
-          AlSniper OS 已验证入口范围
+
+        <div className="wechat-app__navigation" aria-label="微信浏览控制">
+          <button
+            type="button"
+            aria-label="后退"
+            title="后退"
+            disabled={!view.bridgeAvailable || !view.hostState.canGoBack || view.commandPending !== null}
+            onClick={() => { void view.runAction('back'); }}
+          >
+            <ArrowLeft size={18} aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            aria-label="刷新微信"
+            title="刷新"
+            disabled={!view.bridgeAvailable || view.commandPending !== null}
+            onClick={() => { void view.runAction('reload'); }}
+          >
+            <RefreshCw
+              className={view.commandPending === 'reload' ? 'wechat-app__spin' : undefined}
+              size={17}
+              aria-hidden="true"
+            />
+          </button>
+        </div>
+
+        <span className={`wechat-app__status wechat-app__status--${failed ? 'failed' : view.hostState.phase}`}>
+          <span aria-hidden="true" />
+          {statusLabel}
         </span>
       </header>
 
-      <main className="wechat-app__content">
-        <section className="wechat-app__hero" aria-labelledby="wechat-launch-heading">
-          <div className="wechat-app__hero-copy">
-            <span className="wechat-app__section-label">WeChat Desktop</span>
-            <h2 id="wechat-launch-heading">启动已安装的微信</h2>
+      <main
+        className="wechat-app__surface"
+        ref={view.surfaceRef}
+        aria-busy={view.bridgeAvailable && loading ? 'true' : 'false'}
+        onPointerDown={view.requestFocus}
+      >
+        {!view.bridgeAvailable ? (
+          <section className="wechat-app__message" role="alert" aria-labelledby="wechat-desktop-required">
+            <span className="wechat-app__message-icon"><MonitorUp size={34} aria-hidden="true" /></span>
+            <h2 id="wechat-desktop-required">请使用 AlSniper OS 桌面版</h2>
             <p>
-              {nativeApplications
-                ? 'AlSniper OS 会请求原生 host 启动已验证腾讯发布者签名的微信客户端。'
-                : '当前未连接原生 host；下方 xweixin:// 启动只是浏览器的尽力尝试，无法确认客户端是否真实启动。'}
-              微信客户端本体、登录和消息服务由腾讯提供。
-              此应用不会仿造微信登录或聊天界面，也不会读取你的微信账号、消息或二维码。
+              当前环境没有桌面宿主，无法在系统内安全嵌入微信。浏览器版本不会伪装成可用微信，
+              也不会把你跳转到另一个网页或尝试启动本机客户端。
             </p>
-            <button
-              className="wechat-app__primary"
-              type="button"
-              disabled={nativeLaunchPending}
-              onClick={() => { void launchDesktopClient(); }}
-            >
-              <ExternalLink size={18} aria-hidden="true" />
-              {nativeLaunchPending
-                ? '正在请求原生 host…'
-                : nativeApplications
-                  ? '通过原生 host 启动微信'
-                  : '尝试 xweixin:// 启动（尽力而为）'}
-            </button>
-          </div>
-
-          <div className="wechat-app__scan-note">
-            <span className="wechat-app__scan-icon"><QrCode size={38} aria-hidden="true" /></span>
-            <strong>未安装或需要登录？</strong>
-            <p>
-              使用下方 Microsoft Store 或腾讯官网下载入口安装官方客户端；网页版通常需要手机微信扫码确认。
-            </p>
-          </div>
-        </section>
-
-        {visibleFeedback ? (
-          <div
-            className={`wechat-app__notice ${visibleFeedback.ok ? 'wechat-app__notice--success' : 'wechat-app__notice--error'}`}
-            role={visibleFeedback.ok ? 'status' : 'alert'}
-            aria-live="polite"
-          >
-            {visibleFeedback.message}
-          </div>
-        ) : null}
-
-        <section className="wechat-app__destinations" aria-labelledby="wechat-options-heading">
-          <div className="wechat-app__section-heading">
-            <div>
-              <span className="wechat-app__section-label">官方入口</span>
-              <h2 id="wechat-options-heading">选择使用方式</h2>
-            </div>
-            <button className="wechat-app__text-action" type="button" onClick={() => openDestination('website')}>
-              微信官网
-              <ExternalLink size={15} aria-hidden="true" />
-            </button>
-          </div>
-
-          <div className="wechat-app__destination-grid">
-            {DESTINATION_CARDS.map((card) => {
-              const Icon = card.icon;
-              const destination = WECHAT_OFFICIAL_DESTINATIONS[card.id];
-              return (
-                <article className="wechat-app__destination" key={card.id}>
-                  <span className="wechat-app__destination-icon"><Icon size={23} aria-hidden="true" /></span>
-                  <h3>{card.title}</h3>
-                  <strong>{card.officialBadge}</strong>
-                  <p>{card.description}</p>
-                  <code>{new URL(destination.url).hostname}</code>
-                  <button type="button" onClick={() => openDestination(card.id)}>
-                    {card.action}
-                    <ExternalLink size={15} aria-hidden="true" />
-                  </button>
-                </article>
-              );
-            })}
-          </div>
-        </section>
-
-        <section className="wechat-app__trust" aria-label="安全与安装说明">
-          <div>
-            <ShieldCheck size={20} aria-hidden="true" />
-            <p><strong>隔离打开</strong><span>新页面使用 noopener 与 noreferrer，不能回控 AlSniper OS。</span></p>
-          </div>
-          <div>
-            <Smartphone size={20} aria-hidden="true" />
-            <p><strong>账号归腾讯管理</strong><span>登录、扫码、风控与消息数据均由微信官方服务处理。</span></p>
-          </div>
-          <div>
-            <QrCode size={20} aria-hidden="true" />
-            <p><strong>网页版作为次选</strong><span>网页版可用性和账号资格受腾讯策略、所在地区及账号状态影响。</span></p>
-          </div>
-        </section>
+          </section>
+        ) : failed ? (
+          <section className="wechat-app__message wechat-app__message--error" role="alert">
+            <span className="wechat-app__message-icon"><TriangleAlert size={32} aria-hidden="true" /></span>
+            <h2>微信视图无法加载</h2>
+            <p>{view.errorMessage ?? describeWeChatViewError(view.hostState.errorCode)}</p>
+            {view.errorMessage === null ? (
+              <button
+                className="wechat-app__retry"
+                type="button"
+                disabled={view.commandPending !== null}
+                onClick={() => { void view.runAction('retry'); }}
+              >
+                <RefreshCw
+                  className={view.commandPending === 'retry' ? 'wechat-app__spin' : undefined}
+                  size={17}
+                  aria-hidden="true"
+                />
+                {view.commandPending === 'retry' ? '正在重试…' : '重试'}
+              </button>
+            ) : null}
+          </section>
+        ) : loading ? (
+          <section className="wechat-app__message" role="status" aria-live="polite">
+            <span className="wechat-app__message-icon wechat-app__message-icon--loading">
+              <LoaderCircle className="wechat-app__spin" size={34} aria-hidden="true" />
+            </span>
+            <h2>{PHASE_LABELS[view.hostState.phase]}</h2>
+            <p>正在通过受隔离的桌面宿主加载微信官方服务。</p>
+          </section>
+        ) : (
+          <p className="wechat-app__ready-description">
+            微信内容已在 AlSniper OS 桌面宿主中加载。
+          </p>
+        )}
       </main>
+
+      <footer className="wechat-app__security">
+        <span><ShieldCheck size={15} aria-hidden="true" />仅允许微信固定服务范围</span>
+        <span><LockKeyhole size={15} aria-hidden="true" />会话由隔离的桌面宿主管理</span>
+      </footer>
     </div>
   );
 }
