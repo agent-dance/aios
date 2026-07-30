@@ -5,6 +5,14 @@ const principal = { kind: 'agent' as const, instanceId: 'instance-1', packageId:
 
 const ports = (): OsCapabilityPorts => ({
   apps: { open: vi.fn(), close: vi.fn(), focus: vi.fn(), minimize: vi.fn() },
+  applicationActions: {
+    execute: vi.fn(async () => ({
+      status: 'committed' as const,
+      receiptId: 'effect-1',
+      approvedByUser: true,
+      retryable: false,
+    })),
+  },
   preferences: { update: vi.fn() },
   systemStatus: { update: vi.fn() },
   store: { install: vi.fn() },
@@ -25,8 +33,8 @@ describe('OS capability broker', () => {
     const target = ports();
     const broker = createCapabilityBroker({ principal, ports: target, policy: { authorize: () => 'allow' } });
     const intent = { id: 'i1', type: 'open_app' as const, appId: 'finder' };
-    const receipt = await broker.execute(intent, { expectedRevision: 0 });
-    expect(await broker.execute(intent, { expectedRevision: 0 })).toBe(receipt);
+    const receipt = await broker.execute(intent, { expectedRevision: 0, idempotencyKey: 'effect-1' });
+    expect(await broker.execute(intent, { expectedRevision: 0, idempotencyKey: 'effect-1' })).toBe(receipt);
     expect(target.apps.open).toHaveBeenCalledTimes(1);
     await expect(broker.execute({ ...intent, appId: 'settings' }, { expectedRevision: 0 }))
       .rejects.toMatchObject({ code: 'BROKER_IDEMPOTENCY_CONFLICT' });
@@ -89,6 +97,130 @@ describe('OS capability broker', () => {
       type: 'set_system_status',
       statusPatch: { healthScore: 100 },
     } as never, { expectedRevision: 1 })).rejects.toMatchObject({ code: 'BROKER_INVALID_INTENT' });
+  });
+
+  it('binds application actions to the Broker principal, revision, and idempotency key', async () => {
+    const target = ports();
+    const approval = { request: vi.fn(async () => true) };
+    const broker = createCapabilityBroker({
+      principal,
+      ports: target,
+      approval,
+      policy: { authorize: ({ capability }) => capability === 'app.action.execute' ? 'allow' : 'deny' },
+    });
+    const argumentsValue = { text: 'hello', nested: { value: 1 } };
+    const intent = {
+      id: 'send-1',
+      type: 'execute_app_action' as const,
+      appId: 'notes.app',
+      actionId: 'notes.document.append',
+      arguments: argumentsValue,
+    };
+    const receipt = await broker.execute(intent, { expectedRevision: 0, idempotencyKey: 'effect-1' });
+    expect(await broker.execute(intent, { expectedRevision: 0, idempotencyKey: 'effect-1' })).toBe(receipt);
+
+    expect(receipt).toMatchObject({
+      capability: 'app.action.execute',
+      risk: 'high',
+      approvedByUser: true,
+      applicationEffect: { status: 'committed', receiptId: 'effect-1' },
+    });
+    expect(approval.request).not.toHaveBeenCalled();
+    expect(target.applicationActions.execute).toHaveBeenCalledWith({
+      principal,
+      intentId: 'effect-1',
+      idempotencyKey: 'effect-1',
+      appId: 'notes.app',
+      actionId: 'notes.document.append',
+      arguments: argumentsValue,
+      expectedRevision: 0,
+    });
+    const dispatched = vi.mocked(target.applicationActions.execute).mock.calls[0]![0];
+    expect(Object.isFrozen(dispatched)).toBe(true);
+    expect(Object.isFrozen(dispatched.principal)).toBe(true);
+    expect(Object.isFrozen(dispatched.arguments)).toBe(true);
+    expect(Object.isFrozen(dispatched.arguments.nested)).toBe(true);
+    expect(target.applicationActions.execute).toHaveBeenCalledTimes(1);
+    await expect(broker.execute({
+      ...intent,
+      arguments: { text: 'different' },
+    }, { expectedRevision: 0, idempotencyKey: 'effect-1' }))
+      .rejects.toMatchObject({ code: 'BROKER_IDEMPOTENCY_CONFLICT' });
+    await expect(broker.execute({
+      ...intent,
+      arguments: { text: 'different' },
+    }, { expectedRevision: 1, idempotencyKey: 'effect-2' }))
+      .resolves.toMatchObject({ intentId: 'send-1', revision: 2 });
+    expect(target.applicationActions.execute).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(target.applicationActions.execute).mock.calls[1]![0].idempotencyKey).toBe('effect-2');
+  });
+
+  it.each([
+    ['rejected', 'BROKER_OPERATION_REJECTED'],
+    ['failed', 'BROKER_OPERATION_FAILED'],
+    ['unknown', 'BROKER_OPERATION_UNKNOWN'],
+  ] as const)('does not accept or advance revision for an application %s result', async (status, code) => {
+    const target = ports();
+    target.applicationActions.execute = vi.fn(async () => ({
+      status,
+      receiptId: `effect-${status}`,
+      approvedByUser: status !== 'rejected',
+      retryable: status === 'failed',
+      errorCode: status === 'rejected'
+        ? 'APPROVAL_DENIED'
+        : status === 'unknown'
+          ? 'OUTCOME_UNKNOWN_AFTER_DISPATCH_FENCE'
+          : 'PRECONDITION_FAILED',
+    }));
+    const broker = createCapabilityBroker({ principal, ports: target, policy: { authorize: () => 'allow' } });
+
+    await expect(broker.execute({
+      id: `send-${status}`,
+      type: 'execute_app_action',
+      appId: 'wechat',
+      actionId: 'wechat.message.send_to_current',
+      arguments: { text: 'hello' },
+    }, { expectedRevision: 0, idempotencyKey: `effect-${status}` })).rejects.toMatchObject({
+      code,
+      ...(status === 'unknown' ? { retryable: false } : {}),
+    });
+    expect(broker.getRevision()).toBe(0);
+  });
+
+  it('never crosses the application boundary after approval denial or TOCTOU revision drift', async () => {
+    const deniedTarget = ports();
+    const denied = createCapabilityBroker({
+      principal,
+      ports: deniedTarget,
+      approval: { request: async () => false },
+      policy: { authorize: () => 'require-approval' },
+    });
+    const intent = {
+      id: 'send-denied',
+      type: 'execute_app_action' as const,
+      appId: 'wechat',
+      actionId: 'wechat.message.send_to_current',
+      arguments: { text: 'hello' },
+    };
+    await expect(denied.execute(intent, { expectedRevision: 0, idempotencyKey: 'effect-denied' }))
+      .rejects.toMatchObject({ code: 'BROKER_APPROVAL_DENIED' });
+    expect(deniedTarget.applicationActions.execute).not.toHaveBeenCalled();
+
+    let revision = 3;
+    const staleTarget = ports();
+    const stale = createCapabilityBroker({
+      principal,
+      ports: staleTarget,
+      revisionClock: { getRevision: () => revision, bumpRevision: () => ++revision },
+      approval: { request: async () => { revision += 1; return true; } },
+      policy: { authorize: () => 'require-approval' },
+    });
+    await expect(stale.execute(
+      { ...intent, id: 'send-stale' },
+      { expectedRevision: 3, idempotencyKey: 'effect-stale' },
+    ))
+      .rejects.toMatchObject({ code: 'BROKER_STALE_REVISION' });
+    expect(staleTarget.applicationActions.execute).not.toHaveBeenCalled();
   });
 
   it('rejects preferences outside the closed cross-language accent enum', async () => {

@@ -33,12 +33,21 @@ import type {
   AssistantSurface,
   AssistantSurfaceRenderer,
 } from './types';
+
 import {
   readVoiceDisclosureConsent,
   type VoiceDisclosureConsent,
   writeVoiceDisclosureConsent,
 } from './voiceDisclosure';
 import './assistant.css';
+
+export const describeAssistantReceiptFallback = (
+  status: AssistantActionReceipt['status'],
+): string => status === 'accepted'
+  ? '已完成'
+  : status === 'unknown'
+    ? '结果暂时无法确认；为避免重复操作，请勿重试'
+    : '未执行';
 
 const createId = () => {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID();
@@ -353,7 +362,7 @@ export function AssistantHost<TSurface = AssistantSurface>({
             ASSISTANT_RECEIPT_HISTORY_LIMIT,
           ),
         );
-        setLiveStatus(`${receipt.label}：${receipt.detail ?? (receipt.status === 'accepted' ? '已完成' : '未执行')}`);
+        setLiveStatus(`${receipt.label}：${receipt.detail ?? describeAssistantReceiptFallback(receipt.status)}`);
       }
     } catch (actionError) {
       setReceipts((current) =>
@@ -495,8 +504,7 @@ export function AssistantHost<TSurface = AssistantSurface>({
                     >
                       <strong>{receipt.label}</strong>
                       <span>
-                        {receipt.detail ??
-                          (receipt.status === 'accepted' ? '已完成' : '未执行')}
+                        {receipt.detail ?? describeAssistantReceiptFallback(receipt.status)}
                       </span>
                     </div>
                   ))}

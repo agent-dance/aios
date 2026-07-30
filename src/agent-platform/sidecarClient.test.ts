@@ -145,14 +145,14 @@ describe('sidecar client', () => {
     const bodyHash = await digest('{"x":1}');
     expect(bodyHash).toBe('5041bf1f713df204784353e82f6a4a535931cb64f1f4b4a5aeaffcb720918b22');
     expect(await sign(canonicalSidecarRequest(
-      'POST', 'http://127.0.0.1:4317', '/v1/chat', 'http://localhost:5173', '1.0.0', '1785038400000',
+      'POST', 'http://127.0.0.1:4317', '/v1/chat', 'http://localhost:5173', AIOS_AGENT_PROTOCOL_VERSION, '1785038400000',
       '00112233445566778899aabbccddeeff', bodyHash,
-    ))).toBe('133421e29d48491b58086f2803475f112d8cf54ce74475c6fd8acd872ff1f9cb');
+    ))).toBe('6cd2cc6a2b370b5c7bb4a9fac7e4e5776f5c030dd665f14247dc3d7b511102de');
     const responseHash = await digest('{"ok":true}\n');
     expect(responseHash).toBe('e5f1eb4d806641698a35efe20e098efd20d7d57a9b90ee69079d5bb650920726');
     expect(await sign(canonicalSidecarResponse(
-      '00112233445566778899aabbccddeeff', 'request-vector-1', 200, responseHash, '1.0.0',
-    ))).toBe('f985b14e6fb5979010fd90770e22ec984160048f7f27a9abe70c2028925b6817');
+      '00112233445566778899aabbccddeeff', 'request-vector-1', 200, responseHash, AIOS_AGENT_PROTOCOL_VERSION,
+    ))).toBe('bb51b81e958fa8dc4780f03481a75a2a5a156b84f95b64aa32341e34b4e2293e');
     expect(await sign(canonicalAgentDebugFrame(
       '00112233445566778899aabbccddeeff',
       'request-vector-1',
@@ -164,8 +164,8 @@ describe('sidecar client', () => {
       1,
       '0'.repeat(64),
       '15b3f7b8244fc365b0fc382807379d9fc1c1ece1b73336dce4c69af89c7d14cb',
-      '1.0.0',
-    ))).toBe('229288c01c8047188ec52c03d5fd91ba947cbeb92f43e846944c67ee57b9d73f');
+      AIOS_AGENT_PROTOCOL_VERSION,
+    ))).toBe('dabbfc9d147527f17ceea62d3486b3bcf91dc9cef43bc38fc6e86186fa57cc13');
   });
 
   it('sends per-request HMAC metadata without disclosing the shared secret and accepts an authenticated chat response', async () => {
@@ -345,7 +345,7 @@ describe('sidecar client', () => {
 
   it('validates the least-privilege health disclosure', async () => {
     const client = createSidecarClient(config(respond({
-      protocolVersion: '1.0.0', status: 'ready',
+      protocolVersion: AIOS_AGENT_PROTOCOL_VERSION, status: 'ready',
       agent: { driver: 'codex', authMode: 'linked', profileIsolated: true },
       limits: { maxBodyBytes: 100_000, maxConcurrentRuns: 4 },
       checks: [{ code: 'codex.auth', status: 'pass', message: 'available' }],
@@ -355,7 +355,7 @@ describe('sidecar client', () => {
 
   it('rejects a forged ready response and authenticated-body tampering before schema parsing', async () => {
     const ready = {
-      protocolVersion: '1.0.0', status: 'ready',
+      protocolVersion: AIOS_AGENT_PROTOCOL_VERSION, status: 'ready',
       agent: { driver: 'codex', authMode: 'linked', profileIsolated: true },
       limits: { maxBodyBytes: 100_000, maxConcurrentRuns: 4 },
       checks: [],
@@ -371,7 +371,7 @@ describe('sidecar client', () => {
     const fetcher = vi.fn<typeof fetch>(async (_input, init) => {
       nonces.push(new Headers(init?.headers).get('x-aios-nonce') ?? '');
       return signedResponse(init, {
-        protocolVersion: '1.0.0', status: 'ready',
+        protocolVersion: AIOS_AGENT_PROTOCOL_VERSION, status: 'ready',
         agent: { driver: 'codex', authMode: 'linked', profileIsolated: true },
         limits: { maxBodyBytes: 100_000, maxConcurrentRuns: 4 }, checks: [],
       });
@@ -418,7 +418,7 @@ describe('sidecar client', () => {
         requestHeaders.get('x-aios-timestamp') ?? '', requestHeaders.get('x-aios-nonce') ?? '', bodyHash,
       )));
       return signedResponse(init, {
-        protocolVersion: '1.0.0', status: 'ready',
+        protocolVersion: AIOS_AGENT_PROTOCOL_VERSION, status: 'ready',
         agent: { driver: 'codex', authMode: 'linked', profileIsolated: true },
         limits: { maxBodyBytes: 100_000, maxConcurrentRuns: 4 }, checks: [],
       });
@@ -498,6 +498,129 @@ describe('sidecar client', () => {
       intents: [],
     })));
     await expect(unknownSelection.chat(contextualRequest)).rejects.toMatchObject({ code: 'SIDECAR_INVALID_RESPONSE' });
+  });
+
+  it('projects a closed application-action catalog and binds model output to the advertised pair', async () => {
+    const actionRequest: ChatRequest = {
+      ...request,
+      context: {
+        ...request.context,
+        availableApplicationActions: [{
+          appId: 'wechat',
+          actionId: 'wechat.message.send_to_current',
+          argumentSchemaId: 'wechat.message.send_to_current.arguments@1',
+        }],
+      },
+    };
+    const accepted = createSidecarClient(config(respond({
+      requestId: request.requestId,
+      runId: 'run-wechat-send',
+      message: 'I prepared the requested message for trusted host authorization.',
+      mood: 'focused',
+      intents: [{
+        id: 'wechat-send-1',
+        type: 'execute_app_action',
+        appId: 'wechat',
+        actionId: 'wechat.message.send_to_current',
+        arguments: { text: 'hello' },
+      }],
+    })));
+    await expect(accepted.chat(actionRequest)).resolves.toMatchObject({
+      intents: [{ type: 'execute_app_action', actionId: 'wechat.message.send_to_current' }],
+    });
+
+    const forged = createSidecarClient(config(respond({
+      requestId: request.requestId,
+      runId: 'run-unadvertised-action',
+      message: 'No.',
+      mood: 'concerned',
+      intents: [{
+        id: 'notes-append-1',
+        type: 'execute_app_action',
+        appId: 'notes',
+        actionId: 'notes.document.append',
+        arguments: { text: 'hello' },
+    }],
+    })));
+    await expect(forged.chat(actionRequest)).rejects.toMatchObject({ code: 'SIDECAR_INVALID_RESPONSE' });
+
+    const forgedDebug = createSidecarClient(config(async (_input, init) => debugStreamResponse(init, [{
+      kind: 'completed',
+      traceId: 'trace-unadvertised-action',
+      timeUnixMs: 1,
+      response: {
+        requestId: request.requestId,
+        runId: 'run-unadvertised-action-debug',
+        message: 'No.',
+        mood: 'concerned',
+        intents: [{
+          id: 'notes-append-debug-1',
+          type: 'execute_app_action',
+          appId: 'notes',
+          actionId: 'notes.document.append',
+          arguments: { text: 'hello' },
+        }],
+      },
+    }])));
+    await expect(forgedDebug.chat({
+      ...actionRequest,
+      debug: { profile: AIOS_AGENT_DEBUG_PROFILE },
+    })).rejects.toMatchObject({ code: 'SIDECAR_INVALID_RESPONSE' });
+
+    const mixedCatalogResponse = createSidecarClient(config(respond({
+      requestId: request.requestId,
+      runId: 'run-mixed-action-catalog',
+      message: 'No.',
+      mood: 'concerned',
+      intents: [{
+        id: 'wechat-send-mixed-1',
+        type: 'execute_app_action',
+        appId: 'wechat',
+        actionId: 'wechat.message.send_to_current',
+        arguments: { text: 'hello' },
+      }, {
+        id: 'notes-append-mixed-2',
+        type: 'execute_app_action',
+        appId: 'notes',
+        actionId: 'notes.document.append',
+        arguments: { text: 'hello' },
+      }],
+    })));
+    await expect(mixedCatalogResponse.chat(actionRequest)).rejects.toMatchObject({ code: 'SIDECAR_INVALID_RESPONSE' });
+  });
+
+  it.each([
+    ['unknown argument schema', {
+      appId: 'wechat', actionId: 'wechat.message.send_to_current', argumentSchemaId: 'unknown.arguments@1',
+    }],
+    ['schema registered to another action', {
+      appId: 'wechat', actionId: 'wechat.message.delete', argumentSchemaId: 'wechat.message.send_to_current.arguments@1',
+    }],
+    ['invalid action identifier', {
+      appId: 'wechat', actionId: 'wechat/message/send', argumentSchemaId: 'wechat.message.send_to_current.arguments@1',
+    }],
+  ])('rejects %s before sending application-action context', async (_label, descriptor) => {
+    const fetcher = vi.fn<typeof fetch>();
+    const client = createSidecarClient(config(fetcher));
+    await expect(client.chat({
+      ...request,
+      context: { ...request.context, availableApplicationActions: [descriptor] },
+    } as ChatRequest)).rejects.toMatchObject({ code: 'SIDECAR_CONFIG_INVALID' });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it('rejects duplicate advertised application-action identities before sending', async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const descriptor = {
+      appId: 'wechat' as const,
+      actionId: 'wechat.message.send_to_current' as const,
+      argumentSchemaId: 'wechat.message.send_to_current.arguments@1' as const,
+    };
+    await expect(createSidecarClient(config(fetcher)).chat({
+      ...request,
+      context: { ...request.context, availableApplicationActions: [descriptor, { ...descriptor }] },
+    })).rejects.toMatchObject({ code: 'SIDECAR_CONFIG_INVALID' });
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it('rejects read-only telemetry in a system status write intent', async () => {

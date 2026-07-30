@@ -298,7 +298,7 @@ func TestAgentDebugFrameCanonicalGoldenAndBinding(t *testing.T) {
 		values[0].(string), values[1].(string), values[2].(string), values[3].(string), values[4].(string),
 		values[5].(int), values[6].(string), values[7].(uint64), values[8].(string), values[9].(string), values[10].(string),
 	)
-	const goldenMAC = "229288c01c8047188ec52c03d5fd91ba947cbeb92f43e846944c67ee57b9d73f"
+	const goldenMAC = "dabbfc9d147527f17ceea62d3486b3bcf91dc9cef43bc38fc6e86186fa57cc13"
 	if mac := hmacHex("0123456789abcdef0123456789abcdef", canonical); mac != goldenMAC {
 		t.Fatalf("canonical golden MAC = %s", mac)
 	}

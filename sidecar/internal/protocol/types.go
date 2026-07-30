@@ -11,18 +11,39 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 const AgentDebugProfile = "agent-debug.v1"
 
 var (
-	idPattern       = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
-	manifestPattern = regexp.MustCompile(`^[a-z0-9]+(?:[.-][a-z0-9]+)*$`)
-	versionPattern  = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$`)
-	digestPattern   = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
+	idPattern                     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+	manifestPattern               = regexp.MustCompile(`^[a-z0-9]+(?:[.-][a-z0-9]+)*$`)
+	versionPattern                = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$`)
+	digestPattern                 = regexp.MustCompile(`^sha256:[a-f0-9]{64}$`)
+	actionIDPattern               = regexp.MustCompile(`^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$`)
+	actionArgumentSchemaIDPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+@[1-9][0-9]*$`)
 )
+
+const (
+	maxApplicationActionArgumentsBytes  = 64 * 1024
+	maxApplicationActionJSONDepth       = 20
+	maxApplicationActionObjectKeys      = 256
+	maxApplicationActionArrayItems      = 512
+	wechatSendToCurrentActionID         = "wechat.message.send_to_current"
+	wechatSendToCurrentArgumentSchemaID = "wechat.message.send_to_current.arguments@1"
+)
+
+var registeredApplicationActionDescriptors = map[ApplicationActionDescriptor]struct{}{
+	{
+		AppID:            "wechat",
+		ActionID:         wechatSendToCurrentActionID,
+		ArgumentSchemaID: wechatSendToCurrentArgumentSchemaID,
+	}: {},
+}
 
 type Usage struct {
 	InputTokens        int   `json:"inputTokens"`
@@ -118,16 +139,23 @@ type ChatHistoryEntry struct {
 }
 
 type ChatContext struct {
-	OSRevision        *int64         `json:"osRevision"`
-	Locale            string         `json:"locale,omitempty"`
-	ActiveAppID       string         `json:"activeAppId,omitempty"`
-	Theme             string         `json:"theme,omitempty"`
-	InstalledAppIDs   []string       `json:"installedAppIds,omitempty"`
-	InstalledAgentIDs []string       `json:"installedAgentIds,omitempty"`
-	RunningGames      []RunningGame  `json:"runningGames,omitempty"`
-	SystemStatus      *SystemStatus  `json:"systemStatus,omitempty"`
-	RunningGameIDs    []string       `json:"runningGameIds,omitempty"`
-	EnabledAgents     []EnabledAgent `json:"enabledAgents,omitempty"`
+	OSRevision                  *int64                        `json:"osRevision"`
+	Locale                      string                        `json:"locale,omitempty"`
+	ActiveAppID                 string                        `json:"activeAppId,omitempty"`
+	Theme                       string                        `json:"theme,omitempty"`
+	InstalledAppIDs             []string                      `json:"installedAppIds,omitempty"`
+	InstalledAgentIDs           []string                      `json:"installedAgentIds,omitempty"`
+	RunningGames                []RunningGame                 `json:"runningGames,omitempty"`
+	SystemStatus                *SystemStatus                 `json:"systemStatus,omitempty"`
+	RunningGameIDs              []string                      `json:"runningGameIds,omitempty"`
+	EnabledAgents               []EnabledAgent                `json:"enabledAgents,omitempty"`
+	AvailableApplicationActions []ApplicationActionDescriptor `json:"availableApplicationActions,omitempty"`
+}
+
+type ApplicationActionDescriptor struct {
+	AppID            string `json:"appId"`
+	ActionID         string `json:"actionId"`
+	ArgumentSchemaID string `json:"argumentSchemaId"`
 }
 
 type RunningGame struct {
@@ -172,10 +200,43 @@ type Intent struct {
 	Type             string             `json:"type"`
 	ExpectedRevision *int64             `json:"expectedRevision,omitempty"`
 	AppID            string             `json:"appId,omitempty"`
+	ActionID         string             `json:"actionId,omitempty"`
+	Arguments        json.RawMessage    `json:"arguments,omitempty"`
 	ListingID        string             `json:"listingId,omitempty"`
 	Preferences      *Preferences       `json:"preferences,omitempty"`
 	StatusPatch      *SystemStatusPatch `json:"statusPatch,omitempty"`
 	Manifest         *AgentManifest     `json:"manifest,omitempty"`
+	presentFields    map[string]struct{}
+}
+
+type WeChatSendToCurrentArguments struct {
+	Text string `json:"text"`
+}
+
+func (i *Intent) UnmarshalJSON(data []byte) error {
+	type wireIntent Intent
+	var decoded wireIntent
+	if err := DecodeStrict(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*i = Intent(decoded)
+	i.presentFields = make(map[string]struct{}, len(fields))
+	for field := range fields {
+		i.presentFields[field] = struct{}{}
+	}
+	return nil
+}
+
+func (i *Intent) hasField(name string, populated bool) bool {
+	if populated {
+		return true
+	}
+	_, present := i.presentFields[name]
+	return present
 }
 
 type Preferences struct {
@@ -421,6 +482,45 @@ func (r ChatRequest) Validate() error {
 			return errors.New("enabled agent instructions exceed aggregate limit")
 		}
 	}
+	if len(r.Context.AvailableApplicationActions) > 64 {
+		return errors.New("availableApplicationActions exceeds limit")
+	}
+	actionKeys := make(map[struct{ appID, actionID string }]struct{}, len(r.Context.AvailableApplicationActions))
+	for _, action := range r.Context.AvailableApplicationActions {
+		if err := action.Validate(); err != nil {
+			return fmt.Errorf("available application action %q: %w", action.ActionID, err)
+		}
+		key := struct{ appID, actionID string }{appID: action.AppID, actionID: action.ActionID}
+		if _, duplicate := actionKeys[key]; duplicate {
+			return fmt.Errorf("duplicate available application action %q for app %q", action.ActionID, action.AppID)
+		}
+		actionKeys[key] = struct{}{}
+	}
+	return nil
+}
+
+func (a ApplicationActionDescriptor) Validate() error {
+	if err := bounded("appId", a.AppID, 1, 128); err != nil {
+		return err
+	}
+	if !manifestPattern.MatchString(a.AppID) {
+		return errors.New("appId must be a lowercase identifier")
+	}
+	if err := bounded("actionId", a.ActionID, 1, 128); err != nil {
+		return err
+	}
+	if !actionIDPattern.MatchString(a.ActionID) {
+		return errors.New("actionId must be a lowercase dotted identifier")
+	}
+	if err := bounded("argumentSchemaId", a.ArgumentSchemaID, 1, 160); err != nil {
+		return err
+	}
+	if !actionArgumentSchemaIDPattern.MatchString(a.ArgumentSchemaID) {
+		return errors.New("argumentSchemaId must be a versioned lowercase dotted identifier")
+	}
+	if _, registered := registeredApplicationActionDescriptors[a]; !registered {
+		return errors.New("application action descriptor is not registered")
+	}
 	return nil
 }
 
@@ -489,7 +589,8 @@ func (o AgentOutput) Validate() error {
 		return errors.New("only one intent is allowed per turn")
 	}
 	intentIDs := make(map[string]struct{}, len(o.Intents))
-	for _, intent := range o.Intents {
+	for index := range o.Intents {
+		intent := &o.Intents[index]
 		if err := intent.Validate(); err != nil {
 			return err
 		}
@@ -569,44 +670,78 @@ func (p AgentDebugFailedPayload) Validate() error {
 	return bounded("Agent debug failure message", p.Error.Message, 1, 160)
 }
 
-func (i Intent) Validate() error {
+func (i *Intent) Validate() error {
+	if i == nil {
+		return errors.New("intent is required")
+	}
 	if err := validateID("intent id", i.ID); err != nil {
 		return err
+	}
+	if i.hasField("expectedRevision", false) && i.ExpectedRevision == nil {
+		return errors.New("expectedRevision cannot be null")
 	}
 	if i.ExpectedRevision != nil && (*i.ExpectedRevision < 0 || *i.ExpectedRevision > 9007199254740991) {
 		return errors.New("expectedRevision cannot be negative")
 	}
+	hasAppID := i.hasField("appId", i.AppID != "")
+	hasActionID := i.hasField("actionId", i.ActionID != "")
+	hasArguments := i.hasField("arguments", i.Arguments != nil)
+	hasListingID := i.hasField("listingId", i.ListingID != "")
+	hasPreferences := i.hasField("preferences", i.Preferences != nil)
+	hasStatusPatch := i.hasField("statusPatch", i.StatusPatch != nil)
+	hasManifest := i.hasField("manifest", i.Manifest != nil)
 	switch i.Type {
 	case "open_app", "close_app", "focus_app", "minimize_app":
 		if err := bounded("appId", i.AppID, 1, 128); err != nil {
 			return err
 		}
-		if i.ListingID != "" || i.Preferences != nil || i.StatusPatch != nil || i.Manifest != nil {
+		if hasActionID || hasArguments || hasListingID || hasPreferences || hasStatusPatch || hasManifest {
 			return errors.New("intent contains fields outside its type")
 		}
+	case "execute_app_action":
+		if err := bounded("appId", i.AppID, 1, 128); err != nil {
+			return err
+		}
+		if !manifestPattern.MatchString(i.AppID) {
+			return errors.New("appId must be a lowercase identifier")
+		}
+		if err := bounded("actionId", i.ActionID, 1, 128); err != nil {
+			return err
+		}
+		if !actionIDPattern.MatchString(i.ActionID) {
+			return errors.New("actionId must be a lowercase dotted identifier")
+		}
+		if hasListingID || hasPreferences || hasStatusPatch || hasManifest {
+			return errors.New("intent contains fields outside its type")
+		}
+		normalizedArguments, err := validateApplicationActionArguments(i.AppID, i.ActionID, i.Arguments)
+		if err != nil {
+			return err
+		}
+		i.Arguments = normalizedArguments
 	case "install_app":
 		if err := bounded("listingId", i.ListingID, 1, 128); err != nil {
 			return err
 		}
-		if i.AppID != "" || i.Preferences != nil || i.StatusPatch != nil || i.Manifest != nil {
+		if hasAppID || hasActionID || hasArguments || hasPreferences || hasStatusPatch || hasManifest {
 			return errors.New("intent contains fields outside its type")
 		}
 	case "set_preferences":
-		if i.Preferences == nil || i.AppID != "" || i.ListingID != "" || i.StatusPatch != nil || i.Manifest != nil {
+		if i.Preferences == nil || hasAppID || hasActionID || hasArguments || hasListingID || hasStatusPatch || hasManifest {
 			return errors.New("invalid set_preferences intent")
 		}
 		if err := i.Preferences.Validate(); err != nil {
 			return err
 		}
 	case "set_system_status":
-		if i.StatusPatch == nil || i.AppID != "" || i.ListingID != "" || i.Preferences != nil || i.Manifest != nil {
+		if i.StatusPatch == nil || hasAppID || hasActionID || hasArguments || hasListingID || hasPreferences || hasManifest {
 			return errors.New("invalid set_system_status intent")
 		}
 		if err := i.StatusPatch.Validate(); err != nil {
 			return err
 		}
 	case "install_agent":
-		if i.Manifest == nil || i.AppID != "" || i.ListingID != "" || i.Preferences != nil || i.StatusPatch != nil {
+		if i.Manifest == nil || hasAppID || hasActionID || hasArguments || hasListingID || hasPreferences || hasStatusPatch {
 			return errors.New("invalid install_agent intent")
 		}
 		if err := i.Manifest.Validate(); err != nil {
@@ -616,6 +751,243 @@ func (i Intent) Validate() error {
 		return fmt.Errorf("unsupported intent type %q", i.Type)
 	}
 	return nil
+}
+
+func validateApplicationActionArguments(appID, actionID string, raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("arguments are required")
+	}
+	if len(raw) > maxApplicationActionArgumentsBytes {
+		return nil, fmt.Errorf("arguments exceed %d JSON bytes", maxApplicationActionArgumentsBytes)
+	}
+	value, err := decodeApplicationActionArguments(raw)
+	if err != nil {
+		return nil, fmt.Errorf("arguments: %w", err)
+	}
+	if _, ok := value.(map[string]any); !ok {
+		return nil, errors.New("arguments must be a JSON object")
+	}
+	if actionID != wechatSendToCurrentActionID {
+		return raw, nil
+	}
+	if appID != "wechat" {
+		return nil, errors.New("wechat.message.send_to_current requires appId wechat")
+	}
+	var arguments WeChatSendToCurrentArguments
+	if err := DecodeStrict(raw, &arguments); err != nil {
+		return nil, fmt.Errorf("arguments for %s: %w", actionID, err)
+	}
+	arguments.Text = strings.ReplaceAll(strings.ReplaceAll(arguments.Text, "\r\n", "\n"), "\r", "\n")
+	if containsDangerousDisplayRune(arguments.Text) {
+		return nil, errors.New("arguments.text contains a dangerous control or bidirectional character")
+	}
+	// ECMAScript String.prototype.trim treats U+FEFF as whitespace while
+	// unicode.IsSpace (and therefore strings.TrimSpace) intentionally does not.
+	// Include it explicitly so the Go/model boundary and trusted Electron
+	// adapter accept exactly the same non-empty message bodies.
+	if strings.TrimFunc(arguments.Text, func(character rune) bool {
+		return unicode.IsSpace(character) || character == '\ufeff'
+	}) == "" {
+		return nil, errors.New("arguments.text must contain a non-whitespace character")
+	}
+	if err := bounded("arguments.text", arguments.Text, 1, 4000); err != nil {
+		return nil, err
+	}
+	normalized, err := json.Marshal(arguments)
+	if err != nil {
+		return nil, fmt.Errorf("normalize arguments for %s: %w", actionID, err)
+	}
+	if len(normalized) > maxApplicationActionArgumentsBytes {
+		return nil, fmt.Errorf("arguments exceed %d JSON bytes", maxApplicationActionArgumentsBytes)
+	}
+	return normalized, nil
+}
+
+func decodeApplicationActionArguments(raw json.RawMessage) (any, error) {
+	if !utf8.Valid(raw) {
+		return nil, errors.New("JSON must be valid UTF-8")
+	}
+	if err := validateJSONSurrogateEscapes(raw); err != nil {
+		return nil, err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	value, err := decodeBoundedApplicationActionJSON(decoder, 0)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := decoder.Token(); err == nil {
+		return nil, errors.New("multiple JSON values are not allowed")
+	} else if !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	return value, nil
+}
+
+func validateJSONSurrogateEscapes(raw []byte) error {
+	inString := false
+	for index := 0; index < len(raw); index++ {
+		switch raw[index] {
+		case '"':
+			inString = !inString
+		case '\\':
+			if !inString {
+				continue
+			}
+			if index+1 >= len(raw) {
+				return errors.New("incomplete JSON string escape")
+			}
+			if raw[index+1] != 'u' {
+				index++
+				continue
+			}
+			codeUnit, next, err := parseJSONUnicodeEscape(raw, index)
+			if err != nil {
+				return err
+			}
+			if codeUnit >= 0xd800 && codeUnit <= 0xdbff {
+				low, afterPair, err := parseJSONUnicodeEscape(raw, next)
+				if err != nil || low < 0xdc00 || low > 0xdfff {
+					return errors.New("JSON string contains an unpaired high surrogate")
+				}
+				index = afterPair - 1
+				continue
+			}
+			if codeUnit >= 0xdc00 && codeUnit <= 0xdfff {
+				return errors.New("JSON string contains an unpaired low surrogate")
+			}
+			index = next - 1
+		}
+	}
+	return nil
+}
+
+func parseJSONUnicodeEscape(raw []byte, slash int) (uint16, int, error) {
+	if slash < 0 || slash+5 >= len(raw) || raw[slash] != '\\' || raw[slash+1] != 'u' {
+		return 0, slash, errors.New("JSON string contains an incomplete surrogate pair")
+	}
+	var value uint16
+	for index := slash + 2; index < slash+6; index++ {
+		value <<= 4
+		switch digit := raw[index]; {
+		case digit >= '0' && digit <= '9':
+			value |= uint16(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			value |= uint16(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			value |= uint16(digit-'A') + 10
+		default:
+			return 0, slash, errors.New("JSON string contains an invalid Unicode escape")
+		}
+	}
+	return value, slash + 6, nil
+}
+
+func containsDangerousDisplayRune(value string) bool {
+	for _, character := range value {
+		if (character >= 0x0000 && character <= 0x0009) ||
+			(character >= 0x000b && character <= 0x001f) ||
+			(character >= 0x007f && character <= 0x009f) ||
+			character == 0x061c || character == 0x200e || character == 0x200f ||
+			character == 0x2028 || character == 0x2029 ||
+			(character >= 0x202a && character <= 0x202e) ||
+			(character >= 0x2066 && character <= 0x2069) {
+			return true
+		}
+	}
+	return false
+}
+
+func decodeBoundedApplicationActionJSON(decoder *json.Decoder, depth int) (any, error) {
+	if depth > maxApplicationActionJSONDepth {
+		return nil, errors.New("JSON nesting is too deep")
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter {
+		switch token.(type) {
+		case nil, bool:
+			return token, nil
+		case string:
+			if utf16CodeUnits(token.(string)) > 32768 {
+				return nil, errors.New("JSON string exceeds limit")
+			}
+			return token, nil
+		case json.Number:
+			number, err := token.(json.Number).Float64()
+			if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
+				return nil, errors.New("JSON number must be finite")
+			}
+			return number, nil
+		default:
+			return nil, errors.New("unsupported JSON value")
+		}
+	}
+	switch delimiter {
+	case '{':
+		object := make(map[string]any)
+		for decoder.More() {
+			if len(object) >= maxApplicationActionObjectKeys {
+				return nil, errors.New("JSON object is too large")
+			}
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return nil, err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return nil, errors.New("JSON object key must be a string")
+			}
+			if err := bounded("JSON object key", key, 1, 128); err != nil {
+				return nil, err
+			}
+			switch key {
+			case "__proto__", "constructor", "prototype":
+				return nil, fmt.Errorf("JSON object key %q is forbidden", key)
+			}
+			if _, duplicate := object[key]; duplicate {
+				return nil, fmt.Errorf("duplicate JSON object key %q", key)
+			}
+			entry, err := decodeBoundedApplicationActionJSON(decoder, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			object[key] = entry
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		if closing != json.Delim('}') {
+			return nil, errors.New("JSON object is not closed")
+		}
+		return object, nil
+	case '[':
+		array := make([]any, 0)
+		for decoder.More() {
+			if len(array) >= maxApplicationActionArrayItems {
+				return nil, errors.New("JSON array is too large")
+			}
+			entry, err := decodeBoundedApplicationActionJSON(decoder, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			array = append(array, entry)
+		}
+		closing, err := decoder.Token()
+		if err != nil {
+			return nil, err
+		}
+		if closing != json.Delim(']') {
+			return nil, errors.New("JSON array is not closed")
+		}
+		return array, nil
+	default:
+		return nil, errors.New("unexpected JSON delimiter")
+	}
 }
 
 func (p Preferences) Validate() error {
@@ -680,7 +1052,7 @@ func validEnergyMode(value string) bool {
 }
 
 var allowedCapabilities = map[string]struct{}{
-	"os.app.open": {}, "os.app.close": {}, "os.app.focus": {}, "os.app.minimize": {}, "os.preferences.write": {}, "os.system-status.write": {}, "store.app.install": {}, "agent.package.install": {}, "a2ui.surface.publish": {},
+	"os.app.open": {}, "os.app.close": {}, "os.app.focus": {}, "os.app.minimize": {}, "app.action.execute": {}, "os.preferences.write": {}, "os.system-status.write": {}, "store.app.install": {}, "agent.package.install": {}, "a2ui.surface.publish": {},
 }
 
 func (m AgentManifest) Validate() error {

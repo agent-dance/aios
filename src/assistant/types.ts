@@ -70,7 +70,8 @@ export interface AssistantSurface {
 export interface AssistantActionReceipt {
   readonly id: string;
   readonly label: string;
-  readonly status: 'accepted' | 'rejected' | 'failed';
+  /** Unknown is terminal for display and must never be presented as retryable. */
+  readonly status: 'accepted' | 'rejected' | 'failed' | 'unknown';
   readonly detail?: string;
 }
 

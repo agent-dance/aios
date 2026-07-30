@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { includeCompiledAsset } from './packagePolicy.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const webDistribution = join(repositoryRoot, 'dist');
@@ -114,12 +115,6 @@ function isOwnedTemporaryDirectory(directory) {
 
 async function createStagingDirectory(appVersion) {
   const stagingDirectory = await mkdtemp(temporaryPrefix);
-  const includeCompiledAsset = (source) => (
-    !source.endsWith('.map')
-    && !source.endsWith(`${sep}smoke.js`)
-    && !source.endsWith(`${sep}persistenceSmoke.js`)
-  );
-
   await Promise.all([
     cp(webDistribution, join(stagingDirectory, 'dist'), {
       recursive: true,

@@ -449,6 +449,7 @@
 .assistant-receipt span { color: rgba(255, 255, 255, 0.64); text-align: right; }
 .assistant-receipt--accepted strong { color: #9bf7d9; }
 .assistant-receipt--rejected strong { color: #ffd58b; }
+.assistant-receipt--unknown strong { color: #f7c56c; }
 .assistant-receipt--failed strong { color: #ff9c9c; }
 
 .assistant-error {

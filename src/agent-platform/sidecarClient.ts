@@ -2,6 +2,7 @@ import { validateA2uiSurface } from './a2ui';
 import { AGENT_CONTRIBUTIONS, OS_CAPABILITIES } from './agentManifest';
 import { validateOsIntent, validateSystemStatusSnapshot } from './intents';
 import {
+  APPLICATION_ACTION_ARGUMENT_SCHEMA_IDS,
   AIOS_AGENT_DEBUG_PROFILE,
   AIOS_AGENT_PROTOCOL_VERSION,
   type AgentDebugCompleted,
@@ -92,6 +93,17 @@ interface SidecarClientConfig {
 
 const REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const AGENT_ID = /^[a-z0-9]+(?:[.-][a-z0-9]+)*$/;
+const APPLICATION_ID = /^[a-z0-9]+(?:[.-][a-z0-9]+)*$/;
+const APPLICATION_ACTION_ID = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$/;
+const REGISTERED_APPLICATION_ACTIONS = Object.freeze({
+  'wechat.message.send_to_current.arguments@1': Object.freeze({
+    appId: 'wechat',
+    actionId: 'wechat.message.send_to_current',
+  }),
+} satisfies Record<
+  (typeof APPLICATION_ACTION_ARGUMENT_SCHEMA_IDS)[number],
+  Readonly<{ appId: string; actionId: string }>
+>);
 const HEX_NONCE = /^[0-9a-f]{32}$/;
 const HEX_SHA256 = /^[0-9a-f]{64}$/;
 const REQUEST_SIGNATURE_CONTEXT = 'AIOS1-REQUEST';
@@ -155,6 +167,44 @@ const validateEnabledAgents = (value: unknown, path: string): OsContextSnapshot[
   return agents;
 };
 
+const validateAvailableApplicationActions = (
+  value: unknown,
+  path: string,
+): NonNullable<OsContextSnapshot['availableApplicationActions']> => {
+  const actions = Object.freeze(assertArray(value, path, {
+    max: 64,
+    item: (entry, itemPath) => {
+      const action = assertRecord(entry, itemPath);
+      assertExactKeys(action, ['appId', 'actionId', 'argumentSchemaId'], [], itemPath);
+      const appId = assertString(action.appId, `${itemPath}.appId`, {
+        min: 1,
+        max: 128,
+        pattern: APPLICATION_ID,
+      });
+      const actionId = assertString(action.actionId, `${itemPath}.actionId`, {
+        min: 3,
+        max: 128,
+        pattern: APPLICATION_ACTION_ID,
+      });
+      const argumentSchemaId = assertEnum(
+        action.argumentSchemaId,
+        APPLICATION_ACTION_ARGUMENT_SCHEMA_IDS,
+        `${itemPath}.argumentSchemaId`,
+      );
+      const registered = REGISTERED_APPLICATION_ACTIONS[argumentSchemaId];
+      if (appId !== registered.appId || actionId !== registered.actionId) {
+        throw new ValidationError(itemPath, 'argument schema is not registered for this application action');
+      }
+      return Object.freeze({ appId, actionId, argumentSchemaId });
+    },
+  }));
+  const identities = actions.map((action) => `${action.appId}\u0000${action.actionId}`);
+  if (new Set(identities).size !== identities.length) {
+    throw new ValidationError(path, 'duplicate application action');
+  }
+  return actions;
+};
+
 export const validateChatRequest = (value: unknown): ChatRequest => {
   const record = assertRecord(value, 'request');
   assertExactKeys(record, ['requestId', 'threadId', 'message', 'context'], ['history', 'debug'], 'request');
@@ -167,6 +217,7 @@ export const validateChatRequest = (value: unknown): ChatRequest => {
     'installedAgentIds',
     'systemStatus',
     'runningGameIds',
+    'availableApplicationActions',
     'enabledAgents',
     'runningGames',
   ], 'request.context');
@@ -213,6 +264,12 @@ export const validateChatRequest = (value: unknown): ChatRequest => {
       ...(context.installedAgentIds === undefined ? {} : { installedAgentIds: validateStringList(context.installedAgentIds, 'request.context.installedAgentIds', 128) }),
       ...(context.systemStatus === undefined ? {} : { systemStatus: validateSystemStatusSnapshot(context.systemStatus, 'request.context.systemStatus') }),
       ...(context.runningGameIds === undefined ? {} : { runningGameIds: validateUniqueStringList(context.runningGameIds, 'request.context.runningGameIds', 32) }),
+      ...(context.availableApplicationActions === undefined ? {} : {
+        availableApplicationActions: validateAvailableApplicationActions(
+          context.availableApplicationActions,
+          'request.context.availableApplicationActions',
+        ),
+      }),
       ...(context.enabledAgents === undefined ? {} : { enabledAgents: validateEnabledAgents(context.enabledAgents, 'request.context.enabledAgents') }),
       ...(context.runningGames === undefined ? {} : {
         runningGames: Object.freeze(assertArray(context.runningGames, 'request.context.runningGames', {
@@ -1004,6 +1061,19 @@ export const createSidecarClient = (config: SidecarClientConfig): SidecarClient 
         !chatRequest.context.enabledAgents?.some((agent) => agent.id === response.activeAgentId)
       ) {
         throw new SidecarClientError('SIDECAR_INVALID_RESPONSE', 'Sidecar selected an Agent outside the enabled domain context.');
+      }
+      for (const intent of response.intents) {
+        if (
+          intent.type === 'execute_app_action' &&
+          !chatRequest.context.availableApplicationActions?.some(
+            (advertised) => advertised.appId === intent.appId && advertised.actionId === intent.actionId,
+          )
+        ) {
+          throw new SidecarClientError(
+            'SIDECAR_INVALID_RESPONSE',
+            'Sidecar proposed an application action outside the host-advertised catalog.',
+          );
+        }
       }
       return response;
     },

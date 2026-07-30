@@ -10,7 +10,7 @@ import type {
   SidecarClient,
 } from '../agent-platform';
 import type { AssistantDebugEvent } from '../assistant';
-import { validateAgentManifest } from '../agent-platform';
+import { AIOS_AGENT_PROTOCOL_VERSION, validateAgentManifest } from '../agent-platform';
 import { DEFAULT_SYSTEM_STATUS } from '../system/useSystemStore';
 import { useSystemStore } from '../system/useSystemStore';
 import {
@@ -22,7 +22,7 @@ import {
 } from './AgentRuntimeProvider';
 
 const authenticationHealth = (checks: HealthResponse['checks']): HealthResponse => ({
-  protocolVersion: '1.0.0',
+  protocolVersion: AIOS_AGENT_PROTOCOL_VERSION,
   status: checks.some((check) => check.status === 'fail') ? 'not_ready' : 'ready',
   agent: { driver: 'codex', authMode: 'linked', profileIsolated: true },
   limits: { maxBodyBytes: 262_144, maxConcurrentRuns: 8 },
@@ -69,6 +69,10 @@ const host = (
   confirmCapability: AgentRuntimeHostPort['confirmCapability'] = vi.fn(() => true),
 ): AgentRuntimeHostPort => ({
   confirmCapability,
+  listApplicationActions: async () => [],
+  executeApplicationAction: vi.fn(async () => {
+    throw new Error('application control not configured for this test');
+  }),
   locale: () => 'zh-CN',
   requestId: () => 'request-1',
 });
@@ -103,7 +107,7 @@ const domainRegistry: AgentRegistry = {
 
 const clientFor = (respond: (request: ChatRequest) => ChatResponse): SidecarClient => ({
   health: async (): Promise<HealthResponse> => ({
-    protocolVersion: '1.0.0',
+    protocolVersion: AIOS_AGENT_PROTOCOL_VERSION,
     status: 'ready',
     agent: { driver: 'codex', authMode: 'linked', profileIsolated: true },
     limits: { maxBodyBytes: 262_144, maxConcurrentRuns: 4 },

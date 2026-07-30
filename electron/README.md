@@ -2,7 +2,15 @@
 
 This host embeds the fixed official WeChat Web entry (`https://wx.qq.com/`) in an Electron `WebContentsView`. The remote page runs in a sandboxed renderer with no Node.js integration, no preload bridge, a dedicated persistent session, denied permissions and downloads, and exact navigation boundaries.
 
-The local React shell receives only `window.alsniperDesktop.wechat`. Its closed API supports mount, bounds, visibility, focus, reload, safe back-navigation, unmount, state lookup, and state subscriptions. It cannot supply a URL, IPC channel, partition, or application identifier.
+For WeChat lifecycle control, the local React shell receives only `window.alsniperDesktop.wechat`. That closed API supports mount, bounds, visibility, focus, reload, safe back-navigation, unmount, state lookup, and state subscriptions. It cannot supply a URL, IPC channel, partition, or application identifier.
+
+## Semantic application control
+
+The shell also receives a closed `window.alsniperDesktop.applicationControl` bridge for capability discovery, typed execution, and receipt lookup. It does not expose selectors, arbitrary JavaScript, CDP, coordinates, a commit handle, or the embedded WeChat `WebContents`.
+
+Application Control is owned by Electron main. The first versioned action is `wechat.message.send_to_current` with the exact `{ "text": string }` argument contract. Main prepares against the currently attested WeChat document and chat identity, renders the exact recipient and escaped full message in a native confirmation dialog, persists an HMAC-chained dispatch fence, and only then permits one semantic click. The isolated runtime accepts success or failure only after observing one unique new pending bubble and that same DOM bubble's terminal status; official Web WeChat may migrate its pending LocalID to one server MsgID on success. Navigation, page replacement, crash, timeout, ambiguous evidence, or a post-fence host failure produces non-retryable `unknown`; the system never automatically sends again.
+
+The fixed-schema journal lives under Electron user data, contains no recipient, nickname, username, message body, approval detail, or raw content digest, and is bounded to 64 MiB. Missing keys, corruption, truncation, or an unavailable journal disables application-control capabilities without preventing the shell or normal WeChat use from starting. See [ADR 0004](../docs/decisions/0004-application-control-effect-journal.md).
 
 ## Build contract
 
@@ -20,6 +28,12 @@ electron dist-electron/main.js --dev-url=http://127.0.0.1:5173/
 Production starts without `--dev-url`; the host serves `dist/` through the restricted standard `app://alsniper/` scheme. Requests are confined to that directory and do not expose `file://` navigation.
 
 Run policy and controller unit tests with the repository Vitest command. Electron itself and its Node types must be installed by the root package configuration; this directory intentionally does not carry an independent package manifest.
+
+Run the real subprocess crash-recovery gate with:
+
+```text
+npm run desktop:application-control-smoke
+```
 
 ## Security boundary
 

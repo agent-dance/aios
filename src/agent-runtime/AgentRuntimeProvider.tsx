@@ -40,8 +40,16 @@ import {
 import { createSidecarAgentController } from '../agent-platform/game';
 import type { BrokerIntent, OsIntent } from '../agent-platform/intents';
 import {
+  APPLICATION_CONTROL_PROTOCOL_VERSION,
+  cloneApplicationActionCapability,
+  cloneApplicationControlReceipt,
+  parseApplicationControlExecuteRequest,
+  type ApplicationControlExecuteRequest,
+} from '../../electron/shared/applicationControlProtocol';
+import {
   AIOS_AGENT_DEBUG_PROFILE,
   type AgentDebugEvent,
+  type AvailableApplicationAction,
   type HealthResponse,
   type OsContextSnapshot,
 } from '../agent-platform/protocol';
@@ -51,6 +59,7 @@ import type { SystemPreferences } from '../system/types';
 import { useSystemStore } from '../system/useSystemStore';
 import { A2uiErrorBoundary } from './A2uiErrorBoundary';
 import { startSidecarHealthMonitor, type SidecarHealthMonitor } from './healthMonitor';
+import { executeDesktopApplicationAction, listDesktopApplicationActions } from './applicationControlBridge';
 
 const systemRevisionClock = (() => {
   let revision = 0;
@@ -185,6 +194,9 @@ const receiptView = (receipt: CapabilityReceipt, agent?: ReceiptAgentIdentity): 
     receipt.approvedByUser
       ? `Approved and committed at OS revision ${receipt.revision}.`
       : `Committed at OS revision ${receipt.revision}.`,
+    ...(receipt.applicationEffect === undefined ? [] : [
+      `Application effect ${receipt.applicationEffect.status}; receipt ${receipt.applicationEffect.receiptId}.`,
+    ]),
   ].join(' '),
 });
 
@@ -195,10 +207,25 @@ const failedReceipt = (
 ): AssistantActionReceipt => ({
   id: intentId,
   label: agent === undefined ? 'OS capability' : `${agent.name} ${agent.version} · OS capability`,
-  status: error instanceof CapabilityBrokerError && error.code === 'BROKER_APPROVAL_DENIED' ? 'rejected' : 'failed',
+  status: error instanceof CapabilityBrokerError && error.code === 'BROKER_OPERATION_UNKNOWN'
+    ? 'unknown'
+    : error instanceof CapabilityBrokerError
+      && (error.code === 'BROKER_APPROVAL_DENIED' || error.code === 'BROKER_OPERATION_REJECTED')
+      ? 'rejected'
+      : 'failed',
   detail: [
     ...(agent === undefined ? [] : [`Package digest: ${agent.digest}.`]),
     error instanceof Error ? error.message : 'The capability operation failed.',
+    ...((): readonly string[] => {
+      if (!(error instanceof CapabilityBrokerError) || error.cause === null || typeof error.cause !== 'object') return [];
+      const effect = error.cause as { readonly status?: unknown; readonly receiptId?: unknown };
+      if (
+        !['rejected', 'failed', 'unknown'].includes(String(effect.status))
+        || typeof effect.receiptId !== 'string'
+        || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(effect.receiptId)
+      ) return [];
+      return [`Application effect ${String(effect.status)}; receipt ${effect.receiptId}.`];
+    })(),
   ].join(' '),
 });
 
@@ -290,6 +317,8 @@ interface RuntimeAssembly {
 
 export interface AgentRuntimeHostPort {
   readonly confirmCapability: (request: AgentRuntimeApprovalRequest) => boolean | Promise<boolean>;
+  readonly listApplicationActions: () => unknown | Promise<unknown>;
+  readonly executeApplicationAction: (request: ApplicationControlExecuteRequest) => unknown | Promise<unknown>;
   readonly locale: () => string;
   readonly requestId: () => string;
 }
@@ -313,9 +342,70 @@ const browserHost: AgentRuntimeHostPort = Object.freeze({
     '',
     '是否允许本次操作？',
   ].join('\n')),
+  listApplicationActions: listDesktopApplicationActions,
+  executeApplicationAction: executeDesktopApplicationAction,
   locale: () => navigator.language,
   requestId: () => crypto.randomUUID(),
 });
+
+const APPLICATION_ACTION_SCHEMA_BY_ID = Object.freeze({
+  'wechat\u0000wechat.message.send_to_current\u00001.0.0': 'wechat.message.send_to_current.arguments@1',
+} as const);
+const APPLICATION_ACTION_HOST_MESSAGE = '已准备应用操作；请在系统确认后以回执为准。';
+const APPLICATION_ACTION_DISCOVERY_TIMEOUT_MS = 1_500;
+
+const listApplicationActionsWithinDeadline = (
+  host: AgentRuntimeHostPort,
+): Promise<unknown> => new Promise((resolve, reject) => {
+  const timer = globalThis.setTimeout(
+    () => reject(new Error('Application-control capability discovery timed out.')),
+    APPLICATION_ACTION_DISCOVERY_TIMEOUT_MS,
+  );
+  void Promise.resolve()
+    .then(() => host.listApplicationActions())
+    .then(
+      (value) => {
+        globalThis.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        globalThis.clearTimeout(timer);
+        reject(error);
+      },
+    );
+});
+
+const discoverAvailableApplicationActions = async (
+  host: AgentRuntimeHostPort,
+  mayExecuteApplicationActions: boolean,
+  isAppLaunchable: (appId: string) => boolean,
+): Promise<readonly AvailableApplicationAction[]> => {
+  if (!mayExecuteApplicationActions) return Object.freeze([]);
+  try {
+    const raw = await listApplicationActionsWithinDeadline(host);
+    if (!Array.isArray(raw) || raw.length > 64) return Object.freeze([]);
+    const capabilities = raw.map(cloneApplicationActionCapability);
+    const advertised = new Map<string, AvailableApplicationAction>();
+    for (const capability of capabilities) {
+      const capabilityKey = `${capability.appId}\u0000${capability.actionId}\u0000${capability.adapterVersion}`;
+      const argumentSchemaId = APPLICATION_ACTION_SCHEMA_BY_ID[
+        capabilityKey as keyof typeof APPLICATION_ACTION_SCHEMA_BY_ID
+      ];
+      if (argumentSchemaId === undefined || !isAppLaunchable(capability.appId)) continue;
+      const actionKey = `${capability.appId}\u0000${capability.actionId}`;
+      advertised.set(actionKey, Object.freeze({
+        appId: capability.appId,
+        actionId: capability.actionId,
+        argumentSchemaId,
+      }));
+    }
+    return Object.freeze([...advertised.values()]);
+  } catch {
+    // Capability discovery is availability only. Failure must remove, never
+    // synthesize, Agent authority for the current turn.
+    return Object.freeze([]);
+  }
+};
 
 export const assembleRuntime = (
   client: SidecarClient,
@@ -362,9 +452,11 @@ export const assembleRuntime = (
   const pendingIntents = new Map<string, {
     intent: OsIntent;
     revision: number;
+    idempotencyKey?: string;
     activeAgentId?: string;
     emitDebug?: DebugEmitter;
   }>();
+  const pendingExecutions = new Map<string, Promise<AssistantActionReceipt>>();
   const ports: OsCapabilityPorts = {
       apps: {
         open: (appId) => {
@@ -382,6 +474,36 @@ export const assembleRuntime = (
         minimize: (appId) => {
           if (!isAppId(appId)) throw new Error('Unknown app.');
           useSystemStore.getState().minimizeApp(appId);
+        },
+      },
+      applicationActions: {
+        execute: async (request) => {
+          const boundRequest = parseApplicationControlExecuteRequest({
+            protocolVersion: APPLICATION_CONTROL_PROTOCOL_VERSION,
+            intentId: request.intentId,
+            idempotencyKey: request.idempotencyKey,
+            principal: request.principal,
+            appId: request.appId,
+            actionId: request.actionId,
+            arguments: request.arguments,
+            expectedRevision: request.expectedRevision,
+          });
+          const receipt = cloneApplicationControlReceipt(await host.executeApplicationAction(boundRequest));
+          if (
+            receipt.intentId !== boundRequest.intentId
+            || receipt.idempotencyKey !== boundRequest.idempotencyKey
+            || receipt.appId !== boundRequest.appId
+            || receipt.actionId !== boundRequest.actionId
+          ) {
+            throw new Error('Application-control receipt does not match the bound request.');
+          }
+          return Object.freeze({
+            status: receipt.status,
+            receiptId: receipt.receiptId,
+            approvedByUser: receipt.approvedByUser,
+            retryable: receipt.status === 'unknown' ? false : receipt.retryable,
+            ...(receipt.errorCode === undefined ? {} : { errorCode: receipt.errorCode }),
+          });
         },
       },
       preferences: {
@@ -449,6 +571,15 @@ export const assembleRuntime = (
       case 'focus_app':
       case 'minimize_app':
         return { ...requester, operation: intent.type, target: intent.appId, details: provenance };
+      case 'execute_app_action':
+        return {
+          ...requester,
+          operation: '执行应用动作',
+          target: `${intent.appId} / ${intent.actionId}`,
+          // Action arguments can contain message text or other private data.
+          // The main-owned adapter is responsible for a trusted effect preview.
+          details: provenance,
+        };
       case 'install_app':
         return { ...requester, operation: '安装应用', target: intent.listingId, details: provenance };
       case 'set_preferences':
@@ -502,7 +633,11 @@ export const assembleRuntime = (
       userId: 'local-user',
     },
     policy: {
-      authorize: ({ risk }) => risk === 'high' ? 'require-approval' : 'allow',
+      // Application-effect approval is transaction-bound and main-owned.
+      // A renderer confirmation cannot safely preview or authorize it.
+      authorize: ({ capability, risk }) => capability === 'app.action.execute'
+        ? 'allow'
+        : risk === 'high' ? 'require-approval' : 'allow',
     },
     approval,
     revisionClock: systemRevisionClock,
@@ -530,7 +665,10 @@ export const assembleRuntime = (
         userId: 'local-user',
       },
       policy: {
-        authorize: ({ capability }) => manifest.capabilities.includes(capability) ? 'require-approval' : 'deny',
+        authorize: ({ capability }) => {
+          if (!manifest.capabilities.includes(capability)) return 'deny';
+          return capability === 'app.action.execute' ? 'allow' : 'require-approval';
+        },
       },
       approval,
       revisionClock: systemRevisionClock,
@@ -545,6 +683,7 @@ export const assembleRuntime = (
     revision: number,
     activeAgentId?: string,
     emitDebug?: DebugEmitter,
+    idempotencyKey?: string,
   ): Promise<AssistantActionReceipt> => {
     const installation = activeAgentId === undefined ? undefined : registry.get(activeAgentId);
     const agentIdentity = installation === undefined ? undefined : {
@@ -561,7 +700,10 @@ export const assembleRuntime = (
     );
     try {
       const authority = activeAgentId === undefined ? broker : brokerForAgent(activeAgentId);
-      const receipt = await authority.execute(intent, { expectedRevision: revision });
+      const receipt = await authority.execute(intent, {
+        expectedRevision: revision,
+        ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+      });
       emitDebug?.(
         'broker',
         'authorization',
@@ -589,7 +731,7 @@ export const assembleRuntime = (
       emitDebug?.(
         'runtime',
         'completion',
-        receipt.status === 'rejected' ? 'info' : 'failed',
+        receipt.status === 'rejected' || receipt.status === 'unknown' ? 'info' : 'failed',
         'Capability receipt issued',
         `Receipt status: ${receipt.status}`,
       );
@@ -601,6 +743,7 @@ export const assembleRuntime = (
     run: async (request) => {
       const { threadId, message, signal } = request;
       pendingIntents.clear();
+      pendingExecutions.clear();
       const revision = broker.getRevision();
       const system = useSystemStore.getState();
       // Domain instructions are untrusted package data. The Host binds exactly
@@ -613,6 +756,13 @@ export const assembleRuntime = (
       const principalHistory = boundDomainAgent === undefined
         ? desktopPrincipalHistory(request.history)
         : Object.freeze([]);
+      const mayExecuteApplicationActions = boundDomainAgent === undefined
+        || boundDomainAgent.projection.capabilities.includes('app.action.execute');
+      const availableApplicationActions = await discoverAvailableApplicationActions(
+        host,
+        mayExecuteApplicationActions,
+        (appId) => isAppId(appId) && system.isAppLaunchable(appId),
+      );
       const runningGameIds = (['space-game', 'doudizhu'] as const)
         .filter((gameId) => system.windows[gameId]?.isOpen === true);
       const requestId = `chat-${host.requestId()}`;
@@ -633,6 +783,7 @@ export const assembleRuntime = (
           installedAgentIds: registry.list().filter((entry) => entry.status === 'enabled').map((entry) => entry.manifest.id),
           systemStatus: { ...system.systemStatus },
           runningGameIds,
+          availableApplicationActions,
           enabledAgents,
         },
         ...(request.onDebugEvent ? { debug: { profile: AIOS_AGENT_DEBUG_PROFILE } } : {}),
@@ -652,24 +803,32 @@ export const assembleRuntime = (
         throw new Error('The sidecar response does not match the Host-bound domain Agent principal.');
       }
       const authorityAgentId = boundDomainAgent?.id;
+      const containsApplicationAction = response.intents.some((intent) => intent.type === 'execute_app_action');
       const referenced = new Set(response.surface?.components
         .filter((component) => component.type === 'button')
         .map((component) => component.intentId) ?? []);
       const receipts: AssistantActionReceipt[] = [];
       for (const intent of response.intents) {
+        const idempotencyKey = intent.type === 'execute_app_action'
+          ? requestId
+          : undefined;
         if (referenced.has(intent.id)) {
           pendingIntents.set(intent.id, {
             intent,
             revision,
+            ...(idempotencyKey === undefined ? {} : { idempotencyKey }),
             ...(authorityAgentId === undefined ? {} : { activeAgentId: authorityAgentId }),
             ...(emitDebug === undefined ? {} : { emitDebug }),
           });
         } else {
-          receipts.push(await executeIntent(intent, revision, authorityAgentId, emitDebug));
+          receipts.push(await executeIntent(intent, revision, authorityAgentId, emitDebug, idempotencyKey));
         }
       }
       return {
-        message: response.message,
+        // Model prose is never evidence of an external effect. Application
+        // actions use Host-owned wording; the structured receipt is the only
+        // source of truth for committed/rejected/failed/unknown.
+        message: containsApplicationAction ? APPLICATION_ACTION_HOST_MESSAGE : response.message,
         mood: 'speaking',
         ...(response.surface ? { surface: { surface: response.surface, intents: response.intents } } : {}),
         ...(receipts.length > 0 ? { receipts } : {}),
@@ -680,14 +839,29 @@ export const assembleRuntime = (
   const onSurfaceAction = async (intentId: string): Promise<AssistantActionReceipt> => {
     const pending = pendingIntents.get(intentId);
     if (!pending) return { id: intentId, label: 'OS capability', status: 'failed', detail: 'This action is no longer available.' };
-    const receipt = await executeIntent(
+    const existing = pendingExecutions.get(intentId);
+    if (existing !== undefined) return existing;
+    const execution = executeIntent(
       pending.intent,
       pending.revision,
       pending.activeAgentId,
       pending.emitDebug,
-    );
-    if (receipt.status === 'accepted' || receipt.status === 'rejected') pendingIntents.delete(intentId);
-    return receipt;
+      pending.idempotencyKey,
+    ).then((receipt) => {
+      if (
+        (pending.intent.type === 'execute_app_action' || receipt.status !== 'failed')
+        && pendingIntents.get(intentId) === pending
+      ) {
+        pendingIntents.delete(intentId);
+      }
+      return receipt;
+    });
+    pendingExecutions.set(intentId, execution);
+    try {
+      return await execution;
+    } finally {
+      if (pendingExecutions.get(intentId) === execution) pendingExecutions.delete(intentId);
+    }
   };
 
   const doudizhuController = createSidecarAgentController<

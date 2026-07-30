@@ -66,6 +66,13 @@ func enabledDomainAgent() protocol.EnabledAgent {
 	return protocol.EnabledAgent{ID: "travel.planner", Name: "Travel", Description: "Plans travel", Instructions: "Provide travel-domain expertise.", Capabilities: []string{"os.app.open"}, Contributions: []string{"domain-agent"}}
 }
 
+func withWeChatSendAction(req protocol.ChatRequest) protocol.ChatRequest {
+	req.Context.AvailableApplicationActions = []protocol.ApplicationActionDescriptor{{
+		AppID: "wechat", ActionID: "wechat.message.send_to_current", ArgumentSchemaID: "wechat.message.send_to_current.arguments@1",
+	}}
+	return req
+}
+
 func TestServiceAttachesRevisionAndFinalizesManifest(t *testing.T) {
 	runner := &fakeRunner{output: []byte(`{"message":"Ready","mood":"helpful","intents":[{"id":"install","type":"install_agent","manifest":{"id":"travel.planner","name":"Travel","version":"1.0.0","description":"Plans travel","instructions":"Plan useful trips.","capabilities":["a2ui.surface.publish"]}}]}`)}
 	service, _ := NewService(runner, 2)
@@ -133,6 +140,45 @@ func TestServiceAllowsOnlyAnEnabledActiveDomainAgent(t *testing.T) {
 	for _, boundary := range []string{"domain expertise only", "never grants", "cannot directly control the OS"} {
 		if !strings.Contains(prompt, boundary) {
 			t.Fatalf("chat policy omitted %q", boundary)
+		}
+	}
+}
+
+func TestServiceAllowsOnlyHostAdvertisedApplicationActions(t *testing.T) {
+	message := "private canary message"
+	runner := &fakeRunner{output: []byte(`{"message":"Prepared for host authorization.","mood":"focused","intents":[{"id":"send-1","type":"execute_app_action","appId":"wechat","actionId":"wechat.message.send_to_current","arguments":{"text":"` + message + `"}}]}`)}
+	service, _ := NewService(runner, 1)
+	trace := &recordingChatTrace{}
+	response, err := service.ChatWithTrace(context.Background(), withWeChatSendAction(chatRequest("thread-wechat")), trace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Intents) != 1 || response.Intents[0].ExpectedRevision == nil || *response.Intents[0].ExpectedRevision != 7 {
+		t.Fatalf("application action lost host revision: %+v", response.Intents)
+	}
+	if len(trace.decisions) != 1 || trace.decisions[0].Target != "wechat:wechat.message.send_to_current" {
+		t.Fatalf("application action trace target = %+v", trace.decisions)
+	}
+	if strings.Contains(fmt.Sprint(trace.decisions), message) {
+		t.Fatal("application action arguments leaked into the summary trace")
+	}
+
+	if _, err := service.Chat(context.Background(), chatRequest("thread-unadvertised")); !errors.Is(err, ErrInvalidAI) {
+		t.Fatalf("unadvertised application action was not rejected: %v", err)
+	}
+	intent := protocol.Intent{Type: "execute_app_action", AppID: "wechat", ActionID: "wechat.message.send_to_current"}
+	if applicationActionAdvertised(protocol.ChatContext{AvailableApplicationActions: []protocol.ApplicationActionDescriptor{{
+		AppID: "wechat", ActionID: "wechat.message.send_to_current", ArgumentSchemaID: "wechat.message.send_to_current.arguments@2",
+	}}}, intent) {
+		t.Fatal("application action with an unregistered argument schema was advertised")
+	}
+	prompt, err := chatPrompt(withWeChatSendAction(chatRequest("thread-prompt")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, boundary := range []string{"closed host-projected vocabulary", "not authorization", "wechat.message.send_to_current.arguments@1", "CRLF and lone CR are normalized to LF", "non-empty after trimming whitespace", "no unsafe control, bidirectional-formatting, or unpaired-surrogate character", "Never emit selectors", "Never claim a message was sent"} {
+		if !strings.Contains(prompt, boundary) {
+			t.Fatalf("application action policy omitted %q", boundary)
 		}
 	}
 }
@@ -237,8 +283,12 @@ func TestSchemasAreJSONAndChatAllowsAtMostOneIntent(t *testing.T) {
 		`"manifestId":{"type":"string","minLength":3,"maxLength":128,"pattern":"^[a-z0-9]+([.-][a-z0-9]+)*$"}`,
 		`"manifest":{"type":"object","additionalProperties":false,"properties":{"id":{"$ref":"#/$defs/manifestId"}`,
 		`"version":{"type":"string","maxLength":64`,
-		`"capabilities":{"type":"array","maxItems":9,"uniqueItems":true`,
+		`"capabilities":{"type":"array","maxItems":10,"uniqueItems":true`,
 		`"instructions":{"type":"string","minLength":1,"maxLength":12000}`,
+		`"type":{"const":"execute_app_action"}`,
+		`"appId":{"const":"wechat"}`,
+		`"actionId":{"const":"wechat.message.send_to_current"}`,
+		`"arguments":{"type":"object","additionalProperties":false,"properties":{"text":{"type":"string","minLength":1,"maxLength":8000}},"required":["text"]}`,
 	} {
 		if !strings.Contains(chatSchemaText, contract) {
 			t.Fatalf("chat schema drifted from contract %s", contract)

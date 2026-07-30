@@ -1,9 +1,14 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
-import { AssistantHost } from './AssistantHost';
+import { AssistantHost, describeAssistantReceiptFallback } from './AssistantHost';
 import type { AssistantClient } from './types';
 
 describe('AssistantHost', () => {
+  it('describes an unknown effect without inviting a duplicate retry', () => {
+    expect(describeAssistantReceiptFallback('unknown')).toContain('无法确认');
+    expect(describeAssistantReceiptFallback('unknown')).toContain('请勿重试');
+  });
+
   it('renders an accessible native control and a non-WebGL fallback', () => {
     const client: AssistantClient = {
       run: async () => ({ message: 'ok' }),

@@ -3,8 +3,20 @@ import type { A2uiSurface } from './a2ui';
 import type { OsIntent, SystemStatusSnapshot } from './intents';
 import type { JsonValue } from './validation';
 
-export const AIOS_AGENT_PROTOCOL_VERSION = '1.0.0' as const;
+export const AIOS_AGENT_PROTOCOL_VERSION = '1.1.0' as const;
 export const AIOS_AGENT_DEBUG_PROFILE = 'agent-debug.v1' as const;
+
+export const APPLICATION_ACTION_ARGUMENT_SCHEMA_IDS = [
+  'wechat.message.send_to_current.arguments@1',
+] as const;
+
+export type ApplicationActionArgumentSchemaId = (typeof APPLICATION_ACTION_ARGUMENT_SCHEMA_IDS)[number];
+
+export interface AvailableApplicationAction {
+  readonly appId: string;
+  readonly actionId: string;
+  readonly argumentSchemaId: ApplicationActionArgumentSchemaId;
+}
 
 export interface HealthResponse {
   readonly protocolVersion: typeof AIOS_AGENT_PROTOCOL_VERSION;
@@ -34,6 +46,12 @@ export interface OsContextSnapshot {
   readonly installedAgentIds?: readonly string[];
   readonly systemStatus?: SystemStatusSnapshot;
   readonly runningGameIds?: readonly string[];
+  /**
+   * Least-authority catalog captured by the trusted host for this turn. The
+   * sidecar may only propose an application action present in this catalog.
+   * Argument contracts are local, versioned schemas rather than prompt input.
+   */
+  readonly availableApplicationActions?: readonly AvailableApplicationAction[];
   readonly enabledAgents?: readonly {
     readonly id: string;
     readonly name: string;

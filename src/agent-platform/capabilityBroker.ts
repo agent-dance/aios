@@ -46,6 +46,14 @@ export interface OsCapabilityPorts {
     focus(appId: string): void | Promise<void>;
     minimize(appId: string): void | Promise<void>;
   };
+  /**
+   * Main-owned semantic application control. The Broker, rather than the
+   * caller, binds principal, revision, and idempotency to the validated
+   * intent immediately before crossing the trusted Host boundary.
+   */
+  readonly applicationActions: {
+    execute(request: ApplicationActionExecutionRequest): ApplicationActionExecutionResult | Promise<ApplicationActionExecutionResult>;
+  };
   readonly preferences: {
     update(preferences: Extract<OsIntent, { type: 'set_preferences' }>['preferences']): void | Promise<void>;
   };
@@ -63,6 +71,32 @@ export interface OsCapabilityPorts {
   };
 }
 
+export type ApplicationActionExecutionStatus =
+  | 'committed'
+  | 'noop'
+  | 'rejected'
+  | 'failed'
+  | 'unknown';
+
+export interface ApplicationActionExecutionRequest {
+  readonly principal: AgentPrincipal;
+  readonly intentId: string;
+  readonly idempotencyKey: string;
+  readonly appId: string;
+  readonly actionId: string;
+  readonly arguments: Extract<OsIntent, { type: 'execute_app_action' }>['arguments'];
+  readonly expectedRevision: number;
+}
+
+export interface ApplicationActionExecutionResult {
+  readonly status: ApplicationActionExecutionStatus;
+  readonly receiptId: string;
+  /** Authoritative approval recorded by the main-owned effect transaction. */
+  readonly approvedByUser: boolean;
+  readonly retryable: boolean;
+  readonly errorCode?: string;
+}
+
 export interface CapabilityReceipt {
   readonly intentId: string;
   readonly principal: AgentPrincipal;
@@ -72,6 +106,10 @@ export interface CapabilityReceipt {
   readonly previousRevision: number;
   readonly revision: number;
   readonly approvedByUser: boolean;
+  readonly applicationEffect?: Readonly<{
+    readonly status: 'committed' | 'noop';
+    readonly receiptId: string;
+  }>;
 }
 
 export type CapabilityBrokerErrorCode =
@@ -81,6 +119,8 @@ export type CapabilityBrokerErrorCode =
   | 'BROKER_APPROVAL_REQUIRED'
   | 'BROKER_APPROVAL_DENIED'
   | 'BROKER_IDEMPOTENCY_CONFLICT'
+  | 'BROKER_OPERATION_REJECTED'
+  | 'BROKER_OPERATION_UNKNOWN'
   | 'BROKER_OPERATION_FAILED';
 
 export class CapabilityBrokerError extends Error {
@@ -100,6 +140,8 @@ export class CapabilityBrokerError extends Error {
 export interface ExecuteIntentOptions {
   /** Host-captured revision associated with the context supplied to the Agent. */
   readonly expectedRevision?: number;
+  /** Host-generated durable key for one application-effect proposal. */
+  readonly idempotencyKey?: string;
 }
 
 export interface CapabilityBroker {
@@ -135,7 +177,8 @@ export const riskForIntent = (intent: BrokerIntent): IntentRisk => {
     case 'set_preferences': return 'medium';
     case 'set_system_status': return 'medium';
     case 'install_app':
-    case 'install_agent': return 'high';
+    case 'install_agent':
+    case 'execute_app_action': return 'high';
   }
 };
 
@@ -144,18 +187,72 @@ const validateBrokerIntent = (candidate: BrokerIntent): BrokerIntent =>
     ? validatePublishSurfaceIntent(candidate)
     : validateOsIntent(candidate);
 
-const executePort = async (ports: OsCapabilityPorts, intent: BrokerIntent): Promise<void> => {
+const executePort = async (
+  ports: OsCapabilityPorts,
+  intent: BrokerIntent,
+  principal: AgentPrincipal,
+  expectedRevision: number,
+  idempotencyKey: string,
+): Promise<ApplicationActionExecutionResult | undefined> => {
   switch (intent.type) {
-    case 'open_app': await ports.apps.open(intent.appId); return;
-    case 'close_app': await ports.apps.close(intent.appId); return;
-    case 'focus_app': await ports.apps.focus(intent.appId); return;
-    case 'minimize_app': await ports.apps.minimize(intent.appId); return;
-    case 'set_preferences': await ports.preferences.update(intent.preferences); return;
-    case 'set_system_status': await ports.systemStatus.update(intent.statusPatch); return;
-    case 'install_app': await ports.store.install(intent.listingId); return;
-    case 'install_agent': await ports.agents.install(intent.manifest); return;
-    case 'publish_surface': await ports.surfaces.publish(intent.surface, intent.availableIntents); return;
+    case 'open_app': await ports.apps.open(intent.appId); return undefined;
+    case 'close_app': await ports.apps.close(intent.appId); return undefined;
+    case 'focus_app': await ports.apps.focus(intent.appId); return undefined;
+    case 'minimize_app': await ports.apps.minimize(intent.appId); return undefined;
+    case 'execute_app_action': return ports.applicationActions.execute(Object.freeze({
+      principal,
+      // The model-local intent ID is only UI correlation. Main receives a
+      // Host-owned effect identifier so a later model turn may safely reuse
+      // the same local ID without aliasing an earlier durable effect.
+      intentId: idempotencyKey,
+      idempotencyKey,
+      appId: intent.appId,
+      actionId: intent.actionId,
+      arguments: intent.arguments,
+      expectedRevision,
+    }));
+    case 'set_preferences': await ports.preferences.update(intent.preferences); return undefined;
+    case 'set_system_status': await ports.systemStatus.update(intent.statusPatch); return undefined;
+    case 'install_app': await ports.store.install(intent.listingId); return undefined;
+    case 'install_agent': await ports.agents.install(intent.manifest); return undefined;
+    case 'publish_surface': await ports.surfaces.publish(intent.surface, intent.availableIntents); return undefined;
   }
+};
+
+const validateApplicationActionExecutionResult = (
+  result: ApplicationActionExecutionResult,
+): ApplicationActionExecutionResult => {
+  const permittedKeys = new Set(['status', 'receiptId', 'approvedByUser', 'retryable', 'errorCode']);
+  const success = result?.status === 'committed' || result?.status === 'noop';
+  const hasError = typeof result?.errorCode === 'string';
+  if (
+    result === null
+    || typeof result !== 'object'
+    || Object.keys(result).some((key) => !permittedKeys.has(key))
+    || !['status', 'receiptId', 'approvedByUser', 'retryable'].every((key) => Object.hasOwn(result, key))
+    || !['committed', 'noop', 'rejected', 'failed', 'unknown'].includes(result.status)
+    || typeof result.receiptId !== 'string'
+    || result.receiptId.length === 0
+    || result.receiptId.length > 128
+    || typeof result.approvedByUser !== 'boolean'
+    || typeof result.retryable !== 'boolean'
+    || (result.errorCode !== undefined && (typeof result.errorCode !== 'string' || result.errorCode.length > 128))
+    || (success && (result.approvedByUser !== true || result.retryable !== false || hasError))
+    || (result.status === 'unknown'
+      && (result.approvedByUser !== true || result.retryable !== false || !hasError))
+    || (result.status === 'rejected'
+      && (result.approvedByUser !== false || result.retryable !== false || !hasError))
+    || (result.status === 'failed' && !hasError)
+  ) {
+    throw new CapabilityBrokerError('BROKER_OPERATION_FAILED', 'Application control returned an invalid result.');
+  }
+  return Object.freeze({
+    status: result.status,
+    receiptId: result.receiptId,
+    approvedByUser: result.approvedByUser,
+    retryable: result.retryable,
+    ...(result.errorCode === undefined ? {} : { errorCode: result.errorCode }),
+  });
 };
 
 export const createCapabilityBroker = (options: CreateCapabilityBrokerOptions): CapabilityBroker => {
@@ -198,11 +295,23 @@ export const createCapabilityBroker = (options: CreateCapabilityBrokerOptions): 
       if (!Number.isSafeInteger(expectedRevision) || (expectedRevision as number) < 0) {
         throw new CapabilityBrokerError('BROKER_INVALID_INTENT', 'A Host-bound expected revision is required.');
       }
-      const fingerprint = stableSerialize({ intent, expectedRevision });
-      const prior = receipts.get(intent.id);
+      const idempotencyKey = intent.type === 'execute_app_action'
+        ? executeOptions.idempotencyKey
+        : intent.id;
+      if (
+        typeof idempotencyKey !== 'string'
+        || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(idempotencyKey)
+      ) {
+        throw new CapabilityBrokerError(
+          'BROKER_INVALID_INTENT',
+          'A Host-bound idempotency key is required for application actions.',
+        );
+      }
+      const fingerprint = stableSerialize({ principal, intent, expectedRevision, idempotencyKey });
+      const prior = receipts.get(idempotencyKey);
       if (prior) {
         if (prior.fingerprint !== fingerprint) {
-          throw new CapabilityBrokerError('BROKER_IDEMPOTENCY_CONFLICT', 'Intent ID was reused with a different payload.');
+          throw new CapabilityBrokerError('BROKER_IDEMPOTENCY_CONFLICT', 'The Host-bound idempotency key was reused with a different payload.');
         }
         return prior.receipt;
       }
@@ -230,8 +339,56 @@ export const createCapabilityBroker = (options: CreateCapabilityBrokerOptions): 
       if (expectedRevision !== currentRevision()) {
         throw new CapabilityBrokerError('BROKER_STALE_REVISION', 'OS state changed while the intent awaited authorization.', { retryable: true });
       }
-      try { await executePort(options.ports, intent); } catch (error) {
+      let applicationEffect: ApplicationActionExecutionResult | undefined;
+      try {
+        applicationEffect = await executePort(
+          options.ports,
+          intent,
+          principal,
+          expectedRevision as number,
+          idempotencyKey,
+        );
+      } catch (error) {
+        if (error instanceof CapabilityBrokerError) throw error;
         throw new CapabilityBrokerError('BROKER_OPERATION_FAILED', 'The OS capability operation failed.', { cause: error });
+      }
+      let committedApplicationEffect: Readonly<{
+        readonly status: 'committed' | 'noop';
+        readonly receiptId: string;
+        readonly approvedByUser: boolean;
+      }> | undefined;
+      if (applicationEffect !== undefined) {
+        let effect: ApplicationActionExecutionResult;
+        try { effect = validateApplicationActionExecutionResult(applicationEffect); } catch (error) {
+          if (error instanceof CapabilityBrokerError) throw error;
+          throw new CapabilityBrokerError('BROKER_OPERATION_FAILED', 'Application control returned an invalid result.', { cause: error });
+        }
+        if (effect.status === 'rejected') {
+          throw new CapabilityBrokerError(
+            'BROKER_OPERATION_REJECTED',
+            'The application rejected the requested action.',
+            { cause: effect },
+          );
+        }
+        if (effect.status === 'unknown') {
+          throw new CapabilityBrokerError(
+            'BROKER_OPERATION_UNKNOWN',
+            'The application action outcome is unknown. It was not retried to avoid duplicating an external effect.',
+            { cause: effect },
+          );
+        }
+        if (effect.status === 'failed') {
+          throw new CapabilityBrokerError(
+            'BROKER_OPERATION_FAILED',
+            'The application action failed.',
+            { retryable: effect.retryable, cause: effect },
+          );
+        }
+        committedApplicationEffect = Object.freeze({
+          status: effect.status,
+          receiptId: effect.receiptId,
+          approvedByUser: effect.approvedByUser,
+        });
       }
       const previousRevision = expectedRevision;
       revision = commitRevision();
@@ -243,13 +400,19 @@ export const createCapabilityBroker = (options: CreateCapabilityBrokerOptions): 
         accepted: true as const,
         previousRevision,
         revision,
-        approvedByUser,
+        approvedByUser: committedApplicationEffect?.approvedByUser ?? approvedByUser,
+        ...(committedApplicationEffect === undefined ? {} : {
+          applicationEffect: Object.freeze({
+            status: committedApplicationEffect.status,
+            receiptId: committedApplicationEffect.receiptId,
+          }),
+        }),
       });
       if (receipts.size >= maxReceipts) {
-        const oldestIntentId = receipts.keys().next().value as string | undefined;
-        if (oldestIntentId !== undefined) receipts.delete(oldestIntentId);
+        const oldestIdempotencyKey = receipts.keys().next().value as string | undefined;
+        if (oldestIdempotencyKey !== undefined) receipts.delete(oldestIdempotencyKey);
       }
-      receipts.set(intent.id, { fingerprint, receipt });
+      receipts.set(idempotencyKey, { fingerprint, receipt });
       return receipt;
     }),
   });

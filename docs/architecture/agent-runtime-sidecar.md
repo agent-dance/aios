@@ -22,7 +22,7 @@ browser shell
   +-- Capability Broker -> OS/store/settings/Agent registry ports
   +-- AGAP ParticipantPort -> game authority
   |
-  | HTTP protocol 1.0.0, exact Origin, mutually authenticated messages
+  | HTTP protocol 1.1.0, exact Origin, mutually authenticated messages
   v
 Go sidecar (127.0.0.1 by default)
   +-- request/schema validation and bounded HTTP server
@@ -55,7 +55,8 @@ The SDK is reused for Codex driver lifecycle, typed binding, native clone-profil
 
 The sidecar uses `127.0.0.1:4317` and configuration rejects hostnames, IPv6 aliases, wildcard addresses, and every other IP. This intentionally matches the browser production CSP's only HTTP sidecar source. Development keeps explicit `ws://localhost:*` and `ws://127.0.0.1:*` sources solely for the Vite HMR transport; they are not accepted sidecar HTTP endpoints.
 
-The HTTP contract is versioned as `1.0.0`:
+The HTTP contract is versioned as `1.1.0`. Browser and sidecar require an exact
+version match and are upgraded atomically; there is no mixed-version fallback:
 
 | Endpoint | Authentication | Purpose |
 | --- | --- | --- |
@@ -165,15 +166,18 @@ Distinct chat threads, matches, games, and seats can therefore run concurrently 
 
 ### Structured intent flow
 
-For a desktop chat turn, the browser captures an OS revision and a bounded context projection: locale, active application, theme, installed apps, full read-only system telemetry, and running-game identifiers. Domain-Agent instructions are never mixed into this desktop principal. A domain Agent is invoked explicitly with `/agent <id> <message>`; the Host binds exactly that installed, enabled package before the request, sends only its descriptor, and executes every returned intent through that package's capability-limited Broker even if the model omits `activeAgentId`. The sidecar treats both user text and context JSON as untrusted input. Codex may return at most one intent from the closed union:
+For a desktop chat turn, the browser captures an OS revision and a bounded context projection: locale, active application, theme, installed apps, full read-only system telemetry, running-game identifiers, and a least-authority catalog of currently available application actions. Each action descriptor contains only a validated `appId`, `actionId`, and versioned local `argumentSchemaId`; arbitrary descriptions and caller-supplied JSON Schema never enter the prompt. Domain-Agent instructions are never mixed into this desktop principal. A domain Agent is invoked explicitly with `/agent <id> <message>`; the Host binds exactly that installed, enabled package before the request, sends only its descriptor, and executes every returned intent through that package's capability-limited Broker even if the model omits `activeAgentId`. The sidecar treats both user text and context JSON as untrusted input. Codex may return at most one intent from the closed union:
 
 - open, close, focus, or minimize an application;
+- propose an application action advertised for this exact turn; protocol 1.1.0 initially registers `wechat.message.send_to_current` with the exact `{ "text": string }` contract;
 - install a signed built-in application listing;
 - update supported preferences;
 - update only controllable system fields such as Wi-Fi, Bluetooth, energy mode, brightness, and volume; health and storage telemetry remain read-only;
 - install a declarative Agent manifest.
 
-The sidecar stamps the intent with the observed revision. In the browser, the Capability Broker revalidates the payload, checks the optimistic revision, computes risk, applies policy, asks through a trusted Host approval surface for high-risk operations, calls the typed OS port, advances the revision, and emits a receipt. Install operations require explicit trusted approval in the current composition. A2UI cannot draw or impersonate that approval surface.
+The sidecar rejects an application-action pair that was not advertised in the request and never exposes selectors, JavaScript, DOM details, coordinates, or message text in its summary trace. Advertisement is vocabulary, not authorization. The sidecar stamps the intent with the observed revision. In the browser, the Capability Broker revalidates the payload, checks the optimistic revision, computes risk, applies policy, and calls the typed application-control port. For application effects, Electron main then owns prepare, the exact native preview, a one-shot grant, the durable dispatch fence, semantic execution, and the immutable receipt. Only `committed` or `noop` advances the browser revision; `unknown` is terminal and is never retried automatically. Install and external-communication operations require explicit trusted approval in the current composition. A2UI cannot draw or impersonate that approval surface.
+
+Application Control v1 treats the renderer-supplied Principal as provenance, not as an authorization credential. This is safe for the current R3 path because every effect receives a fresh main-owned native confirmation and no Principal can obtain an automatic grant. Before the platform adds Principal-based allow rules, reusable grants, confirmation-free effects, or sensitive receipt isolation, Electron main must issue a short-lived one-shot authority handle bound to the authenticated sidecar connection, selected package digest, user session, intent, revision, and audience; durable receipts must then retain the corresponding main-owned Principal chain.
 
 Model output is a proposal. A reply must not be interpreted as proof that an operation ran; only a Broker receipt proves an accepted OS effect.
 

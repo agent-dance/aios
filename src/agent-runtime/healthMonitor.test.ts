@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { HealthResponse, SidecarClient } from '../agent-platform';
+import { AIOS_AGENT_PROTOCOL_VERSION, type HealthResponse, type SidecarClient } from '../agent-platform';
 import { startSidecarHealthMonitor } from './healthMonitor';
 
 const health = (status: HealthResponse['status']): HealthResponse => ({
-  protocolVersion: '1.0.0',
+  protocolVersion: AIOS_AGENT_PROTOCOL_VERSION,
   status,
   agent: { driver: 'codex', authMode: 'linked', profileIsolated: true },
   limits: { maxBodyBytes: 262_144, maxConcurrentRuns: 4 },

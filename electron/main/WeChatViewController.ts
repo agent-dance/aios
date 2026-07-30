@@ -13,6 +13,15 @@ import {
   type WeChatErrorCode,
   type WeChatState,
 } from '../shared/wechatProtocol.js';
+import type {
+  WeChatAutomationTarget,
+} from './application-control/wechat/weChatAutomationTarget.js';
+import {
+  createWeChatMessageRuntimeSource,
+  type WeChatMessageRuntimeCommitInput,
+  type WeChatMessageRuntimeInput,
+  type WeChatMessageRuntimePrepareInput,
+} from './application-control/wechat/weChatMessageRuntime.js';
 
 export interface WeChatControllerLogger {
   error(message: string, error?: unknown): void;
@@ -33,6 +42,7 @@ const defaultLogger: WeChatControllerLogger = {
 };
 
 export const WECHAT_DOCUMENT_READY_TIMEOUT_MS = 15_000;
+const WECHAT_AUTOMATION_ISOLATED_WORLD_ID = 1_004;
 
 export class WeChatViewController {
   readonly #hostWindow: BrowserWindow;
@@ -264,6 +274,65 @@ export class WeChatViewController {
 
   ownsWebContents(contents: WebContents): boolean {
     return this.#view?.webContents === contents;
+  }
+
+  /**
+   * Returns a revocable lease over the exact, attested main document. A full
+   * navigation, root attestation loss, renderer crash, unresponsive event,
+   * unmount, or view replacement invalidates the lease before another action
+   * may be dispatched.
+   */
+  getAutomationTarget(): WeChatAutomationTarget | null {
+    if (this.#disposed || this.#state.phase !== 'ready') {
+      return null;
+    }
+    const view = this.#getMountedView();
+    if (view === null || !isAllowedWeChatMainFrameUrl(view.webContents.getURL())) {
+      return null;
+    }
+
+    const contents = view.webContents;
+    const frame = contents.mainFrame;
+    if (frame.isDestroyed()) {
+      return null;
+    }
+    const controllerGeneration = this.#generation;
+    const documentSequence = this.#documentSequence;
+    const origin = new URL(contents.getURL()).origin;
+    const isCurrent = (): boolean => (
+      this.#state.phase === 'ready'
+      && this.#isCurrent(controllerGeneration, contents)
+      && documentSequence === this.#documentSequence
+      && contents.mainFrame === frame
+      && !frame.isDestroyed()
+      && isAllowedWeChatMainFrameUrl(contents.getURL())
+      && new URL(contents.getURL()).origin === origin
+    );
+
+    return Object.freeze({
+      binding: Object.freeze({ controllerGeneration, documentSequence, origin }),
+      isCurrent,
+      prepareMessage: (input: WeChatMessageRuntimePrepareInput): Promise<unknown> => (
+        executeMessageOperation(input, false)
+      ),
+      commitMessage: (input: WeChatMessageRuntimeCommitInput): Promise<unknown> => (
+        executeMessageOperation(input, true)
+      ),
+    });
+
+    async function executeMessageOperation(
+      input: WeChatMessageRuntimeInput,
+      userGesture: boolean,
+    ): Promise<unknown> {
+        if (!isCurrent()) {
+          throw new Error('The Web WeChat automation document lease is no longer current.');
+        }
+        return contents.executeJavaScriptInIsolatedWorld(
+          WECHAT_AUTOMATION_ISOLATED_WORLD_ID,
+          [{ code: createWeChatMessageRuntimeSource(input) }],
+          userGesture,
+        );
+    }
   }
 
   handleCertificateError(contents: WebContents): void {

@@ -70,7 +70,8 @@ func TestSystemStatusIntentIsClosedAndPreferencesAccentMatchesBrowser(t *testing
 	if err := intent.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if err := (Intent{ID: "status-1", Type: "set_system_status", StatusPatch: &SystemStatusPatch{}}).Validate(); err == nil {
+	emptyStatus := Intent{ID: "status-1", Type: "set_system_status", StatusPatch: &SystemStatusPatch{}}
+	if err := emptyStatus.Validate(); err == nil {
 		t.Fatal("empty status patch accepted")
 	}
 	var output AgentOutput
@@ -85,6 +86,220 @@ func TestSystemStatusIntentIsClosedAndPreferencesAccentMatchesBrowser(t *testing
 	legacy := "#c9ff57"
 	if err := (Preferences{Accent: &legacy}).Validate(); err == nil {
 		t.Fatal("legacy color accent accepted")
+	}
+}
+
+func TestExecuteApplicationActionValidatesKnownWeChatArguments(t *testing.T) {
+	valid := Intent{
+		ID: "send-1", Type: "execute_app_action", AppID: "wechat",
+		ActionID: wechatSendToCurrentActionID, Arguments: json.RawMessage(`{"text":"hello"}`),
+	}
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid WeChat action rejected: %v", err)
+	}
+	valid.Arguments = json.RawMessage(`{"text":"emoji \ud83d\ude00 preserved"}`)
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid JSON surrogate pair rejected: %v", err)
+	}
+	var paired WeChatSendToCurrentArguments
+	if err := DecodeStrict(valid.Arguments, &paired); err != nil {
+		t.Fatal(err)
+	}
+	if paired.Text != "emoji 😀 preserved" || strings.ContainsRune(paired.Text, '\ufffd') {
+		t.Fatalf("valid surrogate pair was corrupted: %q", paired.Text)
+	}
+	valid.Arguments = json.RawMessage(`{"text":"literal \\ud83d and \\ude00 escapes"}`)
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("escaped literal surrogate spelling rejected: %v", err)
+	}
+	valid.Arguments = json.RawMessage(`{"text":"line 1\r\nline 2\rline 3"}`)
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("WeChat newline normalization rejected: %v", err)
+	}
+	var normalized WeChatSendToCurrentArguments
+	if err := DecodeStrict(valid.Arguments, &normalized); err != nil {
+		t.Fatal(err)
+	}
+	if normalized.Text != "line 1\nline 2\nline 3" {
+		t.Fatalf("WeChat newlines were not normalized: %q", normalized.Text)
+	}
+	valid.Arguments = json.RawMessage(fmt.Sprintf(`{"text":%q}`, strings.Repeat("a\r\n", 2000)))
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("text reaching 4000 UTF-16 units only after CRLF normalization rejected: %v", err)
+	}
+	valid.Arguments = json.RawMessage(fmt.Sprintf(`{"text":%q}`, strings.Repeat("😀", 2000)))
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("4000 UTF-16-unit WeChat message rejected: %v", err)
+	}
+	valid.Arguments = json.RawMessage(fmt.Sprintf(`{"text":%q}`, strings.Repeat("😀", 2000)+"a"))
+	if err := valid.Validate(); err == nil {
+		t.Fatal("WeChat message beyond 4000 UTF-16 units accepted")
+	}
+	valid.Arguments = json.RawMessage(strings.Repeat(" ", maxApplicationActionArgumentsBytes) + `{"text":"hello"}`)
+	if err := valid.Validate(); err == nil {
+		t.Fatal("WeChat arguments beyond 64 KiB serialized JSON accepted before normalization")
+	}
+
+	rejected := []struct {
+		name      string
+		appID     string
+		actionID  string
+		arguments string
+	}{
+		{name: "wrong app", appID: "settings", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello"}`},
+		{name: "missing text", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{}`},
+		{name: "empty text", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":""}`},
+		{name: "blank text", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":" \r\n\t"}`},
+		{name: "BOM-only text", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"\ufeff"}`},
+		{name: "NUL text", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello\u0000world"}`},
+		{name: "C0 control", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello\u0007world"}`},
+		{name: "tab control", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello\tworld"}`},
+		{name: "C1 control", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello\u009fworld"}`},
+		{name: "Arabic letter mark", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello\u061cworld"}`},
+		{name: "left-to-right mark", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello\u200eworld"}`},
+		{name: "line separator", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello\u2028world"}`},
+		{name: "bidi override", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello\u202eworld"}`},
+		{name: "bidi isolate", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello\u2066world"}`},
+		{name: "lone high surrogate", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello\ud83d"}`},
+		{name: "lone low surrogate", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello\ude00"}`},
+		{name: "high followed by non-low", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello\ud83d\u0041"}`},
+		{name: "unknown field", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"hello","recipient":"someone"}`},
+		{name: "duplicate field", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `{"text":"first","text":"second"}`},
+		{name: "non-object", appID: "wechat", actionID: wechatSendToCurrentActionID, arguments: `[]`},
+		{name: "invalid action id", appID: "wechat", actionID: "WeChat.send", arguments: `{}`},
+		{name: "invalid app id", appID: "WeChat", actionID: "future.action", arguments: `{}`},
+	}
+	for _, test := range rejected {
+		t.Run(test.name, func(t *testing.T) {
+			intent := Intent{ID: "send-1", Type: "execute_app_action", AppID: test.appID, ActionID: test.actionID, Arguments: json.RawMessage(test.arguments)}
+			if err := intent.Validate(); err == nil {
+				t.Fatal("invalid application action accepted")
+			}
+		})
+	}
+}
+
+func TestExecuteApplicationActionSupportsBoundedExtensibleArguments(t *testing.T) {
+	intent := Intent{
+		ID: "future-1", Type: "execute_app_action", AppID: "calendar",
+		ActionID: "calendar.event.create", Arguments: json.RawMessage(`{"title":"Review","metadata":{"priority":2},"attendees":["a","b"]}`),
+	}
+	if err := intent.Validate(); err != nil {
+		t.Fatalf("bounded future action rejected: %v", err)
+	}
+
+	const boundaryPrefix = `{"chunks":["`
+	const boundaryMiddle = `","`
+	const boundarySuffix = `"]}`
+	firstChunk := strings.Repeat("a", 32768)
+	secondChunk := strings.Repeat("b", maxApplicationActionArgumentsBytes-len(boundaryPrefix)-len(boundaryMiddle)-len(boundarySuffix)-len(firstChunk))
+	intent.Arguments = json.RawMessage(boundaryPrefix + firstChunk + boundaryMiddle + secondChunk + boundarySuffix)
+	if len(intent.Arguments) != maxApplicationActionArgumentsBytes {
+		t.Fatalf("test fixture is %d bytes, want %d", len(intent.Arguments), maxApplicationActionArgumentsBytes)
+	}
+	if err := intent.Validate(); err != nil {
+		t.Fatalf("64 KiB serialized arguments boundary rejected: %v", err)
+	}
+	intent.Arguments = json.RawMessage(boundaryPrefix + firstChunk + boundaryMiddle + secondChunk + "b" + boundarySuffix)
+	if err := intent.Validate(); err == nil {
+		t.Fatal("arguments beyond 64 KiB serialized JSON accepted")
+	}
+
+	intent.Arguments = json.RawMessage(strings.Repeat(`{"nested":`, maxApplicationActionJSONDepth+1) + `0` + strings.Repeat(`}`, maxApplicationActionJSONDepth+1))
+	if err := intent.Validate(); err == nil {
+		t.Fatal("arguments beyond the JSON nesting limit accepted")
+	}
+	intent.Arguments = json.RawMessage(`{"number":1e999}`)
+	if err := intent.Validate(); err == nil {
+		t.Fatal("non-finite JavaScript-number equivalent accepted")
+	}
+	value, err := decodeApplicationActionArguments(json.RawMessage(`{"number":1e3}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if number := value.(map[string]any)["number"]; number != float64(1000) {
+		t.Fatalf("scientific number did not use JavaScript Number semantics: %#v", number)
+	}
+	intent.Arguments = json.RawMessage(fmt.Sprintf(`{"value":%q}`, strings.Repeat("a", 32769)))
+	if err := intent.Validate(); err == nil {
+		t.Fatal("generic string beyond 32768 UTF-16 units accepted")
+	}
+	intent.Arguments = json.RawMessage(fmt.Sprintf(`{%q:true}`, strings.Repeat("k", 129)))
+	if err := intent.Validate(); err == nil {
+		t.Fatal("generic object key beyond 128 UTF-16 units accepted")
+	}
+	for _, key := range []string{"", "__proto__", "constructor", "prototype"} {
+		intent.Arguments = json.RawMessage(fmt.Sprintf(`{%q:true}`, key))
+		if err := intent.Validate(); err == nil {
+			t.Fatalf("forbidden generic object key %q accepted", key)
+		}
+	}
+	intent.Arguments = json.RawMessage(`{"\ud800":true}`)
+	if err := intent.Validate(); err == nil {
+		t.Fatal("unpaired surrogate in a generic argument key accepted")
+	}
+
+	foreign := Intent{ID: "open-1", Type: "open_app", AppID: "wechat", Arguments: json.RawMessage(`{}`)}
+	if err := foreign.Validate(); err == nil {
+		t.Fatal("application action arguments accepted on another intent type")
+	}
+}
+
+func TestIntentWireDecoderPreservesForbiddenFieldPresence(t *testing.T) {
+	for _, encoded := range []string{
+		`{"message":"ok","mood":"neutral","intents":[{"id":"open-1","type":"open_app","appId":"wechat","actionId":""}]}`,
+		`{"message":"ok","mood":"neutral","intents":[{"id":"send-1","type":"execute_app_action","appId":"wechat","actionId":"wechat.message.send_to_current","arguments":{"text":"hello"},"listingId":""}]}`,
+		`{"message":"ok","mood":"neutral","intents":[{"id":"send-1","type":"execute_app_action","appId":"wechat","actionId":"wechat.message.send_to_current","arguments":{"text":"hello"},"preferences":null}]}`,
+		`{"message":"ok","mood":"neutral","intents":[{"id":"open-1","type":"open_app","appId":"wechat","expectedRevision":null}]}`,
+	} {
+		var output AgentOutput
+		if err := DecodeStrict([]byte(encoded), &output); err != nil {
+			t.Fatal(err)
+		}
+		if err := output.Validate(); err == nil {
+			t.Fatalf("wire-only forbidden field presence accepted: %s", encoded)
+		}
+	}
+}
+
+func TestChatContextValidatesAvailableApplicationActionDescriptors(t *testing.T) {
+	descriptor := ApplicationActionDescriptor{
+		AppID: "wechat", ActionID: wechatSendToCurrentActionID,
+		ArgumentSchemaID: wechatSendToCurrentArgumentSchemaID,
+	}
+	request := ChatRequest{
+		RequestID: "request-1", ThreadID: "thread-1", Message: "send hello",
+		Context: ChatContext{OSRevision: ptr[int64](1), AvailableApplicationActions: []ApplicationActionDescriptor{descriptor}},
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("valid application action descriptor rejected: %v", err)
+	}
+
+	request.Context.AvailableApplicationActions = []ApplicationActionDescriptor{descriptor, descriptor}
+	if err := request.Validate(); err == nil {
+		t.Fatal("duplicate application action descriptor accepted")
+	}
+	request.Context.AvailableApplicationActions = []ApplicationActionDescriptor{{
+		AppID: "settings", ActionID: wechatSendToCurrentActionID, ArgumentSchemaID: wechatSendToCurrentArgumentSchemaID,
+	}}
+	if err := request.Validate(); err == nil {
+		t.Fatal("WeChat action descriptor bound to another app accepted")
+	}
+	request.Context.AvailableApplicationActions = []ApplicationActionDescriptor{{
+		AppID: "calendar", ActionID: "calendar.event.create", ArgumentSchemaID: "calendar.event.create.arguments@2",
+	}}
+	if err := request.Validate(); err == nil {
+		t.Fatal("unregistered future action descriptor accepted")
+	}
+	request.Context.AvailableApplicationActions = make([]ApplicationActionDescriptor, 65)
+	for index := range request.Context.AvailableApplicationActions {
+		request.Context.AvailableApplicationActions[index] = ApplicationActionDescriptor{
+			AppID: "calendar", ActionID: fmt.Sprintf("calendar.event.action_%d", index+1),
+			ArgumentSchemaID: fmt.Sprintf("calendar.event.action_%d.arguments@1", index+1),
+		}
+	}
+	if err := request.Validate(); err == nil {
+		t.Fatal("available application action collection beyond 64 accepted")
 	}
 }
 

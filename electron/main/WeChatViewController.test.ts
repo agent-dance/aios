@@ -15,6 +15,7 @@ class FakeWebContents extends EventEmitter {
   readonly focus = vi.fn();
   readonly stop = vi.fn();
   readonly insertCSS = vi.fn(async () => 'layout-key');
+  readonly executeJavaScriptInIsolatedWorld = vi.fn(async () => ({ ok: true }));
   readonly mainFrame = {
     executeJavaScript: vi.fn(async () => true),
     isDestroyed: () => this.destroyed,
@@ -381,6 +382,34 @@ describe('WeChatViewController', () => {
       canGoBack: false,
     }));
     expect(view.webContents.insertCSS).toHaveBeenCalledTimes(2);
+  });
+
+  it('issues an exact-document automation lease and revokes it on unresponsive state', async () => {
+    const { controller, view } = createHarness();
+    controller.mount({ x: 0, y: 0, width: 800, height: 600 });
+    view.webContents.emit('dom-ready');
+    await vi.waitFor(() => expect(controller.getState().phase).toBe('ready'));
+
+    const target = controller.getAutomationTarget();
+    expect(target).not.toBeNull();
+    expect(target?.binding).toMatchObject({
+      controllerGeneration: 1,
+      origin: 'https://wx.qq.com',
+    });
+    expect(target?.binding.documentSequence).toBeGreaterThan(0);
+    await expect(target?.prepareMessage({ operation: 'prepare', rootToken: 'fixed-token' })).resolves.toEqual({ ok: true });
+    expect(view.webContents.executeJavaScriptInIsolatedWorld).toHaveBeenCalledWith(
+      1_004,
+      [{ code: expect.stringContaining('"rootToken":"fixed-token"') }],
+      false,
+    );
+
+    view.webContents.emit('unresponsive');
+    expect(target?.isCurrent()).toBe(false);
+    expect(controller.getAutomationTarget()).toBeNull();
+    await expect(target?.prepareMessage({ operation: 'prepare', rootToken: 'fixed-token' })).rejects.toThrow(
+      'document lease is no longer current',
+    );
   });
 
   it('blocks popup and navigation escape attempts', () => {

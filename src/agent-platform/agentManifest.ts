@@ -13,6 +13,7 @@ export const OS_CAPABILITIES = [
   'os.app.close',
   'os.app.focus',
   'os.app.minimize',
+  'app.action.execute',
   'os.preferences.write',
   'os.system-status.write',
   'store.app.install',

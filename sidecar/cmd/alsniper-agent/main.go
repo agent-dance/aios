@@ -12,6 +12,7 @@ import (
 
 	"github.com/buthim/alsniper-os/sidecar/internal/agent"
 	"github.com/buthim/alsniper-os/sidecar/internal/config"
+	"github.com/buthim/alsniper-os/sidecar/internal/protocol"
 	"github.com/buthim/alsniper-os/sidecar/internal/server"
 )
 
@@ -64,7 +65,7 @@ func main() {
 			logger.Error("graceful shutdown failed", "error", err)
 		}
 	}()
-	logger.Info("AlSniper Agent sidecar listening", "address", cfg.ListenAddress, "protocol", "1.0.0")
+	logger.Info("AlSniper Agent sidecar listening", "address", cfg.ListenAddress, "protocol", protocol.Version)
 	serveErr := httpServer.ListenAndServe()
 	if ctx.Err() != nil {
 		<-shutdownDone

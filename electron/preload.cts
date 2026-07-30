@@ -29,6 +29,29 @@ const CHANNELS = Object.freeze({
   stateChanged: 'alsniper-desktop:wechat:state-changed',
 });
 
+const APPLICATION_CONTROL_CHANNELS = Object.freeze({
+  listCapabilities: 'alsniper-desktop:application-control:list-capabilities',
+  execute: 'alsniper-desktop:application-control:execute',
+  getReceipt: 'alsniper-desktop:application-control:get-receipt',
+});
+
+const APPLICATION_EFFECT_STATUSES = new Set<unknown>(['committed', 'rejected', 'failed', 'unknown', 'noop']);
+const APPLICATION_RISK_LEVELS = new Set<unknown>(['R0', 'R1', 'R2', 'R3', 'R4']);
+const APPLICATION_ERROR_CODES = new Set<unknown>([
+  'ADAPTER_UNAVAILABLE',
+  'ACTION_UNAVAILABLE',
+  'APPROVAL_DENIED',
+  'APPROVAL_UNAVAILABLE',
+  'OUTCOME_UNKNOWN_AFTER_DISPATCH_FENCE',
+  'IDEMPOTENCY_CONFLICT',
+  'INTERNAL_ERROR',
+  'INVALID_ARGUMENT',
+  'JOURNAL_UNAVAILABLE',
+  'PRECONDITION_FAILED',
+  'RECONCILIATION_FAILED',
+  'REPLAY_REJECTED',
+]);
+
 const PHASES = new Set<unknown>(['idle', 'loading', 'ready', 'failed']);
 const ERROR_CODES = new Set<unknown>([
   'NAVIGATION_BLOCKED',
@@ -38,6 +61,11 @@ const ERROR_CODES = new Set<unknown>([
   'RENDERER_CRASHED',
 ]);
 const MAX_BOUND_COMPONENT = 32_768;
+const MAX_APPLICATION_ARGUMENT_BYTES = 65_536;
+const MAX_APPLICATION_JSON_DEPTH = 20;
+const MAX_APPLICATION_ARRAY_ITEMS = 512;
+const MAX_APPLICATION_OBJECT_PROPERTIES = 256;
+const MAX_APPLICATION_STRING_LENGTH = 32_768;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -98,6 +126,131 @@ function cloneState(value: unknown): State {
   });
 }
 
+function cloneApplicationJson(value: unknown, depth = 0): unknown {
+  if (depth > MAX_APPLICATION_JSON_DEPTH) throw new TypeError('Application action arguments are too deeply nested.');
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    if (value.length > MAX_APPLICATION_STRING_LENGTH) throw new TypeError('Application action argument string is too long.');
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('Application action arguments contain a non-finite number.');
+    return Object.is(value, -0) ? 0 : value;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > MAX_APPLICATION_ARRAY_ITEMS) throw new TypeError('Application action argument array is too large.');
+    return Object.freeze(value.map((entry) => cloneApplicationJson(entry, depth + 1)));
+  }
+  if (!isRecord(value) || Object.keys(value).length > MAX_APPLICATION_OBJECT_PROPERTIES) {
+    throw new TypeError('Application action argument must be a bounded JSON object.');
+  }
+  const result: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const [key, entry] of Object.entries(value)) {
+    if (key.length === 0 || key.length > 128 || key === '__proto__' || key === 'constructor' || key === 'prototype') {
+      throw new TypeError('Application action argument contains an invalid key.');
+    }
+    result[key] = cloneApplicationJson(entry, depth + 1);
+  }
+  return Object.freeze(result);
+}
+
+function cloneApplicationPrincipal(value: unknown): Readonly<Record<string, string>> {
+  if (!isRecord(value) || !exactKeys(value, ['kind', 'instanceId', 'packageId', 'userId']) || value.kind !== 'agent') {
+    throw new TypeError('Invalid application-control principal provenance.');
+  }
+  const result = {
+    kind: 'agent',
+    instanceId: value.instanceId,
+    packageId: value.packageId,
+    userId: value.userId,
+  };
+  if (Object.values(result).some((entry) => typeof entry !== 'string' || entry.length === 0 || entry.length > 512)) {
+    throw new TypeError('Invalid application-control principal provenance.');
+  }
+  return Object.freeze(result as Record<string, string>);
+}
+
+function cloneApplicationExecuteRequest(value: unknown): Readonly<Record<string, unknown>> {
+  const required = ['protocolVersion', 'intentId', 'idempotencyKey', 'principal', 'appId', 'actionId', 'arguments', 'expectedRevision'];
+  if (!isRecord(value) || !exactKeys(value, required) || value.protocolVersion !== 1 || !isRecord(value.arguments)) {
+    throw new TypeError('Invalid application-control execute request.');
+  }
+  const argumentsClone = cloneApplicationJson(value.arguments);
+  if (new TextEncoder().encode(JSON.stringify(argumentsClone)).byteLength > MAX_APPLICATION_ARGUMENT_BYTES) {
+    throw new TypeError('Application action arguments exceed 64 KiB.');
+  }
+  return Object.freeze({
+    protocolVersion: 1,
+    intentId: value.intentId,
+    idempotencyKey: value.idempotencyKey,
+    principal: cloneApplicationPrincipal(value.principal),
+    appId: value.appId,
+    actionId: value.actionId,
+    arguments: argumentsClone,
+    expectedRevision: value.expectedRevision,
+  });
+}
+
+function cloneApplicationCapability(value: unknown): Readonly<Record<string, unknown>> {
+  if (
+    !isRecord(value)
+    || !exactKeys(value, ['appId', 'actionId', 'adapterVersion', 'risk', 'requiresApproval'])
+    || typeof value.appId !== 'string'
+    || typeof value.actionId !== 'string'
+    || typeof value.adapterVersion !== 'string'
+    || !APPLICATION_RISK_LEVELS.has(value.risk)
+    || typeof value.requiresApproval !== 'boolean'
+  ) throw new TypeError('Invalid application-control capability.');
+  return Object.freeze({ ...value });
+}
+
+function cloneApplicationReceipt(value: unknown): Readonly<Record<string, unknown>> {
+  if (
+    !isRecord(value)
+    || !exactKeys(
+      value,
+      ['protocolVersion', 'receiptId', 'intentId', 'idempotencyKey', 'appId', 'actionId', 'status', 'approvedByUser', 'retryable', 'occurredAt', 'journalSequence'],
+      ['errorCode', 'reconcilesReceiptId'],
+    )
+    || value.protocolVersion !== 1
+    || !APPLICATION_EFFECT_STATUSES.has(value.status)
+    || typeof value.approvedByUser !== 'boolean'
+    || typeof value.retryable !== 'boolean'
+    || typeof value.occurredAt !== 'string'
+    || !Number.isSafeInteger(value.journalSequence)
+    || (value.journalSequence as number) < 0
+    || (value.errorCode !== undefined && !APPLICATION_ERROR_CODES.has(value.errorCode))
+  ) throw new TypeError('Invalid application-control receipt.');
+  const hasError = value.errorCode !== undefined;
+  if (
+    ((value.status === 'committed' || value.status === 'noop')
+      && (value.approvedByUser !== true || value.retryable !== false || hasError))
+    || (value.status === 'unknown'
+      && (value.approvedByUser !== true || value.retryable !== false || !hasError))
+    || (value.status === 'rejected'
+      && (value.approvedByUser !== false || value.retryable !== false || !hasError))
+    || (value.status === 'failed' && !hasError)
+  ) throw new TypeError('Impossible application-control receipt outcome.');
+  if (
+    ((value.journalSequence as number) === 0
+      && !(value.status === 'rejected' && value.errorCode === 'JOURNAL_UNAVAILABLE'))
+    || ((value.journalSequence as number) > 0
+      && value.status === 'rejected' && value.errorCode === 'JOURNAL_UNAVAILABLE')
+  ) throw new TypeError('Invalid journal-unavailable receipt sequence.');
+  return Object.freeze({ ...value });
+}
+
+function cloneApplicationReceiptLookup(value: unknown): Readonly<Record<string, unknown>> {
+  if (!isRecord(value) || !exactKeys(value, ['protocolVersion', 'idempotencyKey', 'principal']) || value.protocolVersion !== 1) {
+    throw new TypeError('Invalid application-control receipt lookup.');
+  }
+  return Object.freeze({
+    protocolVersion: 1,
+    idempotencyKey: value.idempotencyKey,
+    principal: cloneApplicationPrincipal(value.principal),
+  });
+}
+
 async function invokeState(channel: string, ...args: unknown[]): Promise<State> {
   return cloneState(await ipcRenderer.invoke(channel, ...args));
 }
@@ -140,4 +293,24 @@ const wechat = Object.freeze({
   },
 });
 
-contextBridge.exposeInMainWorld('alsniperDesktop', Object.freeze({ wechat }));
+const applicationControl = Object.freeze({
+  listCapabilities: async (): Promise<readonly Readonly<Record<string, unknown>>[]> => {
+    const value: unknown = await ipcRenderer.invoke(APPLICATION_CONTROL_CHANNELS.listCapabilities);
+    if (!Array.isArray(value)) throw new TypeError('Invalid application-control capability list.');
+    return Object.freeze(value.map(cloneApplicationCapability));
+  },
+  execute: async (request: unknown): Promise<Readonly<Record<string, unknown>>> =>
+    cloneApplicationReceipt(await ipcRenderer.invoke(
+      APPLICATION_CONTROL_CHANNELS.execute,
+      cloneApplicationExecuteRequest(request),
+    )),
+  getReceipt: async (lookup: unknown): Promise<Readonly<Record<string, unknown>> | null> => {
+    const value: unknown = await ipcRenderer.invoke(
+      APPLICATION_CONTROL_CHANNELS.getReceipt,
+      cloneApplicationReceiptLookup(lookup),
+    );
+    return value === null ? null : cloneApplicationReceipt(value);
+  },
+});
+
+contextBridge.exposeInMainWorld('alsniperDesktop', Object.freeze({ wechat, applicationControl }));

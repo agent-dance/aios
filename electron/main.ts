@@ -18,6 +18,12 @@ import {
   WeChatSessionPersistence,
 } from './main/sessionPersistence.js';
 import { WeChatViewController } from './main/WeChatViewController.js';
+import { registerApplicationControlIpc } from './main/application-control/ipcRouter.js';
+import { createNativeApplicationApproval } from './main/application-control/nativeApproval.js';
+import { shouldRejectWeChatClientCertificateRequest } from './main/application-control/clientCertificatePolicy.js';
+import { WeChatMessageAdapter } from './main/application-control/wechat/WeChatMessageAdapter.js';
+import type { ApplicationControlService } from './main/application-control/applicationControlService.js';
+import { createApplicationControlService } from './main/application-control/createApplicationControlService.js';
 import {
   isAllowedShellNavigation,
   parseLoopbackDevServerUrl,
@@ -36,6 +42,8 @@ const shellSessionPolicies = new WeakSet<Session>();
 let mainWindow: BrowserWindow | null = null;
 let weChatController: WeChatViewController | null = null;
 let unregisterWeChatIpc: (() => void) | null = null;
+let unregisterApplicationControlIpc: (() => void) | null = null;
+let applicationControlHost: ApplicationControlService | null = null;
 let weChatSessionPersistence: WeChatSessionPersistence | null = null;
 let applicationSessionPersistence: ApplicationSessionPersistence | null = null;
 let applicationStorageExitGate: ApplicationStorageExitGate | null = null;
@@ -190,6 +198,8 @@ async function createMainWindow(): Promise<BrowserWindow> {
       spellcheck: true,
     },
   });
+  // Bind the trusted native window before renderer IPC can become reachable.
+  mainWindow = shellWindow;
 
   hardenShellSession(shellWindow.webContents.session);
   secureShellWebContents(shellWindow, shellUrl);
@@ -226,6 +236,22 @@ async function createMainWindow(): Promise<BrowserWindow> {
   });
   weChatController = controller;
   unregisterWeChatIpc = registerWeChatIpc(shellWindow, controller);
+
+  let controlHost = applicationControlHost;
+  if (controlHost === null) {
+    controlHost = await createApplicationControlService({
+      journalPath: join(
+        app.getPath('userData'),
+        'trust',
+        'application-control-v1.jsonl',
+      ),
+      approval: createNativeApplicationApproval(() => mainWindow),
+      adapters: [new WeChatMessageAdapter(() => weChatController?.getAutomationTarget() ?? null)],
+      logger: { error: (message) => console.error(message) },
+    });
+    applicationControlHost = controlHost;
+  }
+  unregisterApplicationControlIpc = registerApplicationControlIpc(shellWindow, shellUrl, controlHost);
 
   shellWindow.on('resize', () => controller.handleHostResize());
   shellWindow.on('blur', () => controller.handleHostVisibilityLoss());
@@ -269,6 +295,8 @@ async function createMainWindow(): Promise<BrowserWindow> {
     controller.dispose();
   });
   shellWindow.once('closed', () => {
+    unregisterApplicationControlIpc?.();
+    unregisterApplicationControlIpc = null;
     unregisterWeChatIpc?.();
     unregisterWeChatIpc = null;
     weChatController = null;
@@ -304,6 +332,15 @@ if (!hasSingleInstanceLock) {
       weChatController.handleCertificateError(_webContents);
     }
     callback(false);
+  });
+
+  app.on('select-client-certificate', (event, webContents, url, _certificateList, callback) => {
+    if (shouldRejectWeChatClientCertificateRequest(
+      weChatController?.ownsWebContents(webContents) === true,
+    )) {
+      event.preventDefault();
+      callback();
+    }
   });
 
   app.whenReady()
@@ -343,8 +380,14 @@ if (!hasSingleInstanceLock) {
       }
       unregisterWeChatIpc?.();
       unregisterWeChatIpc = null;
+      unregisterApplicationControlIpc?.();
+      unregisterApplicationControlIpc = null;
       weChatController?.dispose();
       weChatController = null;
+      if (applicationControlHost !== null) {
+        void applicationControlHost.close();
+        applicationControlHost = null;
+      }
     };
     if (
       applicationStorageExitGate !== null

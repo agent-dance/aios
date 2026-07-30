@@ -219,6 +219,59 @@ func TestChatSuccessAndInvalidGameAction(t *testing.T) {
 	}
 }
 
+func TestChatAuthenticatesAdvertisedApplicationActionResponse(t *testing.T) {
+	cfg := testConfig(t)
+	output := []byte(`{"message":"Prepared.","mood":"focused","intents":[{"id":"send-1","type":"execute_app_action","appId":"wechat","actionId":"wechat.message.send_to_current","arguments":{"text":"line 1\r\nline 2 \ud83d\ude00"}}]}`)
+	h := handler(t, runner{ready: true, output: output}, cfg)
+	body := `{"requestId":"r-action","threadId":"t-action","message":"send it","context":{"osRevision":9,"availableApplicationActions":[{"appId":"wechat","actionId":"wechat.message.send_to_current","argumentSchemaId":"wechat.message.send_to_current.arguments@1"}]}}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, request(http.MethodPost, "/v1/chat", body, cfg))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("application action chat: %d %s", rec.Code, rec.Body.String())
+	}
+	verifySignedResponse(t, rec, cfg, "00112233445566778899aabbccddeeff")
+	var response protocol.ChatResponse
+	if err := protocol.DecodeStrict(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Intents) != 1 || response.Intents[0].ExpectedRevision == nil || *response.Intents[0].ExpectedRevision != 9 {
+		t.Fatalf("invalid application action response: %+v", response.Intents)
+	}
+	var arguments protocol.WeChatSendToCurrentArguments
+	if err := protocol.DecodeStrict(response.Intents[0].Arguments, &arguments); err != nil {
+		t.Fatal(err)
+	}
+	if arguments.Text != "line 1\nline 2 😀" || strings.ContainsRune(arguments.Text, '\ufffd') {
+		t.Fatalf("application action arguments were not normalized: %q", arguments.Text)
+	}
+}
+
+func TestChatRejectsInvalidWeChatUnicodeBeforeSignedResponse(t *testing.T) {
+	cfg := testConfig(t)
+	body := `{"requestId":"r-action","threadId":"t-action","message":"send it","context":{"osRevision":9,"availableApplicationActions":[{"appId":"wechat","actionId":"wechat.message.send_to_current","argumentSchemaId":"wechat.message.send_to_current.arguments@1"}]}}`
+	for _, test := range []struct {
+		name string
+		text string
+	}{
+		{name: "lone high surrogate", text: `bad \ud83d`},
+		{name: "lone low surrogate", text: `bad \ude00`},
+		{name: "bidi override", text: `bad \u202e display`},
+		{name: "control character", text: `bad \u0007 display`},
+		{name: "BOM-only text", text: `\ufeff`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output := []byte(`{"message":"Prepared.","mood":"focused","intents":[{"id":"send-1","type":"execute_app_action","appId":"wechat","actionId":"wechat.message.send_to_current","arguments":{"text":"` + test.text + `"}}]}`)
+			h := handler(t, runner{ready: true, output: output}, cfg)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, request(http.MethodPost, "/v1/chat", body, cfg))
+			if rec.Code != http.StatusBadGateway || decodeError(t, rec).Error.Code != "INVALID_AGENT_OUTPUT" {
+				t.Fatalf("invalid WeChat Unicode response: %d %s", rec.Code, rec.Body.String())
+			}
+			verifySignedResponse(t, rec, cfg, "00112233445566778899aabbccddeeff")
+		})
+	}
+}
+
 func TestCancellationMapsToStableError(t *testing.T) {
 	cfg := testConfig(t)
 	h := handler(t, runner{ready: true, wait: true}, cfg)
@@ -301,10 +354,10 @@ func TestCanonicalHMACGoldenVectors(t *testing.T) {
 		t.Fatalf("request body hash = %s", bodyHash)
 	}
 	requestMAC := hmacHex(secret, requestCanonical(
-		http.MethodPost, "http://127.0.0.1:4317", "/v1/chat", "http://localhost:5173", "1.0.0", "1785038400000",
+		http.MethodPost, "http://127.0.0.1:4317", "/v1/chat", "http://localhost:5173", protocol.Version, "1785038400000",
 		"00112233445566778899aabbccddeeff", bodyHash,
 	))
-	if requestMAC != "133421e29d48491b58086f2803475f112d8cf54ce74475c6fd8acd872ff1f9cb" {
+	if requestMAC != "6cd2cc6a2b370b5c7bb4a9fac7e4e5776f5c030dd665f14247dc3d7b511102de" {
 		t.Fatalf("request HMAC = %s", requestMAC)
 	}
 	responseHash := sha256Hex([]byte("{\"ok\":true}\n"))
@@ -312,9 +365,9 @@ func TestCanonicalHMACGoldenVectors(t *testing.T) {
 		t.Fatalf("response body hash = %s", responseHash)
 	}
 	responseMAC := hmacHex(secret, responseCanonical(
-		"00112233445566778899aabbccddeeff", "request-vector-1", http.StatusOK, responseHash, "1.0.0",
+		"00112233445566778899aabbccddeeff", "request-vector-1", http.StatusOK, responseHash, protocol.Version,
 	))
-	if responseMAC != "f985b14e6fb5979010fd90770e22ec984160048f7f27a9abe70c2028925b6817" {
+	if responseMAC != "bb51b81e958fa8dc4780f03481a75a2a5a156b84f95b64aa32341e34b4e2293e" {
 		t.Fatalf("response HMAC = %s", responseMAC)
 	}
 }
