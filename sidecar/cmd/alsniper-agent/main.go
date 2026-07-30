@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -19,6 +22,13 @@ import (
 type runnerFactory func(config.Config) (agent.Runner, func() error, error)
 
 func main() {
+	if len(os.Args) == 2 && os.Args[1] == "--version-json" {
+		if err := writeVersionJSON(os.Stdout); err != nil {
+			_, _ = os.Stderr.WriteString("write version metadata: " + err.Error() + "\n")
+			os.Exit(1)
+		}
+		return
+	}
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg, err := config.Load()
 	if err != nil {
@@ -53,22 +63,38 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 * 1024,
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	shutdownDone := make(chan struct{})
+	listener, err := net.Listen("tcp", cfg.ListenAddress)
+	if err != nil {
+		logger.Error("open HTTP listener", "error", err)
+		closeAgent()
+		os.Exit(1)
+	}
+	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+	ctx, cancel := context.WithCancel(signalContext)
+	defer cancel()
+	if os.Getenv("AIOS_SIDECAR_SHUTDOWN_STDIN") == "1" {
+		go cancelWhenStdinCloses(os.Stdin, cancel)
+	}
+	serveDone := make(chan error, 1)
 	go func() {
-		defer close(shutdownDone)
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := httpServer.Shutdown(shutdownCtx); err != nil {
-			logger.Error("graceful shutdown failed", "error", err)
-		}
+		serveDone <- httpServer.Serve(listener)
 	}()
 	logger.Info("AlSniper Agent sidecar listening", "address", cfg.ListenAddress, "protocol", protocol.Version)
-	serveErr := httpServer.ListenAndServe()
-	if ctx.Err() != nil {
-		<-shutdownDone
+	var serveErr error
+	select {
+	case <-ctx.Done():
+		shutdownContext, stopShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := httpServer.Shutdown(shutdownContext); err != nil {
+			logger.Error("graceful shutdown failed", "error", err)
+			if closeErr := httpServer.Close(); closeErr != nil {
+				logger.Error("force HTTP shutdown failed", "error", closeErr)
+			}
+		}
+		stopShutdown()
+		serveErr = <-serveDone
+	case serveErr = <-serveDone:
+		cancel()
 	}
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 		logger.Error("HTTP server failed", "error", serveErr)
@@ -76,6 +102,30 @@ func main() {
 		os.Exit(1)
 	}
 	closeAgent()
+}
+
+type versionMetadata struct {
+	ProtocolVersion      string `json:"protocolVersion"`
+	AgentAdaptorVersion  string `json:"agentAdaptorVersion"`
+	CodexRequiredVersion string `json:"codexRequiredVersion"`
+}
+
+func writeVersionJSON(output io.Writer) error {
+	return json.NewEncoder(output).Encode(versionMetadata{
+		ProtocolVersion:      protocol.Version,
+		AgentAdaptorVersion:  agent.AgentAdaptorVersion,
+		CodexRequiredVersion: agent.AuditedCodexCLIVersion,
+	})
+}
+
+func cancelWhenStdinCloses(input io.Reader, cancel context.CancelFunc) {
+	buffer := make([]byte, 1)
+	for {
+		if _, err := input.Read(buffer); err != nil {
+			cancel()
+			return
+		}
+	}
 }
 
 func newCodexRunner(cfg config.Config) (agent.Runner, func() error, error) {

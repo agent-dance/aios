@@ -10,5 +10,6 @@ export function includeCompiledAsset(source) {
     && !source.endsWith(`${sep}smoke.js`)
     && !source.endsWith(`${sep}persistenceSmoke.js`)
     && !source.endsWith(`${sep}applicationControlSmoke.js`)
+    && !source.endsWith(`${sep}agentRuntimeOriginSmoke.js`)
   );
 }

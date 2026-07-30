@@ -13,7 +13,13 @@ import (
 )
 
 const (
-	auditedCodexCLIVersion = "0.145.0"
+	// AgentAdaptorVersion is the exact formal upstream release linked into the
+	// sidecar. The dependency lock test prevents this launcher contract from
+	// drifting away from go.mod.
+	AgentAdaptorVersion = "1.0.0"
+	// AuditedCodexCLIVersion is the only CLI feature surface accepted at runtime.
+	AuditedCodexCLIVersion = "0.145.0"
+	auditedCodexCLIVersion = AuditedCodexCLIVersion
 	maxCodexVersionOutput  = 4 << 10
 	codexVersionTimeout    = 5 * time.Second
 )

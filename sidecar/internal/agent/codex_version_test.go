@@ -10,6 +10,20 @@ import (
 	"testing"
 )
 
+func TestAgentAdaptorVersionContractMatchesLinkedModule(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join("..", "..", "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	moduleLine := "github.com/agent-dance/agent-adaptor v" + AgentAdaptorVersion
+	if !strings.Contains(string(contents), moduleLine) {
+		t.Fatalf("go.mod does not pin launcher contract %q", moduleLine)
+	}
+	if strings.Contains(string(contents), "replace github.com/agent-dance/agent-adaptor") {
+		t.Fatal("agent-adaptor must not use a local replacement")
+	}
+}
+
 func TestValidateCodexCLIVersionPinsAuditedBuild(t *testing.T) {
 	for _, testCase := range []struct {
 		name    string

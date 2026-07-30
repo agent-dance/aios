@@ -120,6 +120,7 @@ const DEBUG_STREAM_MAX_FRAMES = 16;
 const DEBUG_STREAM_INITIAL_MAC = '0'.repeat(64);
 const AUTHENTICATION_WINDOW_MS = 30_000;
 const NONCE_CACHE_CAPACITY = 4096;
+const ALSNIPER_DESKTOP_ORIGIN = 'app://alsniper';
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: true });
 
@@ -666,16 +667,41 @@ export const createSidecarClient = (config: SidecarClientConfig): SidecarClient 
     throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Sidecar shared secret is invalid.', { cause: error });
   }
   const origin = (() => {
-    try { return new URL(config.origin).origin; } catch { throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Configured browser origin is invalid.'); }
+    if (config.origin === ALSNIPER_DESKTOP_ORIGIN) return ALSNIPER_DESKTOP_ORIGIN;
+    let parsed: URL;
+    try { parsed = new URL(config.origin); } catch { throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Configured browser origin is invalid.'); }
+    if (
+      (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
+      || parsed.origin !== config.origin
+    ) {
+      throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Configured origin must be an exact HTTP(S) origin or the AlSniper desktop origin.');
+    }
+    return parsed.origin;
   })();
-  if (origin !== config.origin) throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Configured origin must be an exact origin without a path.');
   const fetcher = config.fetch ?? globalThis.fetch;
   if (!fetcher) throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Fetch is unavailable.');
   const defaultTimeout = config.timeoutMs ?? 45_000;
   if (!Number.isSafeInteger(defaultTimeout) || defaultTimeout < 100 || defaultTimeout > 300_000) {
     throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Timeout must be between 100 and 300000ms.');
   }
-  const getOrigin = config.getOrigin ?? (() => globalThis.location?.origin ?? origin);
+  const getOrigin = config.getOrigin ?? (() => {
+    const browserLocation = globalThis.location;
+    if (browserLocation !== undefined) {
+      try {
+        const currentUrl = new URL(browserLocation.href);
+        if (
+          currentUrl.protocol === 'app:'
+          && currentUrl.hostname === 'alsniper'
+          && currentUrl.username === ''
+          && currentUrl.password === ''
+          && currentUrl.port === ''
+        ) return ALSNIPER_DESKTOP_ORIGIN;
+      } catch {
+        return browserLocation.origin;
+      }
+    }
+    return browserLocation?.origin ?? origin;
+  });
   const cryptoProvider = config.crypto ?? globalThis.crypto;
   if (!cryptoProvider?.subtle || typeof cryptoProvider.getRandomValues !== 'function') {
     throw new SidecarClientError('SIDECAR_CONFIG_INVALID', 'Web Crypto is unavailable for authenticated sidecar transport.');

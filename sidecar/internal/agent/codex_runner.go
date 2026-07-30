@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,13 +21,15 @@ import (
 
 	agentadaptor "github.com/agent-dance/agent-adaptor"
 	"github.com/agent-dance/agent-adaptor/codex"
+	adaptordriver "github.com/agent-dance/agent-adaptor/driver"
+	adaptorprofile "github.com/agent-dance/agent-adaptor/profile"
 	"github.com/buthim/alsniper-os/sidecar/internal/config"
 	"github.com/buthim/alsniper-os/sidecar/internal/protocol"
 	"github.com/gofrs/flock"
 )
 
 type CodexRunner struct {
-	sdk               agentadaptor.SDK
+	agent             *agentadaptor.Agent
 	profileDir        string
 	sourceAuth        string
 	filesystemGuard   *codexFilesystemGuard
@@ -130,22 +133,42 @@ func (g *codexFilesystemGuard) preflightRunUnlocked(cwd string, requireCurrentAu
 	return preflightRuntimeWorkspace(g.workspaceRoot, g.workspaceDir)
 }
 
-func (g *codexFilesystemGuard) cloneSelectionValid(profile *agentadaptor.ProfileSelection) bool {
-	return profile != nil && profile.Mode == agentadaptor.ProfileModeClone &&
+func (g *codexFilesystemGuard) cloneSelectionValid(profile *adaptordriver.ProfileSelection) bool {
+	return profile != nil && profile.Mode == adaptordriver.ProfileModeClone &&
 		strings.EqualFold(filepath.Clean(profile.From), filepath.Clean(g.sourceHome)) &&
 		strings.EqualFold(filepath.Clean(profile.Dir), filepath.Clean(g.profileDir)) &&
 		profile.Clone != nil && profile.Clone.IncludeSettings && !profile.Clone.IncludeMCP &&
-		!profile.Clone.IncludeSkills && profile.Clone.IncludeAuth &&
-		profile.Clone.AuthMode == agentadaptor.CloneProfileAuthLink
+		!profile.Clone.IncludeSkills && profile.Clone.AuthMode == adaptordriver.CloneProfileAuthLink
 }
 
-func dedicatedProfileSelection(dir string) *agentadaptor.ProfileSelection {
-	return &agentadaptor.ProfileSelection{Mode: agentadaptor.ProfileModeDedicated, Dir: dir}
+func dedicatedProfileSelection(dir string) *adaptordriver.ProfileSelection {
+	return &adaptordriver.ProfileSelection{Mode: adaptordriver.ProfileModeDedicated, Dir: dir}
 }
 
-type denyDecisionAdapter struct {
-	agentadaptor.DriverAdapter
+// guardedCodexDriver deliberately exposes only the v1 capabilities used by
+// this host. In particular it does not forward Codex's persistent-process,
+// session, skill, MCP, or streaming extension interfaces. Every request is a
+// one-shot `codex exec` launched behind the filesystem guard below.
+type guardedCodexDriver struct {
+	base            adaptordriver.Driver
+	config          codex.Config
 	filesystemGuard *codexFilesystemGuard
+}
+
+// codexBoundaryError marks failures produced by the sidecar's own audited
+// preflight/postflight checks. Provider stderr is never wrapped in this type,
+// so callers can retain actionable host diagnostics without leaking arbitrary
+// upstream text through the public error surface.
+type codexBoundaryError struct{ cause error }
+
+func (e *codexBoundaryError) Error() string { return e.cause.Error() }
+func (e *codexBoundaryError) Unwrap() error { return e.cause }
+
+func boundaryError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &codexBoundaryError{cause: err}
 }
 
 var codexRuntimeDatabase = regexp.MustCompile(`^(?:goals|logs|memories|state)_[1-9][0-9]*\.sqlite(?:-(?:shm|wal))?$`)
@@ -165,45 +188,71 @@ const (
 	codexAuthRejected
 )
 
-func (a denyDecisionAdapter) Descriptor() agentadaptor.DriverDescriptor {
-	descriptor := a.DriverAdapter.Descriptor()
-	descriptor.RunPolicyCaps.Permission.AutoReject = true
-	descriptor.RunPolicyCaps.PlanReview.AutoReject = true
+func (a guardedCodexDriver) Descriptor() adaptordriver.Descriptor {
+	descriptor := a.base.Descriptor()
+	descriptor.Sessions = adaptordriver.SessionCapability{}
+	descriptor.Skills = adaptordriver.SkillCapability{}
+	descriptor.MCP = adaptordriver.MCPCapability{}
+	descriptor.Instructions = adaptordriver.InstructionsCapability{}
+	descriptor.Process = adaptordriver.ProcessCapability{}
+	descriptor.Runtime = adaptordriver.RuntimeCapability{}
+	descriptor.RunPolicyCaps = adaptordriver.RunPolicyCapabilities{Isolation: true}
+	descriptor.StructuredOutput = adaptordriver.StructuredOutputCapability{
+		JSONSchemaPromptValidate: true,
+		WorksWithRun:             true,
+		Notes:                    "AlSniper validates exact JSON locally after one-shot Codex execution.",
+	}
 	return descriptor
 }
 
-func (a denyDecisionAdapter) Run(ctx context.Context, req agentadaptor.DriverRunRequest, sink agentadaptor.EventSink) (agentadaptor.DriverRunResult, error) {
-	if err := validateCodexHomeEnvironment(os.Environ()); err != nil {
-		return agentadaptor.DriverRunResult{}, err
+func (a guardedCodexDriver) ValidateConfig(cfg any) error {
+	if cfg == nil {
+		cfg = a.config
 	}
-	config, ok := req.Config.(agentadaptor.CodexConfig)
+	return a.base.ValidateConfig(cfg)
+}
+
+func (a guardedCodexDriver) Run(ctx context.Context, req adaptordriver.Request, sink adaptordriver.EventSink) (adaptordriver.Response, error) {
+	if err := validateCodexHomeEnvironment(os.Environ()); err != nil {
+		return adaptordriver.Response{}, boundaryError(err)
+	}
+	config := a.config
+	config.CommonConfig = config.CommonConfig.Clone()
+	ok := req.Config == nil
 	if !ok {
-		if pointer, pointerOK := req.Config.(*agentadaptor.CodexConfig); pointerOK && pointer != nil {
+		config, ok = req.Config.(codex.Config)
+		if ok {
+			config.CommonConfig = config.CommonConfig.Clone()
+		}
+	}
+	if !ok {
+		if pointer, pointerOK := req.Config.(*codex.Config); pointerOK && pointer != nil {
 			config = *pointer
+			config.CommonConfig = config.CommonConfig.Clone()
 			ok = true
 		}
 	}
 	if !ok {
-		return agentadaptor.DriverRunResult{}, errors.New("Codex adapter received invalid runtime configuration")
+		return adaptordriver.Response{}, boundaryError(errors.New("Codex adapter received invalid runtime configuration"))
 	}
 	if a.filesystemGuard != nil && !slices.Equal(config.CommonConfig.ExtraArgs, a.filesystemGuard.expectedArgs) {
-		return agentadaptor.DriverRunResult{}, errors.New("Codex runtime arguments differ from the host-owned safety projection")
+		return adaptordriver.Response{}, boundaryError(errors.New("Codex runtime arguments differ from the host-owned safety projection"))
 	}
 	if a.filesystemGuard != nil {
 		if config.CommonConfig.Command != a.filesystemGuard.codexCommand {
-			return agentadaptor.DriverRunResult{}, errors.New("Codex runtime command differs from the audited executable")
+			return adaptordriver.Response{}, boundaryError(errors.New("Codex runtime command differs from the audited executable"))
 		}
 		if err := validateCodexCLIVersion(ctx, a.filesystemGuard.codexCommand); err != nil {
-			return agentadaptor.DriverRunResult{}, err
+			return adaptordriver.Response{}, boundaryError(err)
 		}
 	}
 	if len(req.MCP.Servers) != 0 || len(req.ProfilePayload.MCP.Servers) != 0 ||
 		len(req.Skills.Entries) != 0 || len(req.ProfilePayload.Skills.Entries) != 0 ||
 		len(req.Runtime.Requested) != 0 || len(req.Runtime.Ensured) != 0 || len(req.Runtime.SecretEnv) != 0 ||
 		len(req.ProfilePayload.Agents.Agents) != 0 || len(req.ProfilePayload.Hooks.Hooks) != 0 || len(req.ProfilePayload.Config.Patches) != 0 ||
-		req.Instructions != nil || req.ProfilePayload.Instructions != nil || req.Session != nil || req.Streaming ||
+		req.Instructions != nil || req.ProfilePayload.Instructions != nil || req.Session != nil || req.Streaming || !req.Spawn ||
 		req.ProfilePayload.Declared.Config || req.ProfilePayload.Declared.Instructions || req.ProfilePayload.Declared.Agents || req.ProfilePayload.Declared.Hooks {
-		return agentadaptor.DriverRunResult{}, errors.New("Codex runtime received undeclared profile resources")
+		return adaptordriver.Response{}, boundaryError(errors.New("Codex runtime received undeclared resources or a non-ephemeral execution request"))
 	}
 	// Refresh immediately before every spawn so secrets added by another host
 	// library after sidecar construction are still excluded.
@@ -212,14 +261,14 @@ func (a denyDecisionAdapter) Run(ctx context.Context, req agentadaptor.DriverRun
 	if a.filesystemGuard != nil {
 		guard := a.filesystemGuard
 		if err := validateProfileLease(guard.profileLease, guard.profileDir, guard.canonicalSource); err != nil {
-			return agentadaptor.DriverRunResult{}, err
+			return adaptordriver.Response{}, boundaryError(err)
 		}
 		if !guard.cloneSelectionValid(req.Profile) {
-			return agentadaptor.DriverRunResult{}, errors.New("Codex runtime profile differs from the host-owned authentication clone")
+			return adaptordriver.Response{}, boundaryError(errors.New("Codex runtime profile differs from the host-owned authentication clone"))
 		}
-		profileDriver, ok := a.DriverAdapter.(agentadaptor.ProfileAwareDriver)
+		profileDriver, ok := a.base.(adaptordriver.ProfileReporter)
 		if !ok {
-			return agentadaptor.DriverRunResult{}, errors.New("Codex adapter lacks profile support")
+			return adaptordriver.Response{}, boundaryError(errors.New("Codex adapter lacks profile support"))
 		}
 		// Stable generations take the shared path immediately, so independent
 		// game seats infer concurrently. CloneProfileAuthLink reconciliation is
@@ -232,11 +281,11 @@ func (a denyDecisionAdapter) Run(ctx context.Context, req agentadaptor.DriverRun
 			guard.mu.Lock()
 			if err := guard.preflightRunUnlocked(config.CommonConfig.CWD, false); err != nil {
 				guard.mu.Unlock()
-				return agentadaptor.DriverRunResult{}, fmt.Errorf("preflight Codex runtime filesystem: %w", err)
+				return adaptordriver.Response{}, boundaryError(fmt.Errorf("preflight Codex runtime filesystem: %w", err))
 			}
 			if err := guard.prepareProfileForSDKClone(); err != nil {
 				guard.mu.Unlock()
-				return agentadaptor.DriverRunResult{}, fmt.Errorf("prepare Codex settings clone: %w", err)
+				return adaptordriver.Response{}, boundaryError(fmt.Errorf("prepare Codex settings clone: %w", err))
 			}
 			profile, profileErr := profileDriver.GetProfile(ctx, req.Config, req.Agent, req.Profile)
 			if profileErr == nil && strings.TrimSpace(profile.Error) != "" {
@@ -247,12 +296,12 @@ func (a denyDecisionAdapter) Run(ctx context.Context, req agentadaptor.DriverRun
 			}
 			guard.mu.Unlock()
 			if profileErr != nil {
-				return agentadaptor.DriverRunResult{}, fmt.Errorf("reconcile Codex authentication profile: %w", profileErr)
+				return adaptordriver.Response{}, boundaryError(fmt.Errorf("reconcile Codex authentication profile: %w", profileErr))
 			}
 			guard.mu.RLock()
 			if err := guard.preflightRunUnlocked(config.CommonConfig.CWD, true); err != nil {
 				guard.mu.RUnlock()
-				return agentadaptor.DriverRunResult{}, fmt.Errorf("preflight Codex runtime filesystem: %w", err)
+				return adaptordriver.Response{}, boundaryError(fmt.Errorf("preflight Codex runtime filesystem: %w", err))
 			}
 		}
 		defer guard.mu.RUnlock()
@@ -268,64 +317,55 @@ func (a denyDecisionAdapter) Run(ctx context.Context, req agentadaptor.DriverRun
 			observation.capture(generation, present)
 		}
 	}
-	result, err := a.DriverAdapter.Run(ctx, req, sink)
+	result, err := a.base.Run(ctx, req, sink)
 	if a.filesystemGuard != nil {
 		if postflightErr := a.filesystemGuard.preflightRunUnlocked(config.CommonConfig.CWD, true); postflightErr != nil {
-			return agentadaptor.DriverRunResult{}, fmt.Errorf("postflight Codex runtime filesystem: %w", postflightErr)
+			return adaptordriver.Response{}, boundaryError(fmt.Errorf("postflight Codex runtime filesystem: %w", postflightErr))
 		}
 	}
 	return result, err
 }
 
-func (a denyDecisionAdapter) CheckEnvironment(ctx context.Context, cfg any) (agentadaptor.EnvironmentReport, error) {
-	driver, ok := a.DriverAdapter.(agentadaptor.EnvironmentAwareDriver)
+func (a guardedCodexDriver) CheckEnvironment(ctx context.Context, cfg any) (adaptordriver.EnvironmentReport, error) {
+	probe, ok := a.base.(adaptordriver.EnvironmentProbe)
 	if !ok {
-		return agentadaptor.EnvironmentReport{}, errors.New("Codex adapter lacks environment diagnostics")
+		return adaptordriver.EnvironmentReport{}, errors.New("Codex adapter lacks environment diagnostics")
 	}
 	if a.filesystemGuard != nil {
 		guard := a.filesystemGuard
 		guard.mu.RLock()
 		defer guard.mu.RUnlock()
 		if err := validateProfileLease(guard.profileLease, guard.profileDir, guard.canonicalSource); err != nil {
-			return agentadaptor.EnvironmentReport{}, err
+			return adaptordriver.EnvironmentReport{}, err
 		}
-		config, valid := cfg.(agentadaptor.CodexConfig)
-		if !valid {
-			if pointer, pointerOK := cfg.(*agentadaptor.CodexConfig); pointerOK && pointer != nil {
-				config = *pointer
-				valid = true
-			}
-		}
-		if !valid {
-			return agentadaptor.EnvironmentReport{}, errors.New("Codex diagnostics received invalid runtime configuration")
-		}
+		config := a.config
 		if config.CommonConfig.Command != a.filesystemGuard.codexCommand {
-			return agentadaptor.EnvironmentReport{}, errors.New("Codex diagnostics command differs from the audited executable")
+			return adaptordriver.EnvironmentReport{}, errors.New("Codex diagnostics command differs from the audited executable")
 		}
 		if err := validateCodexCLIVersion(ctx, a.filesystemGuard.codexCommand); err != nil {
-			return agentadaptor.EnvironmentReport{}, err
+			return adaptordriver.EnvironmentReport{}, err
 		}
-		// CheckEnvironment does not accept ProfileSelection in the pinned SDK.
-		// Bind it explicitly to the isolated profile so diagnostics never inspect
-		// or report resources from the operator's native CODEX_HOME.
-		config.CommonConfig.Env = append(codexChildEnvironmentBindings(), agentadaptor.EnvBinding{Name: "CODEX_HOME", Value: a.filesystemGuard.profileDir})
+		// CheckEnvironment has no ProfileSelection argument. Bind diagnostics to
+		// the isolated clone explicitly so diagnostics never inspect or report
+		// resources from the operator's native CODEX_HOME.
+		config.CommonConfig.Env = append(codexChildEnvironmentBindings(), adaptordriver.EnvBinding{Name: "CODEX_HOME", Value: a.filesystemGuard.profileDir})
 		cfg = config
 	}
-	return driver.CheckEnvironment(ctx, cfg)
+	return probe.CheckEnvironment(ctx, cfg)
 }
 
-func (a denyDecisionAdapter) GetProfile(ctx context.Context, cfg any, identity agentadaptor.AgentIdentity, profile *agentadaptor.ProfileSelection) (agentadaptor.AgentProfile, error) {
-	driver, ok := a.DriverAdapter.(agentadaptor.ProfileAwareDriver)
+func (a guardedCodexDriver) GetProfile(ctx context.Context, cfg any, identity adaptordriver.AgentIdentity, profile *adaptordriver.ProfileSelection) (adaptordriver.AgentProfile, error) {
+	reporter, ok := a.base.(adaptordriver.ProfileReporter)
 	if !ok {
-		return agentadaptor.AgentProfile{}, errors.New("Codex adapter lacks profile support")
+		return adaptordriver.AgentProfile{}, errors.New("Codex adapter lacks profile support")
 	}
 	if a.filesystemGuard != nil {
 		guard := a.filesystemGuard
 		if err := validateProfileLease(guard.profileLease, guard.profileDir, guard.canonicalSource); err != nil {
-			return agentadaptor.AgentProfile{}, err
+			return adaptordriver.AgentProfile{}, err
 		}
 		if !guard.cloneSelectionValid(profile) {
-			return agentadaptor.AgentProfile{}, errors.New("Codex profile selection differs from the host-owned authentication clone")
+			return adaptordriver.AgentProfile{}, errors.New("Codex profile selection differs from the host-owned authentication clone")
 		}
 		// Health polling is read-mostly. A stable or logged-out profile can be
 		// inspected under a shared lease and must not wait behind long-running
@@ -343,53 +383,53 @@ func (a denyDecisionAdapter) GetProfile(ctx context.Context, cfg any, identity a
 			stableErr = postflightReconciledProfile(guard.sourceHome, guard.profileDir, guard.sourceAuth, false)
 		}
 		if stableErr == nil {
-			resolved, err := driver.GetProfile(ctx, cfg, identity, dedicatedProfileSelection(guard.profileDir))
+			resolved, err := reporter.GetProfile(ctx, a.config, identity, dedicatedProfileSelection(guard.profileDir))
 			guard.mu.RUnlock()
 			if err != nil {
-				return agentadaptor.AgentProfile{}, err
+				return adaptordriver.AgentProfile{}, err
 			}
 			if strings.TrimSpace(resolved.Error) != "" {
-				return agentadaptor.AgentProfile{}, errors.New("Codex SDK could not inspect the isolated authentication profile")
+				return adaptordriver.AgentProfile{}, errors.New("Codex SDK could not inspect the isolated authentication profile")
 			}
 			return resolved, nil
 		}
 		guard.mu.RUnlock()
 
 		if !guard.mu.TryLock() {
-			return agentadaptor.AgentProfile{}, errors.New("Codex authentication reconciliation is waiting for active Agent runs")
+			return adaptordriver.AgentProfile{}, errors.New("Codex authentication reconciliation is waiting for active Agent runs")
 		}
 		defer guard.mu.Unlock()
 		if err := validateProfileLease(guard.profileLease, guard.profileDir, guard.canonicalSource); err != nil {
-			return agentadaptor.AgentProfile{}, err
+			return adaptordriver.AgentProfile{}, err
 		}
 		if err := preflightNativeCodexHome(guard.sourceHome); err != nil {
-			return agentadaptor.AgentProfile{}, fmt.Errorf("preflight native Codex profile: %w", err)
+			return adaptordriver.AgentProfile{}, fmt.Errorf("preflight native Codex profile: %w", err)
 		}
 		if err := guard.preflightSourceSettings(); err != nil {
-			return agentadaptor.AgentProfile{}, fmt.Errorf("preflight native Codex settings generation: %w", err)
+			return adaptordriver.AgentProfile{}, fmt.Errorf("preflight native Codex settings generation: %w", err)
 		}
 		if err := guard.prepareProfileForSDKClone(); err != nil {
-			return agentadaptor.AgentProfile{}, fmt.Errorf("preflight isolated Codex profile: %w", err)
+			return adaptordriver.AgentProfile{}, fmt.Errorf("preflight isolated Codex profile: %w", err)
 		}
-		resolved, err := driver.GetProfile(ctx, cfg, identity, profile)
+		resolved, err := reporter.GetProfile(ctx, a.config, identity, profile)
 		if err != nil {
-			return agentadaptor.AgentProfile{}, err
+			return adaptordriver.AgentProfile{}, err
 		}
 		if strings.TrimSpace(resolved.Error) != "" {
-			return agentadaptor.AgentProfile{}, errors.New("Codex SDK could not reconcile the authentication profile")
+			return adaptordriver.AgentProfile{}, errors.New("Codex SDK could not reconcile the authentication profile")
 		}
 		if err := preflightNativeCodexHome(guard.sourceHome); err != nil {
-			return agentadaptor.AgentProfile{}, fmt.Errorf("postflight native Codex profile: %w", err)
+			return adaptordriver.AgentProfile{}, fmt.Errorf("postflight native Codex profile: %w", err)
 		}
 		if err := guard.preflightSourceSettings(); err != nil {
-			return agentadaptor.AgentProfile{}, fmt.Errorf("postflight native Codex settings generation: %w", err)
+			return adaptordriver.AgentProfile{}, fmt.Errorf("postflight native Codex settings generation: %w", err)
 		}
 		if err := postflightReconciledProfile(guard.sourceHome, guard.profileDir, guard.sourceAuth, false); err != nil {
-			return agentadaptor.AgentProfile{}, fmt.Errorf("validate reconciled Codex profile: %w", err)
+			return adaptordriver.AgentProfile{}, fmt.Errorf("validate reconciled Codex profile: %w", err)
 		}
 		return resolved, nil
 	}
-	return driver.GetProfile(ctx, cfg, identity, profile)
+	return reporter.GetProfile(ctx, cfg, identity, profile)
 }
 
 func NewCodexRunner(cfg config.Config) (runner *CodexRunner, err error) {
@@ -487,7 +527,7 @@ func NewCodexRunner(cfg config.Config) (runner *CodexRunner, err error) {
 		return nil, err
 	}
 	filesystemGuard.workspaceDir = workspaceDir
-	common := agentadaptor.CommonConfig{
+	common := codex.CommonConfig{
 		Command:     cfg.CodexCommand,
 		CWD:         workspaceDir,
 		Env:         codexChildEnvironmentBindings(),
@@ -495,22 +535,31 @@ func NewCodexRunner(cfg config.Config) (runner *CodexRunner, err error) {
 		GracePeriod: 3 * time.Second,
 		ExtraArgs:   safetyArgs,
 	}
-	codexConfig := agentadaptor.CodexConfig{CommonConfig: common, Model: cfg.Model, ReasoningEffort: agentadaptor.ReasoningEffort(cfg.ReasoningEffort), SkipGitRepoCheck: true}
-	cloneOptions := agentadaptor.CloneProfileOptions{
-		IncludeSettings: true,
-		IncludeMCP:      false,
-		IncludeSkills:   false,
-		IncludeAuth:     true,
-		AuthMode:        agentadaptor.CloneProfileAuthLink,
+	codexConfig := codex.Config{
+		CommonConfig:    common,
+		Model:           cfg.Model,
+		ReasoningEffort: codex.ReasoningEffort(cfg.ReasoningEffort),
 	}
-	profileOption := agentadaptor.WithCloneProfileFrom(sourceHome, profileDir, cloneOptions)
-	base := codex.New(codexConfig, profileOption)
-	binding := agentadaptor.BindTyped(denyDecisionAdapter{DriverAdapter: base.Adapter(), filesystemGuard: filesystemGuard}, codexConfig, profileOption)
-	sdk, err := agentadaptor.Build(agentadaptor.WithDefaultAgent(binding))
-	if err != nil {
-		return nil, fmt.Errorf("build agent-adaptor SDK: %w", err)
+	profileSelection := adaptorprofile.CloneFrom(
+		sourceHome,
+		profileDir,
+		adaptorprofile.CopySettings(),
+		adaptorprofile.LinkAuth(),
+	)
+	driver := guardedCodexDriver{
+		base:            codex.Driver(codexConfig),
+		config:          codexConfig,
+		filesystemGuard: filesystemGuard,
 	}
-	return &CodexRunner{sdk: sdk, profileDir: profileDir, sourceAuth: sourceAuth, filesystemGuard: filesystemGuard, profileLease: profileLease}, nil
+	adaptorAgent := agentadaptor.New(
+		driver,
+		agentadaptor.WithProfile(profileSelection),
+		agentadaptor.WithWorkspace(workspaceDir),
+		agentadaptor.WithPolicy(agentadaptor.Policy{Sandbox: agentadaptor.ReadOnly}),
+		agentadaptor.WithMetadata("surface", "alsniper-os-sidecar"),
+		agentadaptor.WithSpawn(),
+	)
+	return &CodexRunner{agent: adaptorAgent, profileDir: profileDir, sourceAuth: sourceAuth, filesystemGuard: filesystemGuard, profileLease: profileLease}, nil
 }
 
 // Close drains active shared run/readiness leases, prevents later entrants
@@ -520,22 +569,27 @@ func (r *CodexRunner) Close() error {
 		return nil
 	}
 	r.closeOnce.Do(func() {
+		if r.agent != nil {
+			closeContext, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			r.closeErr = r.agent.Close(closeContext)
+			cancel()
+		}
 		if r.filesystemGuard != nil {
 			r.filesystemGuard.mu.Lock()
 			defer r.filesystemGuard.mu.Unlock()
 		}
 		if r.profileLease != nil {
-			r.closeErr = r.profileLease.Close()
+			r.closeErr = errors.Join(r.closeErr, r.profileLease.Close())
 		}
 	})
 	return r.closeErr
 }
 
-func codexChildEnvironmentBindings() []agentadaptor.EnvBinding {
+func codexChildEnvironmentBindings() []adaptordriver.EnvBinding {
 	return credentialEnvironmentBindings(os.Environ())
 }
 
-func credentialEnvironmentBindings(environment []string) []agentadaptor.EnvBinding {
+func credentialEnvironmentBindings(environment []string) []adaptordriver.EnvBinding {
 	// The child must authenticate only through the linked CODEX_HOME/auth.json.
 	// Empty explicit bindings override inherited process variables in the SDK's
 	// environment merge without removing the profile binding added by the clone.
@@ -555,10 +609,10 @@ func credentialEnvironmentBindings(environment []string) []agentadaptor.EnvBindi
 		"AZURE_CLIENT_SECRET",
 		"CODEX_API_KEY",
 	}
-	bindings := make([]agentadaptor.EnvBinding, 0, len(environment)+len(names))
+	bindings := make([]adaptordriver.EnvBinding, 0, len(environment)+len(names))
 	bound := make(map[string]struct{}, len(environment)+len(names))
 	for _, name := range names {
-		bindings = append(bindings, agentadaptor.EnvBinding{Name: name, Value: ""})
+		bindings = append(bindings, adaptordriver.EnvBinding{Name: name, Value: ""})
 		bound[name] = struct{}{}
 	}
 	// The pinned SDK intentionally inherits the full host environment before
@@ -576,7 +630,7 @@ func credentialEnvironmentBindings(environment []string) []agentadaptor.EnvBindi
 		if _, exists := bound[name]; exists {
 			continue
 		}
-		bindings = append(bindings, agentadaptor.EnvBinding{Name: name, Value: ""})
+		bindings = append(bindings, adaptordriver.EnvBinding{Name: name, Value: ""})
 		bound[name] = struct{}{}
 	}
 	return bindings
@@ -634,7 +688,10 @@ func prepareDedicatedWorkspace(root string) (string, error) {
 		return "", err
 	}
 	if existed {
-		if err := validateDedicatedWorkspaceContents(root, true); err != nil {
+		// Accept only an entirely empty unclaimed root.  ensureWorkspaceOwnership
+		// below creates the exact marker with O_EXCL; any foreign entry still
+		// fails validation without being modified.
+		if err := validateDedicatedWorkspaceContents(root, false); err != nil {
 			return "", err
 		}
 	}
@@ -694,6 +751,7 @@ func ensureWorkspaceOwnership(root, marker string) error {
 
 func codexSafetyArgs(mcpDisableArgs ...string) []string {
 	args := []string{
+		"--skip-git-repo-check",
 		"--sandbox", "read-only",
 		"--ignore-rules",
 		"--disable", "shell_tool",
@@ -755,26 +813,24 @@ func codexSafetyArgs(mcpDisableArgs ...string) []string {
 func (r *CodexRunner) Run(ctx context.Context, req RunRequest) (RunResult, error) {
 	observation := &credentialObservation{}
 	runContext := context.WithValue(ctx, credentialObservationContextKey{}, observation)
-	result, err := r.sdk.Run(runContext, req.Prompt,
-		agentadaptor.WithRunPolicy(denyPolicy()),
+	result, err := r.agent.Run(runContext, req.Prompt,
 		// Complete native settings can select an OpenAI-compatible provider that
 		// does not implement Codex's --output-schema transport. Keep the schema as
 		// an SDK-owned authority boundary: prompt for exact JSON, then validate it
 		// locally before any OS intent or game action can escape this runner.
-		agentadaptor.WithJSONSchemaOutput(req.Schema, agentadaptor.PromptValidateOutput(), agentadaptor.StructuredOutputName(req.SchemaName)),
-		agentadaptor.WithMetadata("surface", "alsniper-os-sidecar"),
+		agentadaptor.WithSchemaJSON(req.Schema, agentadaptor.SchemaName(req.SchemaName)),
 	)
 	completion := r.authCompletion.Add(1)
 	// The adapter can return a parsed structured value together with process
 	// termination metadata. Cancellation is an authority boundary: once the
 	// caller has revoked the turn, no previously buffered model output may be
 	// promoted into an OS response or game action.
-	if err := validateCodexRunCompletion(ctx, result, err); err != nil {
-		if errors.Is(err, ErrAuthentication) {
+	if completionErr := validateCodexRunCompletion(ctx, result, err); completionErr != nil {
+		if errors.Is(completionErr, ErrAuthentication) {
 			authGeneration, hasAuthGeneration := observation.snapshot()
 			r.recordAuthOutcome(codexAuthRejected, authGeneration, hasAuthGeneration, completion)
 		}
-		return RunResult{}, err
+		return RunResult{}, completionErr
 	}
 	structuredJSON, err := r.acceptCompletedCodexRun(result, observation, completion)
 	if err != nil {
@@ -787,74 +843,76 @@ func (r *CodexRunner) Run(ctx context.Context, req RunRequest) (RunResult, error
 	return RunResult{RunID: result.RunID, Model: result.Model, JSON: structuredJSON, Usage: usage}, nil
 }
 
-func (r *CodexRunner) acceptCompletedCodexRun(result agentadaptor.RunResult, observation *credentialObservation, completion uint64) ([]byte, error) {
+func (r *CodexRunner) acceptCompletedCodexRun(result *agentadaptor.Result, observation *credentialObservation, completion uint64) ([]byte, error) {
 	authGeneration, hasAuthGeneration := observation.snapshot()
 	r.recordAuthOutcome(codexAuthVerified, authGeneration, hasAuthGeneration, completion)
 	return validatedCodexStructuredJSON(result)
 }
 
-func validateCodexRunCompletion(ctx context.Context, result agentadaptor.RunResult, runErr error) error {
+func validateCodexRunCompletion(ctx context.Context, result *agentadaptor.Result, runErr error) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
-	if runErr != nil {
-		return runErr
-	}
-	if result.TimedOut {
-		return context.DeadlineExceeded
-	}
-	if strings.TrimSpace(result.Signal) != "" {
-		return errors.New("Codex process was terminated by a signal")
-	}
-	if result.Failure != nil {
-		classified := classifyCodexFailure(result.Failure)
-		if errors.Is(classified, ErrAuthentication) {
-			return classified
+	if runErr == nil {
+		if result == nil {
+			return ErrAgent
 		}
-		// PromptValidateOutput reports locally rejected model JSON alongside a
-		// generic adapter failure. Preserve that closed schema boundary as a
-		// stable product error without allowing it to mask authentication.
-		if result.Failure.Code == agentadaptor.FailurePolicyError && result.StructuredOutput != nil && !result.StructuredOutput.Valid {
-			return ErrInvalidAI
-		}
-		return classified
-	}
-	if result.ExitCode != 0 {
-		return ErrAgent
-	}
-	return nil
-}
-
-func classifyCodexFailure(failure *agentadaptor.RunFailure) error {
-	if failure == nil {
 		return nil
 	}
-	if failure.Code == agentadaptor.FailureAgentError && codexAuthenticationFailurePattern.MatchString(failure.Message) {
+	if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
+		return runErr
+	}
+	var boundary *codexBoundaryError
+	if errors.As(runErr, &boundary) && boundary != nil && boundary.cause != nil {
+		if codexAuthenticationFailurePattern.MatchString(boundary.cause.Error()) {
+			return ErrAuthentication
+		}
+		return boundary.cause
+	}
+	var classified *agentadaptor.RunError
+	if errors.As(runErr, &classified) {
+		if classified.Reason == agentadaptor.ReasonAgentError && codexRunAuthenticationFailure(runErr, result) {
+			return ErrAuthentication
+		}
+		if classified.Reason == agentadaptor.ReasonPolicyViolation {
+			// The guarded descriptor exposes prompt + local JSON Schema validation
+			// only. A policy violation after launch therefore represents invalid
+			// model output, which must never cross the sidecar authority boundary.
+			return ErrInvalidAI
+		}
+		return ErrAgent
+	}
+	if codexRunAuthenticationFailure(runErr, result) {
 		return ErrAuthentication
 	}
 	return ErrAgent
 }
 
-func validatedCodexStructuredJSON(result agentadaptor.RunResult) ([]byte, error) {
-	if result.StructuredOutput == nil || !result.StructuredOutput.Valid || len(result.StructuredOutput.RawJSON) == 0 {
-		return nil, ErrInvalidAI
+func codexRunAuthenticationFailure(runErr error, result *agentadaptor.Result) bool {
+	if runErr != nil && codexAuthenticationFailurePattern.MatchString(runErr.Error()) {
+		return true
 	}
-	return append([]byte(nil), result.StructuredOutput.RawJSON...), nil
+	if result == nil {
+		return false
+	}
+	raw := result.Raw()
+	return codexAuthenticationFailurePattern.MatchString(raw.Stderr) || codexAuthenticationFailurePattern.MatchString(raw.Stdout)
 }
 
-func denyPolicy() agentadaptor.RunPolicy {
-	return agentadaptor.RunPolicy{
-		Isolation: agentadaptor.IsolationReadOnly,
-		WebSearch: agentadaptor.FeatureDeny,
-		Browser:   agentadaptor.FeatureDeny,
-		HumanDecision: agentadaptor.HumanDecisionPolicy{
-			Permission: agentadaptor.HumanDecisionAutoReject,
-			PlanReview: agentadaptor.HumanDecisionAutoReject,
-			Question:   agentadaptor.QuestionAutoReject,
-			OnReject:   agentadaptor.FailureAbort,
-			OnTimeout:  agentadaptor.FailureAbort,
-		},
+func validatedCodexStructuredJSON(result *agentadaptor.Result) ([]byte, error) {
+	if result == nil {
+		return nil, ErrInvalidAI
 	}
+	var raw json.RawMessage
+	if err := result.Decode(&raw); err != nil || len(raw) == 0 {
+		return nil, ErrInvalidAI
+	}
+	if !json.Valid(raw) {
+		return nil, ErrInvalidAI
+	}
+	// Result.Decode is the v1 authority surface: it only exposes the locally
+	// validated payload selected by WithSchemaJSON.
+	return append([]byte(nil), raw...), nil
 }
 
 func (r *CodexRunner) Readiness(ctx context.Context) Readiness {
@@ -863,7 +921,8 @@ func (r *CodexRunner) Readiness(ctx context.Context) Readiness {
 	checks := make([]protocol.HealthCheck, 0, 7)
 	ready := true
 	settingsChecked := false
-	profile, err := r.sdk.Admin().Default().GetProfile(ctx)
+	profileState, err := r.agent.ProfileState(ctx)
+	profile := profileState.Profile
 	if err != nil {
 		ready = false
 		checks = append(checks, protocol.HealthCheck{Code: "profile_link", Status: "fail", Message: "The isolated Codex profile could not be initialized."})
@@ -910,8 +969,8 @@ func (r *CodexRunner) Readiness(ctx context.Context) Readiness {
 		ready = false
 		checks = append(checks, protocol.HealthCheck{Code: "profile_settings", Status: "fail", Message: "The SDK-cloned native Codex settings failed validation."})
 	}
-	report, envErr := r.sdk.Admin().Default().CheckEnvironment(ctx)
-	if envErr != nil || report.Status == agentadaptor.EnvironmentFail {
+	report, envErr := r.agent.Inspect().Environment(ctx)
+	if envErr != nil || report.Status == adaptordriver.EnvironmentFail {
 		ready = false
 		checks = append(checks, protocol.HealthCheck{Code: "codex_cli", Status: "fail", Message: "The Codex CLI environment is unavailable."})
 	} else {
@@ -1062,15 +1121,8 @@ func isolatedProfileContents(dir string) error {
 				return err
 			}
 		case "tmp":
-			if err := validateProfileEntry(path, true, false); err != nil {
+			if err := validateCodexTemporaryDirectory(path); err != nil {
 				return err
-			}
-			children, err := os.ReadDir(path)
-			if err != nil {
-				return err
-			}
-			if len(children) != 0 {
-				return errors.New("profile tmp directory must be empty")
 			}
 		case "skills":
 			if err := validateProfileEntry(path, true, false); err != nil {
@@ -1100,6 +1152,57 @@ func isolatedProfileContents(dir string) error {
 				continue
 			}
 			return fmt.Errorf("unexpected profile resource %q", entry.Name())
+		}
+	}
+	return nil
+}
+
+// Codex 0.145.0 leaves an empty tmp/arg0 directory hierarchy behind even for
+// --ephemeral one-shot runs.  Accepting those empty provider-owned directories
+// is necessary for postflight to distinguish a completed run from a filesystem
+// escape.  Files, links, reparse points, unexpected roots, excessive depth,
+// and excessive fan-out remain forbidden because they could retain prompts or
+// introduce provider-controlled configuration across turns.
+func validateCodexTemporaryDirectory(dir string) error {
+	if err := validateProfileEntry(dir, true, false); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	if len(entries) != 1 || entries[0].Name() != "arg0" {
+		return errors.New("profile tmp directory contains unexpected resources")
+	}
+	count := 0
+	return validateEmptyTemporaryDirectoryTree(filepath.Join(dir, "arg0"), 0, &count)
+}
+
+func validateEmptyTemporaryDirectoryTree(dir string, depth int, count *int) error {
+	if depth > 4 {
+		return errors.New("profile tmp directory tree is too deep")
+	}
+	if err := validateProfileEntry(dir, true, false); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		*count++
+		if *count > 64 {
+			return errors.New("profile tmp directory tree is too large")
+		}
+		path := filepath.Join(dir, entry.Name())
+		if err := validateProfileEntry(path, true, false); err != nil {
+			return errors.New("profile tmp directory must contain empty real directories only")
+		}
+		if err := validateEmptyTemporaryDirectoryTree(path, depth+1, count); err != nil {
+			return err
 		}
 	}
 	return nil

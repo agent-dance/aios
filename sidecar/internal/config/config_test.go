@@ -23,6 +23,10 @@ func TestConfigRejectsUnsafeNetworkAndCredentials(t *testing.T) {
 		{"short-token", func(c *Config) { c.Token = "short" }},
 		{"oversized-token", func(c *Config) { c.Token = strings.Repeat("x", 513) }},
 		{"origin-path", func(c *Config) { c.AllowedOrigin = "http://localhost:5173/app" }},
+		{"remote-http-origin", func(c *Config) { c.AllowedOrigin = "https://example.com" }},
+		{"untrusted-app-host", func(c *Config) { c.AllowedOrigin = "app://attacker" }},
+		{"app-origin-path", func(c *Config) { c.AllowedOrigin = "app://alsniper/index.html" }},
+		{"file-origin", func(c *Config) { c.AllowedOrigin = "file://alsniper" }},
 		{"same-profile-workspace", func(c *Config) { c.WorkspaceDir = c.ProfileDir }},
 		{"workspace-inside-profile", func(c *Config) { c.WorkspaceDir = filepath.Join(c.ProfileDir, "workspace") }},
 		{"profile-inside-workspace", func(c *Config) { c.ProfileDir = filepath.Join(c.WorkspaceDir, "profile") }},
@@ -42,5 +46,25 @@ func TestConfigAcceptsCSPAuthorizedIPv4Loopback(t *testing.T) {
 	cfg := validConfig(t)
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestConfigAcceptsTrustedPackagedAppOrigin(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.AllowedOrigin = "app://alsniper"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConfigAcceptsLoopbackHTTPOrigins(t *testing.T) {
+	for _, origin := range []string{"http://127.0.0.1:5173", "https://localhost:5173", "http://[::1]:5173"} {
+		t.Run(origin, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.AllowedOrigin = origin
+			if err := cfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

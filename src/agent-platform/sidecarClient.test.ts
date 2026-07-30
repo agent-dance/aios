@@ -327,6 +327,27 @@ describe('sidecar client', () => {
     await expect(wrongOrigin.health()).rejects.toBeInstanceOf(SidecarClientError);
   });
 
+  it('accepts only the single trusted desktop custom origin alongside exact HTTP(S) origins', async () => {
+    const desktop = createSidecarClient({
+      ...config(respond({
+        protocolVersion: AIOS_AGENT_PROTOCOL_VERSION,
+        status: 'ready',
+        agent: { driver: 'codex', authMode: 'linked', profileIsolated: true },
+        limits: { maxBodyBytes: 100_000, maxConcurrentRuns: 4 },
+        checks: [],
+      })),
+      origin: 'app://alsniper',
+      getOrigin: () => 'app://alsniper',
+    });
+    await expect(desktop.health()).resolves.toMatchObject({ status: 'ready' });
+
+    for (const origin of ['null', 'app://other', 'app://alsniper/', 'custom://alsniper', 'https://example.test/path']) {
+      expect(() => createSidecarClient({ ...config(vi.fn()), origin })).toThrowError(
+        expect.objectContaining({ code: 'SIDECAR_CONFIG_INVALID' }),
+      );
+    }
+  });
+
   it('preserves timeout semantics while a response body is still streaming', async () => {
     const fetcher: typeof fetch = async (_input, init) => {
       const metadata = await signedResponse(init, {});

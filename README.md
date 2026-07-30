@@ -41,30 +41,34 @@ desktop runtime is required and never falls back to an external URL.
 
 ### Run with the local Codex Agent
 
-The Agent runtime is a loopback-only Go sidecar that requires Go 1.26.5 or newer and the security-audited `codex-cli 0.145.0` build. Through the pinned SDK's native clone path, it derives an isolated profile from the operator's Codex profile: `config.toml`, `config.json`, and `instructions.md` are cloned as complete settings-contract files, while `auth.json` is linked rather than copied. Codex CLI 0.145 consumes the cloned `config.toml` as its native model/provider/settings source instead of a separately projected provider route; explicit sidecar model/reasoning environment overrides remain process-scoped. The CLI itself defines whether that version consumes the other two SDK-declared settings files. From the repository root, this single PowerShell session generates one ephemeral HMAC secret, starts the sidecar as a managed job, and gives the same secret to Vite without printing or persisting it. Browser requests never transmit that secret; they send bounded, timestamped HMAC-SHA256 proofs with unique nonces, and verify every signed response before parsing it:
+The temporary trusted launcher runs a locally built `alsniper-agent.exe` beside
+the production Electron shell. It requires Windows x64, Go 1.26.5 or newer, and
+the security-audited local `codex-cli 0.145.0` build:
 
 ```powershell
-$agentToken = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant()
-$repoPath = (Resolve-Path .).Path
-$sidecarJob = Start-Job -ArgumentList $repoPath, $agentToken -ScriptBlock {
-  param($repoPath, $agentToken)
-  Set-Location -LiteralPath $repoPath
-  $env:AIOS_SIDECAR_TOKEN = $agentToken
-  go -C sidecar run ./cmd/alsniper-agent
-}
-$env:VITE_AIOS_SIDECAR_URL = 'http://127.0.0.1:4317'
-$env:VITE_AIOS_SIDECAR_TOKEN = $agentToken
-try {
-  npm run dev
-} finally {
-  Stop-Job -Job $sidecarJob -ErrorAction SilentlyContinue
-  Remove-Job -Job $sidecarJob -Force -ErrorAction SilentlyContinue
-  Remove-Item Env:VITE_AIOS_SIDECAR_URL, Env:VITE_AIOS_SIDECAR_TOKEN -ErrorAction SilentlyContinue
-  $agentToken = $null
-}
+npm run local-runtime:build
+npm run local-runtime:launch
 ```
 
-Vite embeds development environment values in browser code, so this path is for local loopback development only. Production must use a trusted desktop launcher to inject an ephemeral `window.__AIOS_SIDECAR_CONFIG__`; production builds ignore `VITE_AIOS_SIDECAR_TOKEN`. Codex processes run with `--ephemeral`; multi-turn context is a bounded in-memory browser window rather than a persisted rollout. Invoke an installed domain Agent explicitly with `/agent <agent-id> <message>` so the Host binds its package principal before inference. The health endpoint reports provider authentication as pending until a real call verifies it. If a turn returns `AGENT_AUTH_REQUIRED`, run `codex login` and retry; SDK reconciliation follows the refreshed OAuth credential without restarting the sidecar. Native settings and their MCP-disable projection are frozen at sidecar startup, so changing `CODEX_HOME`, `config.toml`, `config.json`, or `instructions.md` requires a restart.
+The build fails unless the executable's own Go metadata proves that it embeds
+the unreplaced `agent-adaptor v1.0.0` module. It records a local SHA-256 manifest
+under ignored `release/local-agent-runtime/`, and launch verifies both the hash
+and embedded dependency again. The launcher starts the packaged `AlSniper OS`
+executable so its existing `%APPDATA%/AlSniper OS` WeChat partition and other
+desktop data remain continuous. Independent fresh 256-bit secrets protect the
+sidecar protocol and desktop lifecycle handshake; they are passed only through
+child-process environments and never enter arguments, logs, browser storage,
+or disk. The desktop is created only after an HMAC-authenticated sidecar health
+exchange and PID-bound desktop named-pipe possession proof succeed. Closing the desktop,
+sidecar, or foreground launcher stops the complete local runtime.
+
+The sidecar derives an isolated profile from the operator's Codex profile:
+supported settings are cloned while `auth.json` is linked so local OAuth
+rotation continues to work without copying credentials. If a turn returns
+`AGENT_AUTH_REQUIRED`, run `codex login`, restart the local runtime, and retry.
+Codex CLI and credentials are not included in the desktop package. See the
+[trusted local runtime runbook](./tools/local-runtime/README.md) for build,
+integrity, startup, and shutdown details.
 
 See [the sidecar runbook](./sidecar/README.md) and [Agent Runtime architecture](./docs/architecture/agent-runtime-sidecar.md) for exact-Origin binding, configuration, capability approval, A2UI, game-seat isolation, failure behavior, and the upstream SDK license release blocker.
 

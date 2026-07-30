@@ -24,6 +24,12 @@ import { shouldRejectWeChatClientCertificateRequest } from './main/application-c
 import { WeChatMessageAdapter } from './main/application-control/wechat/WeChatMessageAdapter.js';
 import type { ApplicationControlService } from './main/application-control/applicationControlService.js';
 import { createApplicationControlService } from './main/application-control/createApplicationControlService.js';
+import { consumeAgentRuntimeBootstrap } from './main/agentRuntimeBootstrap.js';
+import { registerAgentRuntimeIpc } from './main/agentRuntimeIpc.js';
+import {
+  bindDesktopShutdownPipe,
+  consumeDesktopShutdownPipe,
+} from './main/desktopShutdown.js';
 import {
   isAllowedShellNavigation,
   parseLoopbackDevServerUrl,
@@ -43,11 +49,13 @@ let mainWindow: BrowserWindow | null = null;
 let weChatController: WeChatViewController | null = null;
 let unregisterWeChatIpc: (() => void) | null = null;
 let unregisterApplicationControlIpc: (() => void) | null = null;
+let unregisterAgentRuntimeIpc: (() => void) | null = null;
 let applicationControlHost: ApplicationControlService | null = null;
 let weChatSessionPersistence: WeChatSessionPersistence | null = null;
 let applicationSessionPersistence: ApplicationSessionPersistence | null = null;
 let applicationStorageExitGate: ApplicationStorageExitGate | null = null;
 let periodicStorageCheckpoint: ReturnType<typeof setInterval> | null = null;
+let unregisterDesktopShutdownPipe: (() => void) | null = null;
 
 app.enableSandbox();
 protocol.registerSchemesAsPrivileged([{
@@ -118,6 +126,22 @@ function getDevServerUrl(): URL | null {
   return parsed;
 }
 
+// Read and scrub the launch capability before BrowserWindow can spawn a
+// renderer. The immutable main-process copy survives safe React/window remounts.
+const launchDevServerUrl = getDevServerUrl();
+const launchShellUrl = launchDevServerUrl ?? new URL('app://alsniper/index.html');
+const agentRuntimeSidecarConfig = consumeAgentRuntimeBootstrap(
+  process.env,
+  launchDevServerUrl === null ? 'app://alsniper' : launchDevServerUrl.origin,
+);
+const desktopShutdownPipeBootstrap = consumeDesktopShutdownPipe(process.env);
+if (desktopShutdownPipeBootstrap !== undefined) {
+  unregisterDesktopShutdownPipe = bindDesktopShutdownPipe(
+    desktopShutdownPipeBootstrap,
+    () => app.quit(),
+  );
+}
+
 function hardenShellSession(shellSession: Session): void {
   if (shellSessionPolicies.has(shellSession)) {
     return;
@@ -171,8 +195,8 @@ function secureShellWebContents(shellWindow: BrowserWindow, shellUrl: URL): void
 }
 
 async function createMainWindow(): Promise<BrowserWindow> {
-  const devServerUrl = getDevServerUrl();
-  const shellUrl = devServerUrl ?? new URL('app://alsniper/index.html');
+  const devServerUrl = launchDevServerUrl;
+  const shellUrl = launchShellUrl;
   const preloadPath = join(moduleDirectory, 'preload.cjs');
 
   const shellWindow = new BrowserWindow({
@@ -200,6 +224,12 @@ async function createMainWindow(): Promise<BrowserWindow> {
   });
   // Bind the trusted native window before renderer IPC can become reachable.
   mainWindow = shellWindow;
+
+  unregisterAgentRuntimeIpc = registerAgentRuntimeIpc(
+    shellWindow,
+    shellUrl,
+    agentRuntimeSidecarConfig,
+  );
 
   hardenShellSession(shellWindow.webContents.session);
   secureShellWebContents(shellWindow, shellUrl);
@@ -295,6 +325,8 @@ async function createMainWindow(): Promise<BrowserWindow> {
     controller.dispose();
   });
   shellWindow.once('closed', () => {
+    unregisterAgentRuntimeIpc?.();
+    unregisterAgentRuntimeIpc = null;
     unregisterApplicationControlIpc?.();
     unregisterApplicationControlIpc = null;
     unregisterWeChatIpc?.();
@@ -307,6 +339,16 @@ async function createMainWindow(): Promise<BrowserWindow> {
     await shellWindow.loadURL(devServerUrl.href);
   } else {
     await shellWindow.loadURL(shellUrl.href);
+  }
+
+  // `ready-to-show` is an optimization signal, not a lifecycle guarantee: a
+  // Windows supervisor may start Electron without a console/visible startup
+  // window and Chromium can finish the initial navigation without emitting a
+  // later signal that makes the native window visible. Once loadURL resolves,
+  // the shell has a committed document and it is safe to enforce the product
+  // contract that a successful trusted launch presents the desktop.
+  if (!shellWindow.isDestroyed() && !shellWindow.isVisible()) {
+    shellWindow.show();
   }
 
   return shellWindow;
@@ -374,6 +416,8 @@ if (!hasSingleInstanceLock) {
 
   app.on('before-quit', (event) => {
     const prepareForQuit = (): void => {
+      unregisterDesktopShutdownPipe?.();
+      unregisterDesktopShutdownPipe = null;
       if (periodicStorageCheckpoint !== null) {
         clearInterval(periodicStorageCheckpoint);
         periodicStorageCheckpoint = null;
@@ -382,6 +426,8 @@ if (!hasSingleInstanceLock) {
       unregisterWeChatIpc = null;
       unregisterApplicationControlIpc?.();
       unregisterApplicationControlIpc = null;
+      unregisterAgentRuntimeIpc?.();
+      unregisterAgentRuntimeIpc = null;
       weChatController?.dispose();
       weChatController = null;
       if (applicationControlHost !== null) {

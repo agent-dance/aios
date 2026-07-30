@@ -8,26 +8,27 @@ This record covers the direct execution SDK used by the AlSniper OS Go sidecar. 
 | --- | --- |
 | Module | `github.com/agent-dance/agent-adaptor` |
 | Source repository | `https://github.com/agent-dance/agent-adaptor.git` |
-| User-requested branch name | `cl/opt/examples` |
-| Actual upstream ref | `refs/heads/cl/opt_examples` |
-| Resolved commit | `aac715d492a1defd65525c1639dd6a639e36d384` |
-| Go pseudo-version | `v0.12.1-0.20260725141943-aac715d492a1` |
+| Upstream release | `v1.0.0` |
+| Upstream ref | `refs/tags/v1.0.0^{}` |
+| Resolved commit | `e33f0f3eb2dd51a47e2397e1e39a5fef94d8aa38` |
+| Go module version | `v1.0.0` |
+| Module sum | `h1:eF5qUeFbsj7CYWIsnmnx9J3IbeLRaQcLe3OMmR/86mA=` |
 | Pin location | `sidecar/go.mod` and `sidecar/go.sum` |
-| Used capability | Codex driver binding, auth-link profile cloning, stateless ephemeral execution, deny run policy, environment/profile diagnostics, strict JSON Schema output |
+| Used capability | `adaptor.New`, `codex.Driver`, `profile.CloneFrom` with copied settings and linked OAuth state, one-shot execution, Inspector diagnostics, strict local JSON Schema output, `Result`/`RunError`, and `Agent.Close` |
 
 Resolution can be checked without switching the working tree:
 
 ```powershell
-git ls-remote https://github.com/agent-dance/agent-adaptor.git refs/heads/cl/opt_examples refs/heads/cl/opt/examples
+git ls-remote https://github.com/agent-dance/agent-adaptor.git refs/tags/v1.0.0 refs/tags/v1.0.0^{}
 go list -m -json github.com/agent-dance/agent-adaptor
 go mod verify
 ```
 
-At the time of pinning, the remote resolves only `refs/heads/cl/opt_examples` to the recorded commit; the slash-form ref does not exist. The pseudo-version encodes the same commit prefix and is not a floating branch dependency.
+The annotated release tag dereferences to the recorded commit. `go.mod` uses the formal release directly and contains no local `replace`.
 
 ## License status and release decision
 
-The source tree at commit `aac715d492a1defd65525c1639dd6a639e36d384` contains no `LICENSE`, `LICENSE.*`, `COPYING`, `NOTICE`, or equivalent license file. A scan of the upstream root documentation also found no usable copyright license grant.
+The source tree at release commit `e33f0f3eb2dd51a47e2397e1e39a5fef94d8aa38` contains no `LICENSE`, `LICENSE.*`, `COPYING`, `NOTICE`, or equivalent license file. A scan of the upstream root documentation also found no usable copyright license grant.
 
 Consequently, redistribution is not authorized by repository metadata. This is a legal blocker for publishing an AlSniper OS binary that incorporates this Go module, and for vendoring or redistributing its source. Repository visibility and the ability to download or build the source do not imply redistribution permission.
 

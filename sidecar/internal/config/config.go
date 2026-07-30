@@ -36,7 +36,13 @@ func Load() (Config, error) {
 	cfg := Config{
 		ListenAddress:     "127.0.0.1:4317",
 		AllowedOrigin:     "http://localhost:5173",
-		ProfileDir:        filepath.Join(base, "AlSniperOS", "agent-sidecar", "codex-profile"),
+		// Keep the clean-cut agent-adaptor v1 profile separate from profiles
+		// produced by pre-v1 runtimes.  Those older profiles may contain
+		// persistent sessions, skills, or temporary resources that the v1
+		// one-shot security boundary must reject; selecting a fresh owned
+		// profile preserves the old files without weakening validation or
+		// deleting user-local data during migration.
+		ProfileDir:        filepath.Join(base, "AlSniperOS", "agent-sidecar", "codex-profile-v1"),
 		WorkspaceDir:      filepath.Join(base, "AlSniperOS", "agent-sidecar", "workspace"),
 		CodexCommand:      "codex",
 		MaxBodyBytes:      262144,
@@ -86,8 +92,16 @@ func (c Config) Validate() error {
 		return errors.New("AIOS_SIDECAR_TOKEN must contain between 32 and 512 bytes")
 	}
 	origin, err := url.Parse(c.AllowedOrigin)
-	if err != nil || (origin.Scheme != "http" && origin.Scheme != "https") || origin.Host == "" || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
-		return errors.New("AIOS_SIDECAR_ORIGIN must be one exact HTTP(S) origin")
+	if err != nil || origin.Host == "" || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
+		return errors.New("AIOS_SIDECAR_ORIGIN must be the trusted app origin or one exact loopback HTTP(S) origin")
+	}
+	trustedAppOrigin := c.AllowedOrigin == "app://alsniper"
+	hostname := origin.Hostname()
+	ip := net.ParseIP(hostname)
+	loopbackWebOrigin := (origin.Scheme == "http" || origin.Scheme == "https") &&
+		(strings.EqualFold(hostname, "localhost") || (ip != nil && ip.IsLoopback()))
+	if !trustedAppOrigin && !loopbackWebOrigin {
+		return errors.New("AIOS_SIDECAR_ORIGIN must be app://alsniper or one exact loopback HTTP(S) origin")
 	}
 	if strings.TrimSpace(c.ProfileDir) == "" || strings.TrimSpace(c.WorkspaceDir) == "" {
 		return errors.New("profile and workspace directories are required")

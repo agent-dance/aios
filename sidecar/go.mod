@@ -3,7 +3,7 @@ module github.com/buthim/alsniper-os/sidecar
 go 1.26.5
 
 require (
-	github.com/agent-dance/agent-adaptor v0.12.1-0.20260725141943-aac715d492a1
+	github.com/agent-dance/agent-adaptor v1.0.0
 	github.com/gofrs/flock v0.13.0
 	github.com/pelletier/go-toml/v2 v2.3.0
 )

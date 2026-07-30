@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 
 	agentadaptor "github.com/agent-dance/agent-adaptor"
 	"github.com/agent-dance/agent-adaptor/codex"
+	adaptordriver "github.com/agent-dance/agent-adaptor/driver"
 	"github.com/buthim/alsniper-os/sidecar/internal/config"
 )
 
@@ -28,17 +30,28 @@ type concurrentLeaseAdapter struct {
 	transientErr   error
 }
 
-func (a *concurrentLeaseAdapter) Descriptor() agentadaptor.DriverDescriptor {
-	return agentadaptor.DriverDescriptor{Type: "codex"}
+type requestCaptureDriver struct{ request adaptordriver.Request }
+
+func (d *requestCaptureDriver) Descriptor() adaptordriver.Descriptor {
+	return adaptordriver.Descriptor{Type: "codex"}
+}
+func (d *requestCaptureDriver) ValidateConfig(any) error { return nil }
+func (d *requestCaptureDriver) Run(_ context.Context, request adaptordriver.Request, _ adaptordriver.EventSink) (adaptordriver.Response, error) {
+	d.request = request
+	return adaptordriver.Response{}, nil
+}
+
+func (a *concurrentLeaseAdapter) Descriptor() adaptordriver.Descriptor {
+	return adaptordriver.Descriptor{Type: "codex"}
 }
 
 func (a *concurrentLeaseAdapter) ValidateConfig(any) error { return nil }
 
-func (a *concurrentLeaseAdapter) GetProfile(_ context.Context, _ any, _ agentadaptor.AgentIdentity, profile *agentadaptor.ProfileSelection) (agentadaptor.AgentProfile, error) {
-	return agentadaptor.AgentProfile{DriverType: "codex", Supported: true, Dir: profile.Dir, EnvVar: "CODEX_HOME"}, nil
+func (a *concurrentLeaseAdapter) GetProfile(_ context.Context, _ any, _ adaptordriver.AgentIdentity, profile *adaptordriver.ProfileSelection) (adaptordriver.AgentProfile, error) {
+	return adaptordriver.AgentProfile{DriverType: "codex", Supported: true, Dir: profile.Dir, EnvVar: "CODEX_HOME"}, nil
 }
 
-func (a *concurrentLeaseAdapter) Run(_ context.Context, _ agentadaptor.DriverRunRequest, _ agentadaptor.EventSink) (agentadaptor.DriverRunResult, error) {
+func (a *concurrentLeaseAdapter) Run(_ context.Context, _ adaptordriver.Request, _ adaptordriver.EventSink) (adaptordriver.Response, error) {
 	a.transientOnce.Do(func() {
 		lock := filepath.Join(a.profileDir, sdkProfileLockName)
 		temporary := filepath.Join(a.profileDir, "."+sdkProfileManifestName+".tmp-123456789")
@@ -74,44 +87,61 @@ func (a *concurrentLeaseAdapter) Run(_ context.Context, _ agentadaptor.DriverRun
 		}()
 	})
 	if a.transientErr != nil {
-		return agentadaptor.DriverRunResult{}, a.transientErr
+		return adaptordriver.Response{}, a.transientErr
 	}
 	a.entered <- struct{}{}
 	<-a.release
-	return agentadaptor.DriverRunResult{}, nil
+	return adaptordriver.Response{}, nil
+}
+
+func TestGuardedCodexDriverInjectsImmutableConfigWhenV1RequestConfigIsNil(t *testing.T) {
+	base := &requestCaptureDriver{}
+	originalArgs := []string{"--ephemeral"}
+	configured := codex.Config{CommonConfig: codex.CommonConfig{Command: "codex", CWD: t.TempDir(), ExtraArgs: originalArgs}}
+	driver := guardedCodexDriver{base: base, config: configured}
+	_, err := driver.Run(t.Context(), adaptordriver.Request{Spawn: true}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwarded, ok := base.request.Config.(codex.Config)
+	if !ok {
+		t.Fatalf("v1 nil request config was not projected to codex.Config: %T", base.request.Config)
+	}
+	if forwarded.Command != "codex" || forwarded.CWD != configured.CWD || !slices.Equal(forwarded.ExtraArgs, originalArgs) {
+		t.Fatalf("captured config drifted: %+v", forwarded)
+	}
+	forwarded.ExtraArgs[0] = "mutated"
+	if configured.ExtraArgs[0] != "--ephemeral" || driver.config.ExtraArgs[0] != "--ephemeral" {
+		t.Fatal("v1 config projection aliased the immutable construction snapshot")
+	}
 }
 
 func TestCodexRunCompletionRejectsBufferedOutputAfterAbnormalTermination(t *testing.T) {
-	structured := &agentadaptor.StructuredOutput{Valid: true, RawJSON: []byte(`{"ok":true}`)}
 	tests := []struct {
-		name   string
-		result agentadaptor.RunResult
-		want   error
+		name string
+		err  error
+		want error
 	}{
-		{name: "success", result: agentadaptor.RunResult{StructuredOutput: structured}},
-		{name: "timeout", result: agentadaptor.RunResult{TimedOut: true, StructuredOutput: structured}, want: context.DeadlineExceeded},
-		{name: "nonzero exit", result: agentadaptor.RunResult{ExitCode: 9, StructuredOutput: structured}, want: errors.New("failure")},
-		{name: "signal", result: agentadaptor.RunResult{Signal: "SIGKILL", StructuredOutput: structured}, want: errors.New("failure")},
+		{name: "success"},
+		{name: "deadline", err: context.DeadlineExceeded, want: context.DeadlineExceeded},
+		{name: "process failure", err: errors.New("process exited with status 9"), want: ErrAgent},
+		{name: "signal", err: errors.New("process terminated by SIGKILL"), want: ErrAgent},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateCodexRunCompletion(context.Background(), test.result, nil)
+			err := validateCodexRunCompletion(context.Background(), &agentadaptor.Result{}, test.err)
 			if test.want == nil && err != nil {
 				t.Fatalf("successful process was rejected: %v", err)
 			}
-			if test.want != nil && err == nil {
-				t.Fatal("abnormal process result with valid buffered JSON was accepted")
-			}
-			if errors.Is(test.want, context.DeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
-				t.Fatalf("timeout error = %v", err)
+			if test.want != nil && !errors.Is(err, test.want) {
+				t.Fatalf("completion error = %v, want %v", err, test.want)
 			}
 		})
 	}
 }
 
 func TestCodexRunCompletionRejectsBufferedOutputAfterContextRevocation(t *testing.T) {
-	structured := &agentadaptor.StructuredOutput{Valid: true, RawJSON: []byte(`{"ok":true}`)}
-	result := agentadaptor.RunResult{StructuredOutput: structured}
+	result := &agentadaptor.Result{}
 
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -125,31 +155,29 @@ func TestCodexRunCompletionRejectsBufferedOutputAfterContextRevocation(t *testin
 		t.Fatalf("expired run returned %v", err)
 	}
 
-	sdkErr := errors.New("sdk failure")
-	if err := validateCodexRunCompletion(context.Background(), result, sdkErr); !errors.Is(err, sdkErr) {
-		t.Fatalf("SDK error was not preserved: %v", err)
+	sdkErr := errors.New("sdk failure with provider detail")
+	if err := validateCodexRunCompletion(context.Background(), result, sdkErr); !errors.Is(err, ErrAgent) {
+		t.Fatalf("SDK error was not normalized: %v", err)
 	}
 }
 
 func TestCodexRunCompletionClassifiesFailuresWithoutLeakingProviderText(t *testing.T) {
 	canary := "provider-canary-must-not-leak"
 	for _, test := range []struct {
-		name   string
-		result agentadaptor.RunResult
-		want   error
+		name string
+		err  error
+		want error
 	}{
-		{name: "unauthorized before generic exit", result: agentadaptor.RunResult{ExitCode: 1, Failure: &agentadaptor.RunFailure{Code: agentadaptor.FailureAgentError, Message: "401 unauthorized " + canary}}, want: ErrAuthentication},
-		{name: "invalid key", result: agentadaptor.RunResult{Failure: &agentadaptor.RunFailure{Code: agentadaptor.FailureAgentError, Message: "invalid_api_key " + canary}}, want: ErrAuthentication},
-		{name: "oauth grant expired", result: agentadaptor.RunResult{Failure: &agentadaptor.RunFailure{Code: agentadaptor.FailureAgentError, Message: "invalid_grant: reauthentication required " + canary}}, want: ErrAuthentication},
-		{name: "numeric request id is not auth", result: agentadaptor.RunResult{Failure: &agentadaptor.RunFailure{Code: agentadaptor.FailureAgentError, Message: "request item-401 failed " + canary}}, want: ErrAgent},
-		{name: "non-agent failure cannot become auth", result: agentadaptor.RunResult{Failure: &agentadaptor.RunFailure{Code: agentadaptor.FailureReject, Message: "unauthorized " + canary}}, want: ErrAgent},
-		{name: "local schema rejection", result: agentadaptor.RunResult{Failure: &agentadaptor.RunFailure{Code: agentadaptor.FailurePolicyError, Message: canary}, StructuredOutput: &agentadaptor.StructuredOutput{Valid: false, RawJSON: []byte(`{"ok":"not-a-boolean"}`)}}, want: ErrInvalidAI},
-		{name: "provider failure with invalid structured candidate", result: agentadaptor.RunResult{Failure: &agentadaptor.RunFailure{Code: agentadaptor.FailureAgentError, Message: canary}, StructuredOutput: &agentadaptor.StructuredOutput{Valid: false, RawJSON: []byte(`{"ok":"not-a-boolean"}`)}}, want: ErrAgent},
-		{name: "generic failure before generic exit", result: agentadaptor.RunResult{ExitCode: 1, Failure: &agentadaptor.RunFailure{Code: agentadaptor.FailureAgentError, Message: canary}}, want: ErrAgent},
-		{name: "timeout has priority", result: agentadaptor.RunResult{TimedOut: true, Failure: &agentadaptor.RunFailure{Message: "401 " + canary}}, want: context.DeadlineExceeded},
+		{name: "unauthorized", err: &agentadaptor.RunError{Reason: agentadaptor.ReasonAgentError, Message: "401 unauthorized " + canary, Result: &agentadaptor.Result{}}, want: ErrAuthentication},
+		{name: "invalid key", err: &agentadaptor.RunError{Reason: agentadaptor.ReasonAgentError, Message: "invalid_api_key " + canary, Result: &agentadaptor.Result{}}, want: ErrAuthentication},
+		{name: "oauth grant expired", err: &agentadaptor.RunError{Reason: agentadaptor.ReasonAgentError, Message: "invalid_grant: reauthentication required " + canary, Result: &agentadaptor.Result{}}, want: ErrAuthentication},
+		{name: "numeric request id is not auth", err: &agentadaptor.RunError{Reason: agentadaptor.ReasonAgentError, Message: "request item-401 failed " + canary, Result: &agentadaptor.Result{}}, want: ErrAgent},
+		{name: "local schema rejection", err: &agentadaptor.RunError{Reason: agentadaptor.ReasonPolicyViolation, Message: canary, Result: &agentadaptor.Result{}}, want: ErrInvalidAI},
+		{name: "schema output mentioning unauthorized is not auth", err: &agentadaptor.RunError{Reason: agentadaptor.ReasonPolicyViolation, Message: "unauthorized " + canary, Result: &agentadaptor.Result{}}, want: ErrInvalidAI},
+		{name: "generic failure", err: &agentadaptor.RunError{Reason: agentadaptor.ReasonAgentError, Message: canary, Result: &agentadaptor.Result{}}, want: ErrAgent},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateCodexRunCompletion(context.Background(), test.result, nil)
+			err := validateCodexRunCompletion(context.Background(), &agentadaptor.Result{}, test.err)
 			if !errors.Is(err, test.want) {
 				t.Fatalf("failure classification = %v, want %v", err, test.want)
 			}
@@ -161,18 +189,13 @@ func TestCodexRunCompletionClassifiesFailuresWithoutLeakingProviderText(t *testi
 }
 
 func TestValidatedCodexStructuredJSONFailsClosed(t *testing.T) {
-	for _, result := range []agentadaptor.RunResult{
-		{},
-		{StructuredOutput: &agentadaptor.StructuredOutput{}},
-		{StructuredOutput: &agentadaptor.StructuredOutput{Valid: true}},
-		{StructuredOutput: &agentadaptor.StructuredOutput{Valid: false, RawJSON: []byte(`{"unsafe":true}`)}},
-	} {
+	for _, result := range []*agentadaptor.Result{nil, {}} {
 		if _, err := validatedCodexStructuredJSON(result); !errors.Is(err, ErrInvalidAI) {
 			t.Fatalf("invalid structured output returned %v", err)
 		}
 	}
 	raw := []byte(`{"ok":true}`)
-	got, err := validatedCodexStructuredJSON(agentadaptor.RunResult{StructuredOutput: &agentadaptor.StructuredOutput{Valid: true, RawJSON: raw}})
+	got, err := validatedCodexStructuredJSON(&agentadaptor.Result{Text: string(raw)})
 	if err != nil || !bytes.Equal(got, raw) {
 		t.Fatalf("valid structured output rejected: got=%s err=%v", got, err)
 	}
@@ -192,7 +215,7 @@ func TestCompletedProviderRunVerifiesAuthenticationBeforeOutputValidation(t *tes
 	}
 	observation := &credentialObservation{}
 	observation.capture(generation, true)
-	if _, err := runner.acceptCompletedCodexRun(agentadaptor.RunResult{}, observation, 1); !errors.Is(err, ErrInvalidAI) {
+	if _, err := runner.acceptCompletedCodexRun(&agentadaptor.Result{}, observation, 1); !errors.Is(err, ErrInvalidAI) {
 		t.Fatalf("invalid output returned %v", err)
 	}
 	if runner.authState != codexAuthVerified || !runner.hasAuthGeneration {
@@ -301,6 +324,25 @@ func writeTestNativeAuth(t *testing.T, source string) string {
 	return auth
 }
 
+func TestNewCodexRunnerClaimsAnExistingEmptyWorkspaceRoot(t *testing.T) {
+	source := t.TempDir()
+	writeTestNativeAuth(t, source)
+	profile := filepath.Join(t.TempDir(), "profile")
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	if err := os.Mkdir(workspace, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", source)
+	runner, err := NewCodexRunner(testRunnerConfig(t, profile, workspace, "go"))
+	if err != nil {
+		t.Fatalf("an existing empty workspace root should be safely claimable: %v", err)
+	}
+	t.Cleanup(func() { _ = runner.Close() })
+	if err := validateDedicatedWorkspaceContents(workspace, true); err != nil {
+		t.Fatalf("the workspace ownership claim is invalid: %v", err)
+	}
+}
+
 func TestCodexProfileLinksAuthenticationAndClonesNativeSettings(t *testing.T) {
 	source := t.TempDir()
 	profile := filepath.Join(t.TempDir(), "profile")
@@ -366,40 +408,46 @@ func TestCodexProfileLinksAuthenticationAndClonesNativeSettings(t *testing.T) {
 	}
 }
 
-func TestDenyDecisionAdapterAccuratelyExposesHostDenial(t *testing.T) {
-	descriptor := denyDecisionAdapter{DriverAdapter: codex.NewAdapter()}.Descriptor()
-	if !descriptor.RunPolicyCaps.Permission.AutoReject || !descriptor.RunPolicyCaps.PlanReview.AutoReject {
-		t.Fatal("host denial capability is not exposed")
+func TestGuardedCodexDriverExposesOnlyOneShotHostCapabilities(t *testing.T) {
+	driver := guardedCodexDriver{base: codex.Driver(codex.Config{})}
+	descriptor := driver.Descriptor()
+	if descriptor.Sessions.SupportsResume || descriptor.Process.Persistent || descriptor.Skills.Supported || descriptor.MCP.Supported {
+		t.Fatalf("unsafe optional capability escaped guarded driver: %+v", descriptor)
 	}
-	policy := denyPolicy()
-	if policy.HumanDecision.Permission != agentadaptor.HumanDecisionAutoReject || policy.Isolation != agentadaptor.IsolationReadOnly {
-		t.Fatalf("unexpected policy: %+v", policy)
+	if !descriptor.RunPolicyCaps.Isolation || descriptor.RunPolicyCaps.WebSearch || descriptor.RunPolicyCaps.Browser {
+		t.Fatalf("unexpected policy capabilities: %+v", descriptor.RunPolicyCaps)
+	}
+	if descriptor.StructuredOutput.JSONSchemaNative || !descriptor.StructuredOutput.JSONSchemaPromptValidate || !descriptor.StructuredOutput.WorksWithRun {
+		t.Fatalf("unexpected structured-output contract: %+v", descriptor.StructuredOutput)
 	}
 }
 
 func TestCodexCloneSelectionUsesExactNativeProfileContract(t *testing.T) {
 	guard := &codexFilesystemGuard{sourceHome: filepath.Clean(`C:\native-codex`), profileDir: filepath.Clean(`C:\isolated-codex`)}
-	selection := &agentadaptor.ProfileSelection{
-		Mode: agentadaptor.ProfileModeClone,
+	selection := &adaptordriver.ProfileSelection{
+		Mode: adaptordriver.ProfileModeClone,
 		From: guard.sourceHome,
 		Dir:  guard.profileDir,
-		Clone: &agentadaptor.CloneProfileOptions{
+		Clone: &adaptordriver.CloneProfileOptions{
 			IncludeSettings: true,
 			IncludeMCP:      false,
 			IncludeSkills:   false,
-			IncludeAuth:     true,
-			AuthMode:        agentadaptor.CloneProfileAuthLink,
+			AuthMode:        adaptordriver.CloneProfileAuthLink,
 		},
 	}
 	if !guard.cloneSelectionValid(selection) {
 		t.Fatal("the exact SDK native-profile clone selection was rejected")
 	}
-	for _, mutate := range []func(*agentadaptor.CloneProfileOptions){
-		func(options *agentadaptor.CloneProfileOptions) { options.IncludeSettings = false },
-		func(options *agentadaptor.CloneProfileOptions) { options.IncludeMCP = true },
-		func(options *agentadaptor.CloneProfileOptions) { options.IncludeSkills = true },
-		func(options *agentadaptor.CloneProfileOptions) { options.IncludeAuth = false },
-		func(options *agentadaptor.CloneProfileOptions) { options.AuthMode = agentadaptor.CloneProfileAuthCopy },
+	for _, mutate := range []func(*adaptordriver.CloneProfileOptions){
+		func(options *adaptordriver.CloneProfileOptions) { options.IncludeSettings = false },
+		func(options *adaptordriver.CloneProfileOptions) { options.IncludeMCP = true },
+		func(options *adaptordriver.CloneProfileOptions) { options.IncludeSkills = true },
+		func(options *adaptordriver.CloneProfileOptions) {
+			options.AuthMode = adaptordriver.CloneProfileAuthNone
+		},
+		func(options *adaptordriver.CloneProfileOptions) {
+			options.AuthMode = adaptordriver.CloneProfileAuthCopy
+		},
 	} {
 		copySelection := *selection
 		copyOptions := *selection.Clone
@@ -423,24 +471,23 @@ func TestPinnedSDKCloneIsCopyIfMissingAndAuthModeOverridesIncludeAuth(t *testing
 	if err := os.WriteFile(instructionsPath, []byte("first instructions"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	selection := &agentadaptor.ProfileSelection{
-		Mode: agentadaptor.ProfileModeClone, From: source, Dir: profileDir,
-		Clone: &agentadaptor.CloneProfileOptions{
+	selection := &adaptordriver.ProfileSelection{
+		Mode: adaptordriver.ProfileModeClone, From: source, Dir: profileDir,
+		Clone: &adaptordriver.CloneProfileOptions{
 			IncludeSettings: true,
 			IncludeMCP:      false,
 			IncludeSkills:   false,
-			IncludeAuth:     true,
-			AuthMode:        agentadaptor.CloneProfileAuthLink,
+			AuthMode:        adaptordriver.CloneProfileAuthLink,
 		},
 	}
-	base := codex.New(agentadaptor.CodexConfig{})
-	driver, ok := base.Adapter().(agentadaptor.ProfileAwareDriver)
+	base := codex.Driver(codex.Config{})
+	driver, ok := base.(adaptordriver.ProfileReporter)
 	if !ok {
 		t.Fatal("pinned Codex adapter no longer exposes profile materialization")
 	}
 	clone := func() {
 		t.Helper()
-		resolved, err := driver.GetProfile(t.Context(), agentadaptor.CodexConfig{}, agentadaptor.AgentIdentity{}, selection)
+		resolved, err := driver.GetProfile(t.Context(), codex.Config{}, adaptordriver.AgentIdentity{}, selection)
 		if err != nil || strings.TrimSpace(resolved.Error) != "" {
 			t.Fatalf("pinned SDK clone failed: profile=%+v err=%v", resolved, err)
 		}
@@ -628,14 +675,16 @@ func TestStableCredentialLeaseAllowsParallelAgentRuns(t *testing.T) {
 		clearTransient: make(chan struct{}), cleanupResult: make(chan error, 1),
 		profileDir: profile,
 	}
-	adapter := denyDecisionAdapter{DriverAdapter: base, filesystemGuard: guard}
-	selection := &agentadaptor.ProfileSelection{
-		Mode: agentadaptor.ProfileModeClone, From: source, Dir: profile,
-		Clone: &agentadaptor.CloneProfileOptions{IncludeSettings: true, IncludeMCP: false, IncludeSkills: false, IncludeAuth: true, AuthMode: agentadaptor.CloneProfileAuthLink},
+	configured := codex.Config{CommonConfig: codex.CommonConfig{Command: command, CWD: workspace, ExtraArgs: args}}
+	adapter := guardedCodexDriver{base: base, config: configured, filesystemGuard: guard}
+	selection := &adaptordriver.ProfileSelection{
+		Mode: adaptordriver.ProfileModeClone, From: source, Dir: profile,
+		Clone: &adaptordriver.CloneProfileOptions{IncludeSettings: true, IncludeMCP: false, IncludeSkills: false, AuthMode: adaptordriver.CloneProfileAuthLink},
 	}
-	request := agentadaptor.DriverRunRequest{
-		Config:  agentadaptor.CodexConfig{CommonConfig: agentadaptor.CommonConfig{Command: command, CWD: workspace, ExtraArgs: args}},
+	request := adaptordriver.Request{
+		Config:  configured,
 		Profile: selection,
+		Spawn:   true,
 	}
 
 	errorsByRun := make(chan error, 2)
@@ -1115,8 +1164,12 @@ func TestPrepareDedicatedWorkspaceCreatesDistinctEmptyChildren(t *testing.T) {
 
 func TestPrepareDedicatedWorkspaceRejectsUnclaimedOrUnknownContent(t *testing.T) {
 	empty := t.TempDir()
-	if _, err := prepareDedicatedWorkspace(empty); err == nil {
-		t.Fatal("expected an existing unclaimed empty root to be rejected")
+	workspace, err := prepareDedicatedWorkspace(empty)
+	if err != nil {
+		t.Fatalf("expected an existing empty workspace root to be claimed safely: %v", err)
+	}
+	if filepath.Dir(workspace) != empty {
+		t.Fatalf("workspace %q was not created under claimed root %q", workspace, empty)
 	}
 
 	unclaimed := t.TempDir()
@@ -1663,6 +1716,21 @@ func TestIsolatedProfileRejectsWrongTypesAndPersistentSessions(t *testing.T) {
 	}
 	if err := isolatedProfileContents(profile); err == nil {
 		t.Fatal("non-empty profile tmp directory was accepted")
+	}
+
+	providerProfile := t.TempDir()
+	providerTmp := filepath.Join(providerProfile, "tmp", "arg0", "codex-arg0ABC123")
+	if err := os.MkdirAll(providerTmp, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := isolatedProfileContents(providerProfile); err != nil {
+		t.Fatalf("Codex's empty ephemeral arg directory was rejected: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(providerTmp, "retained-prompt"), []byte("unsafe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := isolatedProfileContents(providerProfile); err == nil {
+		t.Fatal("a retained file beneath the Codex tmp directory was accepted")
 	}
 }
 

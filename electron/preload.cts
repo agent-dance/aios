@@ -35,6 +35,8 @@ const APPLICATION_CONTROL_CHANNELS = Object.freeze({
   getReceipt: 'alsniper-desktop:application-control:get-receipt',
 });
 
+const AGENT_RUNTIME_SIDECAR_CONFIG_CHANNEL = 'alsniper-desktop:agent-runtime:get-sidecar-config';
+
 const APPLICATION_EFFECT_STATUSES = new Set<unknown>(['committed', 'rejected', 'failed', 'unknown', 'noop']);
 const APPLICATION_RISK_LEVELS = new Set<unknown>(['R0', 'R1', 'R2', 'R3', 'R4']);
 const APPLICATION_ERROR_CODES = new Set<unknown>([
@@ -66,6 +68,9 @@ const MAX_APPLICATION_JSON_DEPTH = 20;
 const MAX_APPLICATION_ARRAY_ITEMS = 512;
 const MAX_APPLICATION_OBJECT_PROPERTIES = 256;
 const MAX_APPLICATION_STRING_LENGTH = 32_768;
+const MIN_AGENT_RUNTIME_TOKEN_LENGTH = 32;
+const MAX_AGENT_RUNTIME_TOKEN_LENGTH = 512;
+const textEncoder = new TextEncoder();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -78,6 +83,65 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function exactKeys(value: Record<string, unknown>, required: readonly string[], allowed = required): boolean {
   const keys = Object.keys(value);
   return keys.every((key) => allowed.includes(key)) && required.every((key) => Object.hasOwn(value, key));
+}
+
+function cloneAgentRuntimeSidecarConfig(value: unknown): Readonly<{
+  baseUrl: string;
+  token: string;
+  origin: string;
+}> {
+  const tokenByteLength = typeof value === 'object' && value !== null && 'token' in value && typeof value.token === 'string'
+    ? textEncoder.encode(value.token).byteLength
+    : 0;
+  if (
+    !isRecord(value)
+    || !exactKeys(value, ['baseUrl', 'token', 'origin'])
+    || typeof value.baseUrl !== 'string'
+    || typeof value.token !== 'string'
+    || typeof value.origin !== 'string'
+    || tokenByteLength < MIN_AGENT_RUNTIME_TOKEN_LENGTH
+    || tokenByteLength > MAX_AGENT_RUNTIME_TOKEN_LENGTH
+    || value.token.trim() !== value.token
+    || /[\u0000-\u001f\u007f]/u.test(value.token)
+  ) throw new TypeError('Invalid Agent Runtime sidecar configuration.');
+
+  let baseUrl: URL;
+  try {
+    baseUrl = new URL(value.baseUrl);
+  } catch {
+    throw new TypeError('Invalid Agent Runtime sidecar configuration.');
+  }
+  const port = Number(baseUrl.port);
+  const validOrigin = value.origin === 'app://alsniper' || (() => {
+    try {
+      const origin = new URL(value.origin);
+      return (
+        value.origin === origin.origin
+        && origin.protocol === 'http:'
+        && (origin.hostname === '127.0.0.1' || origin.hostname === 'localhost' || origin.hostname === '[::1]')
+        && origin.username === ''
+        && origin.password === ''
+        && Number.isInteger(Number(origin.port))
+        && Number(origin.port) >= 1_024
+        && Number(origin.port) <= 65_535
+      );
+    } catch {
+      return false;
+    }
+  })();
+  if (
+    value.baseUrl !== baseUrl.origin
+    || baseUrl.protocol !== 'http:'
+    || baseUrl.hostname !== '127.0.0.1'
+    || baseUrl.username !== ''
+    || baseUrl.password !== ''
+    || !Number.isInteger(port)
+    || port < 1_024
+    || port > 65_535
+    || !validOrigin
+  ) throw new TypeError('Invalid Agent Runtime sidecar configuration.');
+
+  return Object.freeze({ baseUrl: value.baseUrl, token: value.token, origin: value.origin });
 }
 
 function cloneBounds(value: unknown): Bounds {
@@ -313,4 +377,15 @@ const applicationControl = Object.freeze({
   },
 });
 
-contextBridge.exposeInMainWorld('alsniperDesktop', Object.freeze({ wechat, applicationControl }));
+const agentRuntime = Object.freeze({
+  getSidecarConfig: async (): Promise<Readonly<{
+    baseUrl: string;
+    token: string;
+    origin: string;
+  }> | undefined> => {
+    const value: unknown = await ipcRenderer.invoke(AGENT_RUNTIME_SIDECAR_CONFIG_CHANNEL);
+    return value === undefined ? undefined : cloneAgentRuntimeSidecarConfig(value);
+  },
+});
+
+contextBridge.exposeInMainWorld('alsniperDesktop', Object.freeze({ wechat, applicationControl, agentRuntime }));

@@ -60,6 +60,7 @@ import { useSystemStore } from '../system/useSystemStore';
 import { A2uiErrorBoundary } from './A2uiErrorBoundary';
 import { startSidecarHealthMonitor, type SidecarHealthMonitor } from './healthMonitor';
 import { executeDesktopApplicationAction, listDesktopApplicationActions } from './applicationControlBridge';
+import { resolveAgentRuntimeSidecarConfig } from './sidecarBootstrap';
 
 const systemRevisionClock = (() => {
   let revision = 0;
@@ -72,19 +73,6 @@ const systemRevisionClock = (() => {
     },
   });
 })();
-
-interface InjectedSidecarConfig {
-  readonly baseUrl: string;
-  readonly token: string;
-  readonly origin?: string;
-}
-
-declare global {
-  interface Window {
-    /** Injected by the trusted desktop launcher. Never persisted by the WebView. */
-    __AIOS_SIDECAR_CONFIG__?: InjectedSidecarConfig;
-  }
-}
 
 export interface AgentSurfaceEnvelope {
   readonly surface: A2uiSurface;
@@ -143,21 +131,6 @@ const initialValue: AgentRuntimeValue = Object.freeze({
 });
 
 const AgentRuntimeContext = createContext<AgentRuntimeValue>(initialValue);
-
-let consumedSidecarConfig: InjectedSidecarConfig | undefined;
-
-const resolveConfig = (): InjectedSidecarConfig | undefined => {
-  const injected = window.__AIOS_SIDECAR_CONFIG__;
-  if (injected) {
-    delete window.__AIOS_SIDECAR_CONFIG__;
-    consumedSidecarConfig = Object.freeze({ ...injected });
-  }
-  if (consumedSidecarConfig) return consumedSidecarConfig;
-  if (!import.meta.env.DEV) return undefined;
-  const baseUrl = import.meta.env.VITE_AIOS_SIDECAR_URL as string | undefined;
-  const token = import.meta.env.VITE_AIOS_SIDECAR_TOKEN as string | undefined;
-  return baseUrl && token ? { baseUrl, token } : undefined;
-};
 
 const voiceAvailability = (): AiPrivacyStatus['voiceInput'] =>
   'SpeechRecognition' in window || 'webkitSpeechRecognition' in window ? 'permission-required' : 'unavailable';
@@ -919,14 +892,18 @@ export function AgentRuntimeProvider({ children }: { readonly children: ReactNod
   useEffect(() => {
     let disposed = false;
     let healthMonitor: SidecarHealthMonitor | undefined;
-    const config = resolveConfig();
-    if (!config) return;
     void (async () => {
       try {
+        const config = await resolveAgentRuntimeSidecarConfig(window, import.meta.env.DEV ? {
+          enabled: true,
+          baseUrl: import.meta.env.VITE_AIOS_SIDECAR_URL as string | undefined,
+          token: import.meta.env.VITE_AIOS_SIDECAR_TOKEN as string | undefined,
+        } : undefined);
+        if (disposed || config === undefined) return;
         const client = createSidecarClient({
           baseUrl: config.baseUrl,
           token: config.token,
-          origin: config.origin ?? window.location.origin,
+          origin: config.origin,
         });
         const registry = await createBrowserAgentRegistry({
           onPersistenceModeChange: (mode) => {

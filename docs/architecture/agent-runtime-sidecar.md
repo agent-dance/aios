@@ -39,21 +39,22 @@ The dependency direction is intentional. Codex can propose an intent or select a
 
 ## Pinned execution SDK
 
-The Go module uses `github.com/agent-dance/agent-adaptor` from the requested `cl/opt/examples` line. The upstream repository publishes that work under the actual ref `refs/heads/cl/opt_examples`. The dependency is fixed rather than branch-floating:
+The Go module uses the formal `github.com/agent-dance/agent-adaptor` v1 release. The dependency is tag-pinned with no branch or local replacement:
 
 | Item | Value |
 | --- | --- |
 | Remote | `https://github.com/agent-dance/agent-adaptor.git` |
-| Upstream ref | `refs/heads/cl/opt_examples` |
-| Commit | `aac715d492a1defd65525c1639dd6a639e36d384` |
-| Go version | `v0.12.1-0.20260725141943-aac715d492a1` |
+| Upstream ref | `refs/tags/v1.0.0^{}` |
+| Commit | `e33f0f3eb2dd51a47e2397e1e39a5fef94d8aa38` |
+| Go module version | `v1.0.0` |
+| Module sum | `h1:eF5qUeFbsj7CYWIsnmnx9J3IbeLRaQcLe3OMmR/86mA=` |
 | AlSniper OS minimum Go toolchain | Go 1.26.5 |
 
-The SDK is reused for Codex driver lifecycle, typed binding, native clone-profile materialization, run policy, environment/profile diagnostics, and prompt-plus-local JSON Schema validation. Go 1.26.5 is the minimum because earlier 1.26 patch releases contain reachable standard-library vulnerabilities. The sidecar adds the OS-specific HTTP, authorization, validation, scheduling, and authority boundaries that the SDK intentionally does not provide.
+The v1 API is used through `adaptor.New`, `codex.Driver`, `profile.CloneFrom`, `WithSchemaJSON`, `Result`/`RunError`, `Inspector`, and `Agent.Close`. A host wrapper deliberately narrows the built-in Codex descriptor to one-shot execution with prompt-plus-local JSON Schema validation. Go 1.26.5 is the minimum because earlier 1.26 patch releases contain reachable standard-library vulnerabilities. The sidecar adds the OS-specific HTTP, authorization, validation, scheduling, and authority boundaries that the SDK intentionally does not provide.
 
 ## Transport and authentication
 
-The sidecar uses `127.0.0.1:4317` and configuration rejects hostnames, IPv6 aliases, wildcard addresses, and every other IP. This intentionally matches the browser production CSP's only HTTP sidecar source. Development keeps explicit `ws://localhost:*` and `ws://127.0.0.1:*` sources solely for the Vite HMR transport; they are not accepted sidecar HTTP endpoints.
+The sidecar uses `127.0.0.1:4317` and configuration rejects hostname, IPv6, wildcard, and every other listener alias. The authenticated request Origin is independently restricted to the packaged `app://alsniper` origin or an exact loopback HTTP(S) development origin; non-loopback web origins and every other custom scheme fail closed.
 
 The HTTP contract is versioned as `1.1.0`. Browser and sidecar require an exact
 version match and are upgraded atomically; there is no mixed-version fallback:
@@ -109,25 +110,22 @@ The host must also configure `AIOS_SIDECAR_ORIGIN` to that exact browser origin.
 
 ## Codex authentication and process isolation
 
-The host creates and owns a dedicated sidecar Codex profile, then selects it through `agent-adaptor`'s `WithCloneProfileFrom`. The clone request is exact:
+The host creates and owns a dedicated sidecar Codex profile, then selects it through the v1 profile API. The clone request is exact:
 
 ```go
-agentadaptor.CloneProfileOptions{
-    IncludeSettings: true,
-    IncludeMCP:      false,
-    IncludeSkills:   false,
-    IncludeAuth:     true,
-    AuthMode:        agentadaptor.CloneProfileAuthLink,
-}
+profile.CloneFrom(sourceHome, profileDir,
+    profile.CopySettings(),
+    profile.LinkAuth(),
+)
 ```
 
-The SDK gives a non-empty `AuthMode` priority over `IncludeAuth`. Authentication therefore uses `CloneProfileAuthLink` and is never copied: the SDK creates a symlink, falls back to a hardlink, and fails rather than falling back to an auth copy. This lets it follow `codex login` OAuth rotation while limiting replacement authority to the claimed profile's fixed `auth.json`. Reconciliation holds an exclusive filesystem lease; the host then proves `SameFile`, switches the actual run to a dedicated selection, and holds a shared lease through process completion. Stable credential generations support parallel game-seat inference while no sidecar process can start inside the SDK's remove-then-link window.
+Authentication uses `profile.LinkAuth()` and is never copied: the SDK creates a symlink, falls back to a hardlink, and fails rather than falling back to an auth copy. This lets it follow `codex login` OAuth rotation while limiting replacement authority to the claimed profile's fixed `auth.json`. Reconciliation holds an exclusive filesystem lease; the host then proves `SameFile`, switches the actual run to a dedicated selection, and holds a shared lease through process completion. Stable credential generations support parallel inference while no sidecar process can start inside the SDK's remove-then-link window.
 
-`IncludeSettings:true` asks the SDK to copy missing `config.json`, `config.toml`, and `instructions.md` as opaque complete files. It is copy-if-missing, not a mirror: the SDK does not replace an existing target. The host therefore wraps native materialization with a stricter lifecycle. At startup it validates bounded regular source files without following links, hashes their presence and contents into one settings generation, and, when any cloned file is missing or stale, removes only those three fixed targets from its claimed profile before invoking the SDK clone. It then proves exact equality for `config.json` and `instructions.md` and TOML-semantic equality for `config.toml`; the latter is necessary because the pinned SDK's empty MCP reconciliation re-marshals that file. Codex runs with native user-configuration loading enabled and the isolated profile selected. Codex CLI 0.145 consumes the cloned `config.toml` as its native model/provider/settings source rather than using a separate host-built provider projection; the CLI defines whether that version consumes the cloned `config.json` and `instructions.md` files declared by the SDK settings contract. `AIOS_AGENT_MODEL` and `AIOS_AGENT_REASONING_EFFORT` remain explicit process-scoped overrides.
+`profile.CopySettings()` asks the SDK to copy missing `config.json`, `config.toml`, and `instructions.md` as opaque complete files. It is copy-if-missing, not a mirror: the SDK does not replace an existing target. The host therefore wraps native materialization with a stricter lifecycle. At startup it validates bounded regular source files without following links, hashes their presence and contents into one settings generation, and, when any cloned file is missing or stale, removes only those three fixed targets from its claimed profile before invoking the SDK clone. It then proves exact equality for `config.json` and `instructions.md` and TOML-semantic equality for `config.toml`; the latter is necessary because the release's empty MCP reconciliation re-marshals that file. Codex runs with native user-configuration loading enabled and the isolated profile selected. Codex CLI 0.145 consumes the cloned `config.toml` as its native model/provider/settings source rather than using a separate host-built provider projection; the CLI defines whether that version consumes the cloned `config.json` and `instructions.md` files declared by the SDK settings contract. `AIOS_AGENT_MODEL` and `AIOS_AGENT_REASONING_EFFORT` remain explicit process-scoped overrides.
 
 The startup settings generation is immutable. The host captures two matching, bounded no-follow snapshots and derives both the generation and the MCP deny projection from the same immutable file bytes; a split-read change fails startup. Every readiness refresh and each process preflight repeats the stable capture and rejects a change, including presence/absence changes, before execution. Restarting the sidecar computes the new generation, rebuilds its safety overrides, and refreshes the cloned files. This deliberately differs from authentication: `codex login` changes only the auth generation, which is relinked automatically without a restart and resets provider verification to unverified until a successful call.
 
-`IncludeMCP:false` disables the SDK's separate MCP materialization pass; it does not filter `mcp_servers` or `mcpServers` sections embedded in complete settings files. The host therefore enumerates only the bounded server identifiers from the frozen native JSON/TOML snapshot and constructs one immutable `mcp_servers={...enabled=false...}` inline-table override that disables every discovered server. Invalid MCP structure or identifiers, more than 128 unique servers, or a projection over 16 KiB fail startup before Windows process creation. Because settings generation is pinned, a server cannot be added after enumeration without making readiness and execution fail until restart. `IncludeSkills:false` likewise prevents user skill-directory cloning; only the provider-created `.system` runtime skills remain allowlisted.
+Because neither `profile.CopyMCP()` nor `profile.CopySkills()` is selected, the SDK does not separately materialize MCP or user skill directories. This cannot filter `mcp_servers` or `mcpServers` sections embedded in complete settings files. The host therefore enumerates only bounded server identifiers from the frozen native JSON/TOML snapshot and constructs one immutable `mcp_servers={...enabled=false...}` override. Invalid structure or identifiers, more than 128 unique servers, or a projection over 16 KiB fail before process creation. Because settings generation is pinned, a server cannot be added after enumeration without making readiness and execution fail until restart; only provider-created `.system` runtime skills remain allowlisted.
 
 Before any directory creation or SDK call, the host walks every existing component of the native Codex home, isolated profile, and workspace paths with no-follow metadata checks. Symlinks, Windows junctions/reparse points, special files, filesystem-root targets, containment, and canonical filesystem aliases fail closed. A new profile/workspace target is created one component at a time only beneath validated real parents and receives a sidecar ownership marker. The profile is additionally bound to a hash of the canonical native home and held by one OS-enforced exclusive file lease for the entire sidecar lifetime, so another sidecar process cannot reconcile it between preflight and Codex process creation. Existing unclaimed directories are rejected; an existing profile additionally requires the frozen cloned settings, exact native auth file, and closed runtime allowlist. Workspace markers and every retained `run-*` directory are revalidated without following links. Readiness is intentionally uncached and revalidates the lease plus audited CLI version on every request; execution independently repeats settings generation/digest, native/profile/auth, host-argument, workspace-root, exact empty run-CWD, and process-lease checks immediately before and after every real driver invocation.
 
@@ -140,8 +138,7 @@ Complete native settings and instructions are trusted operator input, but they d
 - Chronicle/screen context, memories, Goals, external memory import, artifacts, realtime conversation, network proxy, permission/MCP elicitation, skill/tool discovery, and workspace dependency surfaces disabled so one game seat cannot obtain context outside its supplied observation;
 - `notify=[]` and every startup-known MCP server disabled through host-owned configuration overrides;
 - a fail-closed child-environment allowlist that clears sidecar secrets, provider credentials, and unknown host variables while retaining only bounded operational variables;
-- permission, plan review, and question decisions automatically rejected;
-- rejection and timeout configured to abort the run;
+- all provider permission-elicitation and tool-call surfaces disabled before launch; the wrapper advertises no HITL capability and the host never requests an approval mode;
 - exact-JSON prompting followed by local JSON Schema validation for both chat and game decisions, preserving compatibility with native provider routes that do not implement Codex `--output-schema`;
 - stateless `--ephemeral` execution, so Codex does not write conversation, speech transcript, or game-observation rollouts to the isolated profile.
 
@@ -151,7 +148,7 @@ The denylist and native-config behavior are audited against exactly `codex-cli 0
 
 ## Invocation isolation, cancellation, and parallelism
 
-Every model process is stateless and ephemeral: the sidecar does not configure an SDK SessionStore, does not request Codex resume, and passes `--ephemeral` on every spawn. To preserve useful multi-turn behavior, the browser supplies at most 12 prior user/assistant messages, with 2,000 UTF-16 units per message and 12,000 in aggregate; this window lives only in the mounted assistant UI and is validated again by both client and sidecar. Conversation text, speech transcripts, and seat-projected observations are not retained as local Codex rollouts. Provider-side processing and retention remain governed by the configured Codex provider and account policy.
+Every model process is stateless and ephemeral: the wrapper does not expose v1 session, persistent-process, or streaming interfaces, construction applies `WithSpawn()`, and every CLI spawn receives `--ephemeral`. To preserve useful multi-turn behavior, the browser supplies at most 12 prior user/assistant messages, with 2,000 UTF-16 units per message and 12,000 in aggregate; this window lives only in the mounted assistant UI and is validated again by both client and sidecar. Conversation text, speech transcripts, and seat-projected observations are not retained as local Codex rollouts. Provider-side processing and retention remain governed by the configured Codex provider and account policy.
 
 The service applies two independent controls:
 

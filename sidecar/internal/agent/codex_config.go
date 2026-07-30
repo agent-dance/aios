@@ -17,7 +17,7 @@ import (
 )
 
 // codexSDKSettingsFiles is pinned to the Codex profile contract in
-// agent-adaptor v0.12.1-0.20260725141943-aac715d492a1. IncludeSettings copies
+// agent-adaptor v1.0.0. profile.CopySettings copies
 // these files in this order and deliberately treats each file as opaque.
 var codexSDKSettingsFiles = [...]string{"config.json", "config.toml", "instructions.md"}
 

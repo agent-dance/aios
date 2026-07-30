@@ -492,7 +492,10 @@ func preflightDedicatedWorkspace(root string) error {
 	if !existed {
 		return nil
 	}
-	return validateDedicatedWorkspaceContents(root, true)
+	// A previously created but still-empty directory has no content to trust
+	// and can be claimed atomically later while the profile lease is held.
+	// Non-empty unclaimed directories remain fail-closed.
+	return validateDedicatedWorkspaceContents(root, false)
 }
 
 func preflightRuntimeWorkspace(root, workspace string) error {

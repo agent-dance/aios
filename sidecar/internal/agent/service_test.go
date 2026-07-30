@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	agentadaptor "github.com/agent-dance/agent-adaptor"
 	"github.com/buthim/alsniper-os/sidecar/internal/protocol"
 )
 
@@ -301,9 +300,5 @@ func TestSchemasAreJSONAndChatAllowsAtMostOneIntent(t *testing.T) {
 		if strings.Contains(statusSchema, readOnly) {
 			t.Fatalf("read-only telemetry %q leaked into status write schema", readOnly)
 		}
-	}
-	policy := denyPolicy()
-	if policy.Isolation != agentadaptor.IsolationReadOnly || policy.WebSearch != agentadaptor.FeatureDeny || policy.Browser != agentadaptor.FeatureDeny || policy.HumanDecision.Permission != agentadaptor.HumanDecisionAutoReject || policy.HumanDecision.PlanReview != agentadaptor.HumanDecisionAutoReject || policy.HumanDecision.Question != agentadaptor.QuestionAutoReject {
-		t.Fatalf("unsafe policy: %+v", policy)
 	}
 }
