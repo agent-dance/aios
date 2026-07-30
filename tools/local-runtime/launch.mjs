@@ -24,6 +24,7 @@ import {
   DESKTOP_SHUTDOWN_PIPE_ENV,
   DESKTOP_SHUTDOWN_SECRET_ENV,
 } from './desktop-shutdown-channel.mjs';
+import { installShutdownSignals } from './launcher-signals.mjs';
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const runtimeDirectory = join(repositoryRoot, 'release', 'local-agent-runtime');
@@ -364,13 +365,6 @@ async function stopManagedDesktop(child, exitPromise, shutdownChannel) {
   }
 }
 
-function installShutdownSignals(resolveSignal) {
-  const handler = (signal) => resolveSignal(signal);
-  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.once(signal, handler);
-  process.stdin.resume();
-  process.stdin.once('end', () => resolveSignal('stdin-eof'));
-}
-
 async function startReadySidecar({ token, codexExecutable, artifactHash, shutdownSignal }) {
   let lastError = new Error('The local Agent sidecar could not start.');
   for (let attempt = 1; attempt <= 4; attempt += 1) {
@@ -447,7 +441,7 @@ async function main() {
   let desktopShutdownChannel;
   let signalResolve;
   const signal = new Promise((resolveSignal) => { signalResolve = resolveSignal; });
-  installShutdownSignals(signalResolve);
+  const disposeShutdownSignals = installShutdownSignals(process, signalResolve);
 
   try {
     sidecar = await startReadySidecar({ token, codexExecutable, artifactHash, shutdownSignal: signal });
@@ -518,13 +512,17 @@ async function main() {
     tokenText = '';
     token.fill(0);
     shuttingDown = true;
-    await Promise.all([
-      sidecar === undefined ? Promise.resolve() : stopManagedChild(sidecar.child, sidecar.exit, true, SIDECAR_GRACEFUL_SHUTDOWN_MS),
-      electron === undefined || desktopShutdownChannel === undefined
-        ? Promise.resolve()
-        : stopManagedDesktop(electron.child, electron.exit, desktopShutdownChannel),
-    ]);
-    desktopShutdownChannel?.dispose();
+    try {
+      await Promise.all([
+        sidecar === undefined ? Promise.resolve() : stopManagedChild(sidecar.child, sidecar.exit, true, SIDECAR_GRACEFUL_SHUTDOWN_MS),
+        electron === undefined || desktopShutdownChannel === undefined
+          ? Promise.resolve()
+          : stopManagedDesktop(electron.child, electron.exit, desktopShutdownChannel),
+      ]);
+    } finally {
+      desktopShutdownChannel?.dispose();
+      disposeShutdownSignals();
+    }
     exitCleanupEnabled = false;
   }
 }
